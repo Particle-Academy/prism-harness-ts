@@ -40,3 +40,14 @@ export type { HarnessEvent, HarnessListener, RunFailed, RunFinished, RunStarted 
 
 export { diagnose } from './doctor.js';
 export type { DoctorFinding, DoctorReport, DoctorSubjects } from './doctor.js';
+
+export { AgentRuntime, recordApproval } from './runtime.js';
+export type {
+  AgentResponse,
+  AgentRuntimeOptions,
+  LlmClient,
+  LlmRequest,
+  LlmResponse,
+  LlmToolCall,
+  PendingApproval,
+} from './runtime.js';
