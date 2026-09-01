@@ -124,7 +124,7 @@ export class FileSessionStore implements SessionStore {
         try {
           return await callback();
         } finally {
-          await unlink(lockPath).catch(() => undefined);
+          await this.#release(lockPath);
         }
       } catch (error) {
         if (!isHeld(error)) throw error;
@@ -145,6 +145,39 @@ export class FileSessionStore implements SessionStore {
         await sleep(25);
       }
     }
+  }
+
+  /**
+   * Give the lock up, and NEVER leave it held on the way out.
+   *
+   * Deleting is the normal path, but on Windows it can fail: another waiter
+   * attempting to create the same path holds a transient handle, and the unlink
+   * then raises EPERM. Swallowing that — which is what this did first — LEAKS
+   * THE LOCK. The waiter then sees a lockfile whose TTL is still in the future,
+   * has no way to know its holder is gone, and blocks for the whole wait before
+   * failing. Not theoretical: `prism-harness-py` hit exactly this the first
+   * time two threads recorded a message concurrently, and this port had the
+   * same defect with no test that happened to reach it.
+   *
+   * So if the file cannot be removed, it is rewritten with an ALREADY-PAST
+   * expiry. Any waiter reclaims it on its next attempt, which is the same path
+   * a genuinely dead holder takes.
+   */
+  async #release(lockPath: string): Promise<void> {
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      try {
+        await unlink(lockPath);
+
+        return;
+      } catch (error) {
+        if (isMissing(error)) return;
+        await sleep(5);
+      }
+    }
+
+    // Nothing left to try but mark it dead. The TTL is the backstop, and it is
+    // why the lockfile carries one at all.
+    await writeFile(lockPath, '0', 'utf8').catch(() => undefined);
   }
 
   async #expired(lockPath: string): Promise<boolean> {

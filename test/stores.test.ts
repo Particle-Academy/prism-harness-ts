@@ -178,6 +178,61 @@ describe('FileSessionStore', () => {
     expect(await store.withLock('k', () => 'recovered')).toBe('recovered');
   });
 
+  it('survives many contending callers', async () => {
+    // A general concurrency assertion: every caller gets through, none is
+    // starved. It does NOT discriminate the release-leak bug below — verified
+    // by reverting the fix and watching this still pass — so it is not the
+    // regression test for it, and saying so matters more than the green tick.
+    const store = await fileStore();
+    let entered = 0;
+
+    await Promise.all(
+      Array.from({ length: 12 }, () =>
+        store.withLock('contended', async () => {
+          entered += 1;
+          await new Promise((resolve) => setTimeout(resolve, 1));
+        }),
+      ),
+    );
+
+    expect(entered).toBe(12);
+  }, 20_000);
+
+  it('leaves NO lockfile behind after a normal release', async () => {
+    // The property `#release` exists to guarantee. Its retry-then-mark-dead
+    // fallback cannot be induced portably — an unlink only fails while another
+    // caller happens to hold the path, which is a Windows timing window — so
+    // this asserts the outcome that IS observable everywhere, and the test
+    // below covers the state that fallback leaves behind.
+    const directory = await mkdtemp(join(tmpdir(), 'prism-harness-store-'));
+    const store = new FileSessionStore(directory);
+    await store.withLock('k', () => undefined);
+
+    await expect(readFile(await lockPath(directory, store), 'utf8')).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+  });
+
+  it('reclaims a lock marked dead, WITHOUT waiting out the ttl', async () => {
+    // The contract `#release`'s fallback depends on: when it cannot delete the
+    // lockfile it rewrites it with an already-past expiry rather than leaving
+    // it held, and a waiter must then reclaim it on the next attempt instead of
+    // blocking for the full wait. `prism-harness-py` hit that leak on its first
+    // concurrent test; this port had the same defect.
+    const directory = await mkdtemp(join(tmpdir(), 'prism-harness-store-'));
+    const store = new FileSessionStore(directory);
+    await store.put('k', {});
+    await writeFile(await lockPath(directory, store), '0', 'utf8');
+
+    const started = Date.now();
+    // A wait far shorter than the 10s lock ttl: reclaiming has to come from the
+    // expiry marker, not from the lock timing out.
+    const result = await store.withLock('k', () => 'reclaimed', 10, 0.5);
+
+    expect(result).toBe('reclaimed');
+    expect(Date.now() - started).toBeLessThan(400);
+  });
+
   it('refuses a stored payload that is not valid JSON, by code', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'prism-harness-store-'));
     const store = new FileSessionStore(directory);
