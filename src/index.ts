@@ -51,3 +51,8 @@ export type {
   LlmToolCall,
   PendingApproval,
 } from './runtime.js';
+
+export { SkillRegistry } from './skills.js';
+
+export { SubagentRunner } from './subagent-runner.js';
+export type { SubagentOutcome, SubagentResult } from './subagent-runner.js';

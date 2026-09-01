@@ -38,22 +38,40 @@ export class RunBudget {
   }
 
   /**
-   * The budget a CHILD actually gets.
+   * The budget a CHILD actually gets, as a TREE-ABSOLUTE ceiling.
    *
    * BUDGETS NEST; THEY DO NOT RESET. A resetting budget is not a budget: a
    * parent limited to 8 steps that may spawn subagents each entitled to a fresh
    * 8 has no bound at all — it has a bound per node in a tree whose width it
    * also controls, which is unbounded spend wearing a limit's clothing.
    *
-   * So a child gets the SMALLER of what it declares and what the tree has left.
-   * A child may ask for less than it is offered; it may never ask for more than
-   * remains.
+   * ## Absolute, not remaining — and this is a FIX, not a port
+   *
+   * The reference computes the child's budget as what REMAINS
+   * (`min(declared, parent.maxSteps - ledger.steps)`) and then `exhaustion()`
+   * compares the ledger's CUMULATIVE steps against it. Those two are in
+   * different units, and the result is that a child is refused the moment its
+   * parent has spent anything: parent 8, ledger 7, child declares 2 gives a
+   * budget of 1, and `7 >= 1` is immediately exhausted — so the child gets
+   * ZERO steps while the tree genuinely has one left. Verified against the
+   * reference's own arithmetic, not inferred.
+   *
+   * Expressing the child's budget as a ceiling THE TREE MAY REACH makes both
+   * halves the same unit and gives the right answer in every case: an unspent
+   * parent still hands a child exactly what it declared, and a nearly-spent one
+   * hands it exactly what is left.
+   *
+   * Recorded in the envelope's port gaps register as a divergence the reference
+   * should adopt.
    */
   nestedWithin(parent: RunBudget, ledger: RunLedger): RunBudget {
     return new RunBudget(
-      Math.min(this.maxSteps, Math.max(0, parent.maxSteps - ledger.steps)),
-      lesser(this.maxCostUsd, ledger.remainingCost(parent)),
-      lesser(this.maxSeconds, ledger.remainingSeconds(parent)),
+      Math.min(parent.maxSteps, ledger.steps + this.maxSteps),
+      lesser(parent.maxCostUsd, this.maxCostUsd === null ? null : ledger.costUsd + this.maxCostUsd),
+      lesser(
+        parent.maxSeconds,
+        this.maxSeconds === null ? null : Math.trunc(ledger.elapsedSeconds()) + this.maxSeconds,
+      ),
     );
   }
 }

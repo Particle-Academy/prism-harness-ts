@@ -113,6 +113,13 @@ describe('Subagent', () => {
 });
 
 describe('RunBudget', () => {
+  // The budget a child gets is a TREE-ABSOLUTE ceiling, so the headroom it
+  // actually has is `maxSteps - ledger.steps`. Expressing it as "remaining"
+  // and comparing it against a cumulative ledger is the reference's bug — see
+  // `nestedWithin`.
+  const headroom = (budget: RunBudget, ledger: RunLedger): number =>
+    budget.maxSteps - ledger.steps;
+
   it('NESTS rather than resets', () => {
     // A parent limited to 8 steps that may spawn subagents each entitled to a
     // fresh 8 has no bound at all — it has a bound per node in a tree whose
@@ -125,28 +132,52 @@ describe('RunBudget', () => {
 
     const child = new RunBudget(8, 1.0).nestedWithin(parent, ledger);
 
-    expect(child.maxSteps).toBe(2);
-    expect(child.maxCostUsd).toBeCloseTo(0.25);
+    expect(headroom(child, ledger)).toBe(2);
+    expect(child.maxSteps).toBeLessThanOrEqual(parent.maxSteps);
+    expect(child.maxCostUsd).toBeCloseTo(1.0);
   });
 
-  it('lets a child ask for LESS than remains', () => {
+  it('gives an UNSPENT parent a child exactly what it declared', () => {
+    // The case the reference gets right, kept so the fix cannot regress it.
     const ledger = RunLedger.start('root');
     const child = new RunBudget(2).nestedWithin(new RunBudget(8), ledger);
 
-    expect(child.maxSteps).toBe(2);
+    expect(headroom(child, ledger)).toBe(2);
+  });
+
+  it('gives a NEARLY SPENT parent a child exactly what is left', () => {
+    // The case the reference gets wrong: it would hand this child zero steps
+    // while the tree still had one.
+    const ledger = RunLedger.start('root');
+    ledger.recordSteps(7);
+
+    const child = new RunBudget(2).nestedWithin(new RunBudget(8), ledger);
+
+    expect(headroom(child, ledger)).toBe(1);
+    expect(ledger.exhaustion(child)).toBeNull();
   });
 
   it('never lets a child ask for more than remains', () => {
     const ledger = RunLedger.start('root');
     ledger.recordSteps(8);
 
-    expect(new RunBudget(99).nestedWithin(new RunBudget(8), ledger).maxSteps).toBe(0);
+    const child = new RunBudget(99).nestedWithin(new RunBudget(8), ledger);
+
+    expect(headroom(child, ledger)).toBe(0);
+    expect(ledger.exhaustion(child)).toMatch(/step budget exhausted/);
   });
 
   it('carries a parent cap down to a child that declared none', () => {
     const child = new RunBudget(4).nestedWithin(new RunBudget(8, 2.0), RunLedger.start('r'));
 
     expect(child.maxCostUsd).toBeCloseTo(2.0);
+  });
+
+  it('keeps a child cost cap tighter than the parent it sits under', () => {
+    const ledger = RunLedger.start('root');
+    const child = new RunBudget(4, 0.25).nestedWithin(new RunBudget(8, 2.0), ledger);
+
+    expect(child.maxCostUsd).toBeCloseTo(0.25);
   });
 });
 

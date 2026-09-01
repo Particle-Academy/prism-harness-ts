@@ -29,7 +29,9 @@ export type HarnessErrorCode =
   /** A tool policy is defined but the authorizer that would consult it is off. */
   | 'unsafe_authorization_configuration'
   /** A tool call was refused by the call-time policy. */
-  | 'call_not_authorized';
+  | 'call_not_authorized'
+  /** A skill file was asked for that would resolve outside its own skill. */
+  | 'skill_path_refused';
 
 export interface HarnessErrorOptions {
   cause?: unknown;
@@ -132,6 +134,16 @@ export class HarnessError extends Error {
       'call_not_authorized',
       `This call to [${tool}] was refused by the tool authorization policy.`,
     );
+  }
+
+  /**
+   * A skill name or path that would leave the skill directory.
+   *
+   * Refused rather than sanitised. Silently rewriting a traversal to something
+   * safe teaches a caller — or a model — that the request was fine.
+   */
+  static skillPathRefused(detail: string): HarnessError {
+    return new HarnessError('skill_path_refused', `Refused to read a skill file: ${detail}.`);
   }
 
   static noAgentRuntime(action: string): HarnessError {
