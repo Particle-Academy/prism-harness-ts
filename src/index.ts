@@ -19,3 +19,24 @@ export type { ThreadMessage } from './thread.js';
 
 export { PendingSession, PrismHarness } from './harness.js';
 export type { HarnessOptions } from './harness.js';
+
+export { AgentMode, ModeRegistry } from './modes.js';
+export type { ModeConfig, ModeRegistryConfig } from './modes.js';
+
+export { MAX_DEPTH, RunBudget, RunContext, RunLedger, Subagent, subagentFromConfig } from './subagents.js';
+
+export { ToolAuthorizer, ToolRegistry, authorizedTool } from './tools.js';
+export type {
+  CallPolicy,
+  HarnessTool,
+  OfferPolicy,
+  ToolAuthorizerOptions,
+  ToolFactory,
+  ToolProvider,
+} from './tools.js';
+
+export { HarnessEvents } from './events.js';
+export type { HarnessEvent, HarnessListener, RunFailed, RunFinished, RunStarted } from './events.js';
+
+export { diagnose } from './doctor.js';
+export type { DoctorFinding, DoctorReport, DoctorSubjects } from './doctor.js';

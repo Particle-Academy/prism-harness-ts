@@ -21,7 +21,15 @@ export type HarnessErrorCode =
   /** A stored payload could not be mapped back into a value object. */
   | 'unmappable_content'
   /** A session was asked to do something that needs a runtime it does not have. */
-  | 'no_agent_runtime';
+  | 'no_agent_runtime'
+  /** A mode was asked for that the application has not configured. */
+  | 'mode_not_configured'
+  /** A configured mode is malformed, or names something that does not exist. */
+  | 'mode_malformed'
+  /** A tool policy is defined but the authorizer that would consult it is off. */
+  | 'unsafe_authorization_configuration'
+  /** A tool call was refused by the call-time policy. */
+  | 'call_not_authorized';
 
 export interface HarnessErrorOptions {
   cause?: unknown;
@@ -85,6 +93,44 @@ export class HarnessError extends Error {
       'unmappable_content',
       `Could not rebuild stored content: ${description}.`,
       options,
+    );
+  }
+
+  static modeNotConfigured(name: string): HarnessError {
+    return new HarnessError('mode_not_configured', `Harness mode [${name}] is not configured.`);
+  }
+
+  static modeMalformed(name: string, detail: string): HarnessError {
+    return new HarnessError('mode_malformed', `Harness mode [${name}] is malformed: ${detail}.`);
+  }
+
+  /**
+   * Both at once is the one configuration not to leave in place.
+   *
+   * A defined policy that is never consulted looks like a control to every
+   * reader and is not one -- every registered tool is offered to every run
+   * while the code says otherwise.
+   */
+  static policyDefinedButDisabled(): HarnessError {
+    return new HarnessError(
+      'unsafe_authorization_configuration',
+      'A tool authorization policy was supplied, but the authorizer is disabled, so that policy is ' +
+        'never consulted and every registered tool is offered to every run. Either enable the ' +
+        'authorizer, or remove the policy so nothing suggests tool access is being restricted.',
+    );
+  }
+
+  /**
+   * Thrown rather than returned as a tool result.
+   *
+   * A refusal handed back as a result reads to the model as a failure it might
+   * retry differently, and a denied action being retried is the opposite of
+   * what a guard is for.
+   */
+  static callNotAuthorized(tool: string): HarnessError {
+    return new HarnessError(
+      'call_not_authorized',
+      `This call to [${tool}] was refused by the tool authorization policy.`,
     );
   }
 
