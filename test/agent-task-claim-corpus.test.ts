@@ -417,7 +417,7 @@ describe.skipIf(Boolean(recordingInto))('where the THREE languages stand', () =>
     expect(corpus.cases.filter((row) => row.result.py === null).map((row) => row.id)).toEqual([]);
   });
 
-  it('has ONE row left that the languages answer differently', () => {
+  it('has ONE row left where the three do not read alike, and it is a SKIP', () => {
     expect(disagreeing.map((row) => row.id)).toEqual(['atc-0017']);
   });
 
@@ -435,21 +435,24 @@ describe.skipIf(Boolean(recordingInto))('where the THREE languages stand', () =>
     }
   });
 
-  it('gives atc-0017 THREE different answers, and this port has the strict one', () => {
-    // PHP skips it (its type system rejects `90.4` before any guard), this port
-    // REFUSES it, and the corpus records Python ACCEPTING it — `claimed_until`
-    // lands on 1735689690, which is `now + 90`. A fractional lease truncated to
-    // a whole one is a configuration silently becoming a different
-    // configuration, which is what the row's title says must not happen. Not
-    // this port's finding to fix; recorded here so a re-vendor cannot bury it.
+  it('has atc-0017 answered identically by both ports, and skipped only by PHP', () => {
+    // This row briefly had THREE answers: PHP skips it (its type system rejects
+    // `90.4` before any guard runs), this port REFUSES it, and the corpus
+    // recorded Python ACCEPTING it and truncating to 90 — `claimed_until` on
+    // `now + 90`, a configuration silently becoming a different configuration.
+    // That was G-40, and Python closed it, so the two languages that can
+    // express the row now give the same answer.
+    //
+    // The assertion is kept rather than deleted with the finding: it is what
+    // makes a re-vendor that changes the picture go red instead of quietly
+    // agreeing. It has already done that once — this test is the one that
+    // failed when Python's fix landed.
     const row = corpus.cases.find((entry) => entry.id === 'atc-0017')!;
 
     expect(isSkipped(row.result.php)).toBe(true);
+    expect(isSkipped(row.result.ts)).toBe(false);
     expect((row.result.ts as RowOutcome).code).toBe('task_lease_invalid');
-    expect(row.result.py).toMatchObject({
-      outcome: 'ok',
-      record: { claimed_until: 1735689690 },
-    });
+    expect(canonical(row.result.py)).toBe(canonical(row.result.ts));
   });
 });
 
