@@ -21,6 +21,27 @@ otherwise, which is a claim rather than a check. Verify it with
 Never pipe a gate into `head`/`tail`/`grep` and read `$?` — that is the
 FILTER's exit code, not the gate's. Redirect to a file, echo `$?`, then look.
 
+## Conformance corpora — vendored, and recorded from HERE
+
+Two cross-language suites from `prism-parity` run in `test/`, each against a
+fixture VENDORED into `test/fixtures/`. The fixture is a byte copy of the
+suite's `cases.json`; a runner that reached for a sibling checkout would work in
+one directory layout and silently no-op in CI.
+
+`agent-task-claim` records this language's half itself, so the recorder and the
+assertions cannot drift apart — they are one `run()`:
+
+```sh
+PRISM_PARITY_CASES=<abs path>/prism-parity/suites/agent-task-claim/cases.json \
+  npx vitest run agent-task-claim      # fills result.ts AND re-vendors the fixture
+node <parity>/tools/sync-corpus.mjs    # the loaders ship their own copies
+```
+
+Off unless that variable is set. Two rows DIVERGE from the reference and are
+recorded as divergences rather than skipped — see the suite manifest's `ts` gap
+and G-39. Do not make a row agree by validating in the runner: a runner that
+supplies the guard measures the runner.
+
 ## What this package holds
 
 Threads, session state, store drivers, and agent task lists. See the port gaps
