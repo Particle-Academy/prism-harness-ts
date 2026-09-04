@@ -113,7 +113,7 @@ pinned across all three languages:
 | `claimed` is written before the work begins | So "started and died" is distinguishable from "never started". |
 | `done` and `failed` are terminal | Re-releasing one is an error, not a silent no-op. |
 | A worker may extend its own lease | Only while it still holds it, and bounded by the RUN. `RunLedger.exhaustion()` refuses outright — cancelled, out of steps, out of money or out of time — and `remainingSeconds()` bounds what is granted. There is no second timeout to set, or to forget to set. The new expiry is `now + granted` even when that shortens the lease: the grant is what the run can still afford. |
-| A lease of zero or less is refused | Not clamped to one second. A clamp is a value quietly becoming a different value, and a caller asking for a zero-second lease has a bug worth handing back. |
+| A lease must be whole positive seconds | Zero or less is refused rather than clamped, and a fraction is refused rather than truncated — both are a value quietly becoming a different value, and `claimed_until` is an integer timestamp so a fractional lease could never have been honoured anyway. The check is `Number.isInteger`, which also refuses `NaN`, the infinities, and the string a JSON config would have delivered past the type annotation. |
 | `release()` names the worker | Not in the spec's sketch, and added because without it a completion tool can close any task in the list — including one another worker is midway through. A release by anyone but the holder is refused, and the refusal does not say who the holder is. |
 
 **A volatile store is refused**, the same way the durable slot is. A
@@ -140,6 +140,14 @@ else — `"complete"`, `null`, or a missing argument — is refused rather than
 guessed at, because `outcome` is the one value the model supplies and it decides
 a terminal state. Guessing would let a malformed call produce the more
 privileged result.
+
+It also **checks the holder itself** rather than trusting the source to. It is
+typed to the `AgentTaskSource` contract, and an interface cannot make an
+implementation check anything — `release(task, worker, outcome)` reads like
+"find it and set the state", which is what a third party will write. A task
+whose holder cannot be established at all is refused too: `AgentTask` is three
+methods, so a conforming source may expose no holder, and reading that silence
+as permission is the same mistake as inferring `done` from a missing outcome.
 
 Stopping is the existing `RunBudget` — cost, turns and wall-clock. Dependency
 ordering is not here: drive [`fancy-flow`](https://github.com/Particle-Academy/fancy-flow)

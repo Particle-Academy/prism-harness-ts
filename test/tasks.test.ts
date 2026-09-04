@@ -24,11 +24,13 @@ import {
   withAgentTask,
   type AgentTaskAttributeSource,
   type AgentTaskAttributes,
+  type AgentTask,
   type AgentTaskRecord,
   type AgentTaskSource,
   type Durability,
   type JsonObject,
   type SessionStore,
+  type TaskOutcome,
   type TaskState,
 } from '../src/index.js';
 
@@ -136,6 +138,110 @@ describe('the padding fixtures themselves', () => {
     expect(PADDING).not.toContain(TOOTHLESS_PADDING);
   });
 });
+
+/**
+ * An `AgentTaskSource` that GUARDS NOTHING. Find it, set the state.
+ *
+ * Exactly what a third party writes from the signature `release(task, worker,
+ * outcome)` — the name says "record what happened", and nothing about the
+ * interface forces the implementation to check who is holding the task. That is
+ * the whole point of this fixture: the completion tool's own pre-check is
+ * invisible against `StoreTaskSource`, which already refuses a non-holder, so
+ * deleting the check passes every other test in this file. Against this source
+ * it does not.
+ *
+ * Deliberately NOT a subclass or a stub of the real one. A fixture that
+ * inherited any of the guards could not prove their absence.
+ */
+class UnguardedTaskSource implements AgentTaskSource {
+  #records: AgentTaskRecord[];
+
+  readonly #initial: readonly AgentTaskRecord[];
+
+  constructor(records: readonly AgentTaskRecord[]) {
+    this.#initial = records.map((record) => ({ ...record }));
+    this.#records = records.map((record) => ({ ...record }));
+  }
+
+  reset(): void {
+    this.#records = this.#initial.map((record) => ({ ...record }));
+  }
+
+  record(id: string): AgentTaskRecord | undefined {
+    return this.#records.find((candidate) => candidate.id === id);
+  }
+
+  async claim(worker: string): Promise<AgentTask | null> {
+    const next = this.#records.find((candidate) => candidate.state === 'todo');
+
+    if (next === undefined) return null;
+
+    next.state = 'claimed';
+    next.claimed_by = worker;
+
+    return asAgentTask(recordToAttributes(next));
+  }
+
+  /** No holder check, no terminal check, no anything. */
+  async release(task: AgentTask, _worker: string, outcome: TaskOutcome): Promise<void> {
+    const found = this.#records.find((candidate) => candidate.id === task.id());
+
+    if (found === undefined) return;
+
+    found.state = outcome;
+  }
+
+  async pending(): Promise<number> {
+    return this.#records.filter((candidate) => candidate.state === 'todo').length;
+  }
+
+  async find(id: string): Promise<AgentTask | null> {
+    const found = this.record(id);
+
+    return found === undefined ? null : asAgentTask(recordToAttributes(found));
+  }
+}
+
+/**
+ * A source whose tasks expose NO HOLDER. Three methods, exactly as the contract
+ * allows.
+ *
+ * `AgentTask` is `id`, `instruction` and `state`; the lease lives on
+ * `LeasedAgentTask`, which a consumer adapting an existing table need not
+ * implement. So this is a CONFORMING source, not a broken one, and the
+ * completion tool has to decide what an unknowable holder means. Treating it as
+ * "no mismatch, therefore allowed" is reading silence as permission.
+ */
+class HolderlessTaskSource implements AgentTaskSource {
+  constructor(private readonly state: TaskState = 'claimed') {}
+
+  async claim(): Promise<AgentTask | null> {
+    return this.bare();
+  }
+
+  async release(): Promise<void> {
+    // Unguarded on purpose, like the fixture below.
+  }
+
+  async pending(): Promise<number> {
+    return 1;
+  }
+
+  async find(id: string): Promise<AgentTask | null> {
+    return id === 'h-1' ? this.bare() : null;
+  }
+
+  /** Deliberately NOT `asAgentTask`, which would supply `claimedBy`. */
+  private bare(): AgentTask {
+    const state = this.state;
+
+    return {
+      id: () => 'h-1',
+      instruction: () => 'no holder is readable here',
+      state: () => state,
+    };
+  }
+}
 
 function ticking(start: number): { now: () => number; set: (value: number) => void } {
   let value = start;
@@ -600,7 +706,27 @@ describe.each<[string, () => Promise<SessionStore>]>([
     expect(Number.NaN <= 0).toBe(false);
     expect(Number.POSITIVE_INFINITY <= 0).toBe(false);
 
-    // Nothing was claimed on the way to any of those refusals.
+    // FRACTIONS are refused too, not truncated. "Truncation lands in the safe
+    // direction" is the clamping argument restated, and it could never have
+    // been honoured anyway: `claimed_until` is an integer timestamp in all
+    // three languages, so a fractional lease was always going to become a
+    // different lease.
+    for (const fraction of [90.4, 0.5, 299.999, 1.000_000_1]) {
+      expect(await codeOf(() => tasks.claim('w-1', fraction))).toBe('task_lease_invalid');
+    }
+
+    // THE UNTYPED DOOR, which is the one that actually mattered in the
+    // reference. A lease read out of a JSON config is a STRING, the type
+    // annotation never sees it, and `Math.trunc('90.4')` is 90 — so the guard
+    // would have been defeated from inside the file that declares the setting.
+    for (const untyped of ['90.4', '90', '300', true, null, [], {}]) {
+      expect(
+        await codeOf(() => tasks.claim('w-1', untyped as unknown as number)),
+      ).toBe('task_lease_invalid');
+    }
+
+    // Nothing above claimed anything — not one of those refusals leaked past
+    // the guard on its way to the store.
     expect((await tasks.find('t-1'))?.state()).toBe('todo');
     expect(await tasks.pending()).toBe(1);
 
@@ -611,6 +737,27 @@ describe.each<[string, () => Promise<SessionStore>]>([
         tasks.extendLease(task, 'w-1', 0, new RunLedger('r'), new RunBudget(8, null, 600)),
       ),
     ).toBe('task_lease_invalid');
+    expect(
+      await codeOf(() =>
+        tasks.extendLease(task, 'w-1', 30.5, new RunLedger('r'), new RunBudget(8, null, 600)),
+      ),
+    ).toBe('task_lease_invalid');
+  });
+
+  it('accepts the lease default it SHIPS', async () => {
+    // The shipped configuration, not only a direct call. A default that could
+    // not pass the guard in front of it would be a package refusing its own
+    // out-of-the-box behaviour — and `claim()` with no second argument is the
+    // call every consumer makes first.
+    const tasks = await source();
+    await tasks.add('the work');
+
+    expect(Number.isInteger(DEFAULT_LEASE_SECONDS)).toBe(true);
+    expect(DEFAULT_LEASE_SECONDS).toBeGreaterThan(0);
+    expect(DEFAULT_LEASE_SECONDS).toBe(300);
+
+    expect(await codeOf(() => tasks.claim('w-1'))).toBe('no error');
+    expect(Number.isInteger((await tasks.find('t-1'))!.claimedUntil()!)).toBe(true);
   });
 
   it('finds a task by id, which is all an external caller has', async () => {
@@ -1201,6 +1348,143 @@ describe('an agent cannot complete its own task by default', () => {
       await codeOf(() => Promise.resolve(factory(session).handle({ outcome: 'done' }))),
     ).toBe('task_lease_not_held');
     expect((await tasks.find(id))?.state()).toBe('claimed');
+  });
+
+  it('CONTROL: the unguarded fixture really is unguarded', async () => {
+    // A control needs its own control. Every test below measures the tool
+    // against `UnguardedTaskSource`; if that fixture ever quietly grew a guard,
+    // all of them would still pass and every one of them would be measuring the
+    // fixture instead of the tool. Run first, and deliberately separate.
+    const unguarded = new UnguardedTaskSource([
+      { claimed_by: 'someone-else', claimed_until: 9_999_999_999, id: 'c-1', instruction: 'theirs', state: 'claimed' },
+      { claimed_by: null, claimed_until: null, id: 'c-2', instruction: 'nobody has it', state: 'todo' },
+      { claimed_by: null, claimed_until: null, id: 'c-3', instruction: 'over', state: 'done' },
+    ]);
+    const taskFor = (id: string) => asAgentTask(recordToAttributes(unguarded.record(id)!));
+
+    // It closes a task held by someone else, one nobody holds, and one that is
+    // already terminal — without a murmur. That is what "unguarded" has to mean
+    // for the tool tests below to prove anything.
+    await unguarded.release(taskFor('c-1'), 'w-1', 'done');
+    await unguarded.release(taskFor('c-2'), 'w-1', 'done');
+    await unguarded.release(taskFor('c-3'), 'w-1', 'failed');
+
+    expect(unguarded.record('c-1')!.state).toBe('done');
+    expect(unguarded.record('c-2')!.state).toBe('done');
+    expect(unguarded.record('c-3')!.state).toBe('failed');
+  });
+
+  it('refuses a task whose holder CANNOT BE ESTABLISHED', async () => {
+    // `AgentTask` is three methods, so this source is conforming rather than
+    // broken. Reading its silence as permission is the same mistake as
+    // inferring `done` from an absent outcome, one level down.
+    const { session } = await heldTask();
+    const holderless = new HolderlessTaskSource('claimed');
+    const tool = agentCompletionTool({
+      source: holderless,
+      task: (await holderless.find('h-1'))!,
+      worker: 'w-1',
+      authorizer: new ToolAuthorizer({ enabled: true, call: () => true }),
+    })(session);
+
+    // The task says `claimed`, so every check except the holder one passes.
+    expect((await holderless.find('h-1'))?.state()).toBe('claimed');
+    expect(await codeOf(() => Promise.resolve(tool.handle({ outcome: 'done' })))).toBe(
+      'task_lease_not_held',
+    );
+  });
+
+  it('refuses on its OWN, against a source that guards nothing', async () => {
+    // The tool's pre-check is invisible against `StoreTaskSource`, which
+    // already refuses a non-holder — delete it and every other test here still
+    // passes, so the mutation SURVIVES. That is the argument for it, not
+    // against it: an interface cannot make an implementation check anything,
+    // and `release(task, worker, outcome)` reads to a third party as "find it
+    // and set the state", which is what they will write. The tool is the thing
+    // a MODEL can call, so it does not get to assume the source behind it is
+    // the careful one.
+    //
+    // Hence this fixture, which guards NOTHING. It is the only thing in the
+    // suite that can tell whether the tool checks or merely delegates.
+    const { session } = await heldTask();
+    const unguarded = new UnguardedTaskSource([
+      { claimed_by: 'someone-else', claimed_until: 9_999_999_999, id: 'u-1', instruction: 'theirs', state: 'claimed' },
+      { claimed_by: null, claimed_until: null, id: 'u-2', instruction: 'nobody has it', state: 'todo' },
+      { claimed_by: null, claimed_until: null, id: 'u-3', instruction: 'over', state: 'done' },
+      { claimed_by: 'w-1', claimed_until: 9_999_999_999, id: 'u-4', instruction: 'mine', state: 'claimed' },
+      // INCONSISTENT: the holder matches, the state does not. Only a source
+      // with no guards can produce this, which is why it is here — it is the
+      // one row that makes the tool's `state === 'claimed'` check observable
+      // rather than shadowed by the holder check.
+      { claimed_by: 'w-1', claimed_until: null, id: 'u-5', instruction: 'never started', state: 'todo' },
+    ]);
+
+    const toolFor = (id: string) =>
+      agentCompletionTool({
+        source: unguarded,
+        task: asAgentTask(recordToAttributes(unguarded.record(id)!)),
+        worker: 'w-1',
+        authorizer: new ToolAuthorizer({ enabled: true, call: () => true }),
+      })(session);
+
+    expect(await codeOf(() => Promise.resolve(toolFor('u-1').handle({ outcome: 'done' })))).toBe(
+      'task_lease_not_held',
+    );
+    expect(await codeOf(() => Promise.resolve(toolFor('u-2').handle({ outcome: 'done' })))).toBe(
+      'task_lease_not_held',
+    );
+    expect(await codeOf(() => Promise.resolve(toolFor('u-3').handle({ outcome: 'done' })))).toBe(
+      'task_already_terminal',
+    );
+    // Holder matches, state does not. The `claimed` check is the only thing
+    // standing here, so this row is what makes it a check rather than a claim.
+    expect(await codeOf(() => Promise.resolve(toolFor('u-5').handle({ outcome: 'done' })))).toBe(
+      'task_lease_not_held',
+    );
+
+    // The refusal must not name the holder either. This one reaches a MODEL as
+    // readable text, so it is the last place to leak a peer worker's identity.
+    let message = '';
+    try {
+      await toolFor('u-1').handle({ outcome: 'done' });
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    expect(message).not.toContain('someone-else');
+    expect(message).toContain('w-1');
+
+    // None of the refusals touched anything.
+    expect(unguarded.record('u-1')!.state).toBe('claimed');
+    expect(unguarded.record('u-2')!.state).toBe('todo');
+    expect(unguarded.record('u-3')!.state).toBe('done');
+    expect(unguarded.record('u-5')!.state).toBe('todo');
+
+    // The positive control: the task this worker really holds still closes.
+    expect(await codeOf(() => Promise.resolve(toolFor('u-4').handle({ outcome: 'done' })))).toBe(
+      'no error',
+    );
+    expect(unguarded.record('u-4')!.state).toBe('done');
+  });
+
+  it('refuses a task the source cannot find', async () => {
+    const { session } = await heldTask();
+    const unguarded = new UnguardedTaskSource([]);
+    const tool = agentCompletionTool({
+      source: unguarded,
+      task: asAgentTask({
+        id: 'gone',
+        instruction: 'x',
+        state: 'claimed',
+        claimedBy: 'w-1',
+        claimedUntil: 9_999_999_999,
+      }),
+      worker: 'w-1',
+      authorizer: new ToolAuthorizer({ enabled: true, call: () => true }),
+    })(session);
+
+    expect(await codeOf(() => Promise.resolve(tool.handle({ outcome: 'done' })))).toBe(
+      'task_not_found',
+    );
   });
 
   it('offers no completion route at all until a consumer builds one', async () => {

@@ -36,7 +36,7 @@ export type HarnessErrorCode =
   | 'duplicate_task_id'
   /** A worker id or a task id was the empty string. */
   | 'task_identifier_blank'
-  /** A lease or extension of zero seconds or fewer was asked for. */
+  /** A lease or extension that was not a whole positive number of seconds. */
   | 'task_lease_invalid'
   /** A task id was named that its source does not hold. */
   | 'task_not_found'
@@ -200,19 +200,24 @@ export class HarnessError extends Error {
   }
 
   /**
-   * A lease of zero seconds or fewer. REFUSED, not clamped.
+   * A lease that is not a whole positive number of seconds. REFUSED, not adjusted.
    *
-   * Clamping it to one second would fail closed, which is why this port did
-   * that first. The reference is right that it is still the wrong shape: a
-   * clamp is a value quietly becoming a DIFFERENT value, and this repository
-   * has already shipped a configuration that silently became a different
-   * configuration and stayed green the whole time. A caller asking for a
-   * zero-second lease has a bug, and the useful thing to hand back is the bug.
+   * Both halves were learned the hard way. Zero or less was CLAMPED to one
+   * second at first, because a clamp fails closed; a positive fraction was then
+   * still TRUNCATED. Both are a value quietly becoming a different value, and
+   * this repository has already shipped a configuration that did exactly that
+   * and stayed green throughout. A caller asking for a zero-second or
+   * fractional lease has a bug, and the useful thing to hand back is the bug.
+   *
+   * Takes `unknown` rather than `number` deliberately: the value that reaches
+   * this is whatever actually arrived, including a string out of a JSON config
+   * that the type annotation never saw.
    */
-  static taskLeaseInvalid(seconds: number): HarnessError {
+  static taskLeaseInvalid(seconds: unknown): HarnessError {
     return new HarnessError(
       'task_lease_invalid',
-      `A lease of [${String(seconds)}] seconds was asked for. It must be at least one second: a ` +
+      `A lease of [${String(seconds)}] seconds was asked for. It must be a whole number of seconds, ` +
+        'at least one. A fraction cannot be honoured -- the expiry is an integer timestamp -- and a ' +
         'lease that has already expired when it is granted hands the same task to a second worker.',
     );
   }

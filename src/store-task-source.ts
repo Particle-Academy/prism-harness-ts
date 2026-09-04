@@ -548,24 +548,40 @@ function assertIdentifier(value: string, what: string): void {
 }
 
 /**
- * A lease in whole seconds, REFUSING zero or less rather than clamping.
+ * A lease of WHOLE POSITIVE SECONDS. Anything else is refused, never adjusted.
  *
- * Clamping to one second fails closed, which is why this was the first answer.
- * It is still wrong: a clamp is a value quietly becoming a different value, and
- * a caller who asked for a zero-second lease has a bug that a silent `1` hides.
+ * Two rules that are really one rule, and this port had to be told the second.
  *
- * A positive fraction is still truncated, which is the same shape of quiet
- * change on a smaller scale. Left as it is because only the `<= 0` rule has
- * been ruled on across the three ports, and inventing the stricter rule here
- * alone would be the unforced divergence the ruling exists to prevent. Raised
- * rather than settled.
+ * Zero or less was clamped to one second at first, because a clamp fails
+ * closed. That is not enough: a clamp is a value quietly becoming a DIFFERENT
+ * value, and this repository has already shipped a configuration that silently
+ * became a different configuration and stayed green throughout.
+ *
+ * A positive FRACTION was then still truncated -- `90.4` became `90` -- which is
+ * the same argument one scale down, and "truncation lands in the safe
+ * direction" is the clamping argument restated. It could never have been
+ * honoured as written either, since `claimed_until` is an integer timestamp in
+ * all three languages, so a fractional lease was always going to become a
+ * different lease.
+ *
+ * ## Every door, not just the typed one
+ *
+ * `Number.isInteger` is doing more work here than it looks, and the parameter is
+ * `unknown` on purpose. The type annotation on `claim()` stops nothing at
+ * runtime: a lease read out of a JSON config arrives as the STRING `'90.4'`,
+ * and `Math.trunc('90.4')` is `90` -- so the guard would have been defeated
+ * from inside the file that declares the setting, silently, exactly as it was
+ * in the reference. `Number.isInteger` is false for a float, for `NaN`, for
+ * either infinity, and for anything that is not a number at all, and it does
+ * not coerce.
+ *
+ * `NaN` deserves its own mention: `NaN <= 0` is FALSE, so a bare positivity
+ * check passes it straight through to become a `claimed_until` of `NaN`.
  */
-function assertLease(seconds: number): number {
-  const whole = Math.trunc(seconds);
-
-  if (!Number.isFinite(whole) || whole <= 0) {
+function assertLease(seconds: unknown): number {
+  if (typeof seconds !== 'number' || !Number.isInteger(seconds) || seconds <= 0) {
     throw HarnessError.taskLeaseInvalid(seconds);
   }
 
-  return whole;
+  return seconds;
 }
