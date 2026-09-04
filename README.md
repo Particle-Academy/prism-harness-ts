@@ -93,9 +93,14 @@ await tasks.pending();   // a COUNT, which is what a loop needs to stop
 ```
 
 There is **no task model, no schema and no migration**. Two contracts and
-adapters: `AgentTaskSource` is where tasks come from, `AgentTask` is one unit of
-work. `StoreTaskSource` is the default, backed by the durable slot; a consumer
-with an existing table wraps their own record with `asAgentTask()` or mixes
+adapters: `AgentTaskSource` is where tasks come from — `claim`, `release`,
+`pending`, `find` — and `AgentTask` is one unit of work. `find()` is on the
+contract because `release()` takes a task while every external caller holds
+only an id: a tool call carries `{"id": "t-1"}` and an HTTP route has
+`/tasks/t-1`.
+
+`StoreTaskSource` is the default, backed by the durable slot; a consumer with an
+existing table wraps their own record with `asAgentTask()` or mixes
 `withAgentTask()` into their class. Both satisfy one contract.
 
 Four states — `todo`, `claimed`, `done`, `failed` — and the transitions are
@@ -107,7 +112,8 @@ pinned across all three languages:
 | A claim carries an owner AND an expiry | Five minutes by default. An expired claim returns the task to **`todo`**, never to `failed`: a worker dying is not the task failing, and conflating them burns a retry that never ran. |
 | `claimed` is written before the work begins | So "started and died" is distinguishable from "never started". |
 | `done` and `failed` are terminal | Re-releasing one is an error, not a silent no-op. |
-| A worker may extend its own lease | Only while it still holds it, and bounded by the run's remaining wall-clock budget (`RunLedger.remainingSeconds()`). There is no second timeout to set — or to forget to set. The new expiry is `now + granted` even when that shortens the lease: the grant is what the run can still afford. |
+| A worker may extend its own lease | Only while it still holds it, and bounded by the RUN. `RunLedger.exhaustion()` refuses outright — cancelled, out of steps, out of money or out of time — and `remainingSeconds()` bounds what is granted. There is no second timeout to set, or to forget to set. The new expiry is `now + granted` even when that shortens the lease: the grant is what the run can still afford. |
+| A lease of zero or less is refused | Not clamped to one second. A clamp is a value quietly becoming a different value, and a caller asking for a zero-second lease has a bug worth handing back. |
 | `release()` names the worker | Not in the spec's sketch, and added because without it a completion tool can close any task in the list — including one another worker is midway through. A release by anyone but the holder is refused, and the refusal does not say who the holder is. |
 
 **A volatile store is refused**, the same way the durable slot is. A
@@ -129,6 +135,12 @@ If the model can declare its own work done, "run until the goal is met" becomes
 "run until it decides it is met", and a run that has stalled ends by declaring
 victory.
 
+That tool **requires an explicit `outcome`** of `done` or `failed`. Anything
+else — `"complete"`, `null`, or a missing argument — is refused rather than
+guessed at, because `outcome` is the one value the model supplies and it decides
+a terminal state. Guessing would let a malformed call produce the more
+privileged result.
+
 Stopping is the existing `RunBudget` — cost, turns and wall-clock. Dependency
 ordering is not here: drive [`fancy-flow`](https://github.com/Particle-Academy/fancy-flow)
 for that. A task list that grows a scheduler has rebuilt a workflow engine
@@ -143,6 +155,16 @@ badly.
   primitive that is atomic on every filesystem worth supporting. Two workers on
   one machine genuinely exclude each other; two machines over a network
   filesystem do not, and no file lock can promise that — use a database there.
+
+  Its **lockfile format is shared with the PHP and Python ports**, because a
+  worker in any of the three may be pointed at one store directory: the expiry
+  in milliseconds, then a newline, written in a single write. The terminator is
+  load-bearing. Without it there is nothing to tell a complete expiry from the
+  first half of one, and every prefix of a timestamp is a smaller, *older*
+  timestamp — so a torn write reads as a lock that expired decades ago and gets
+  deleted out from under the worker holding it. Anything unterminated is treated
+  as held, bounded by the file's own age so a process that died mid-write cannot
+  wedge the key either.
 
 Implement `SessionStore` for anything else. Declare your own `durability()`:
 only you know whether your Redis is persistent or a disposable cache, and that

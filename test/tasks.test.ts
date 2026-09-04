@@ -25,6 +25,7 @@ import {
   type AgentTaskAttributeSource,
   type AgentTaskAttributes,
   type AgentTaskRecord,
+  type AgentTaskSource,
   type Durability,
   type JsonObject,
   type SessionStore,
@@ -77,6 +78,64 @@ function codeOfSync(work: () => unknown): string {
     return error instanceof HarnessError ? error.code : `not a HarnessError: ${String(error)}`;
   }
 }
+
+/**
+ * Padding codepoints JavaScript's OWN `trim()` really strips.
+ *
+ * A padded fixture only proves "nothing is trimmed here" if the host language
+ * would have trimmed it. Otherwise the case passes against a trimming
+ * implementation and the test is decoration — which is not hypothetical: PHP's
+ * version of these rows used U+00A0, and PHP's `trim()` leaves U+00A0 alone, so
+ * it would have gone green against exactly the code it was written to catch.
+ *
+ * And the answer differs per language, so this list is NOT portable:
+ *
+ * | | PHP `trim` | Python `strip` | JS `trim` |
+ * |---|---|---|---|
+ * | U+0020 space | strips | strips | strips |
+ * | U+0009 tab | strips | strips | strips |
+ * | U+00A0 no-break space | **leaves** | strips | strips |
+ * | U+3000 ideographic space | **leaves** | strips | strips |
+ * | U+FEFF byte-order mark | **leaves** | **leaves** | strips |
+ * | U+200B zero-width space | **leaves** | **leaves** | **leaves** |
+ *
+ * Written as code points rather than escapes because this file has had `\`
+ * sequences mangled by tooling before, and a padding character that silently
+ * became something else would make every row below assert the opposite of what
+ * it claims.
+ */
+const PADDING: readonly string[] = [
+  String.fromCharCode(0x20),
+  String.fromCharCode(0x09),
+  String.fromCharCode(0xa0),
+  String.fromCharCode(0x3000),
+  String.fromCharCode(0xfeff),
+];
+
+/** U+200B. Deliberately NOT in `PADDING`: no language strips it, so it proves nothing. */
+const TOOTHLESS_PADDING = String.fromCharCode(0x200b);
+
+describe('the padding fixtures themselves', () => {
+  // A META-TEST, so the list above cannot quietly stop being adversarial. Every
+  // row that uses `PADDING` is asserting "this is NOT trimmed"; if an entry
+  // were one JavaScript ignores anyway, that row would pass against a trimming
+  // implementation and nothing would say so.
+  it('are all codepoints JavaScript would have stripped', () => {
+    expect(PADDING.length).toBeGreaterThan(0);
+
+    for (const pad of PADDING) {
+      expect(`${pad}x${pad}`.trim()).toBe('x');
+      expect(pad.trim()).toBe('');
+    }
+  });
+
+  it('exclude U+200B, which would prove nothing', () => {
+    // The negative control for the meta-test above: this is what a toothless
+    // entry looks like, and it is why the list is checked rather than trusted.
+    expect(TOOTHLESS_PADDING.trim()).toBe(TOOTHLESS_PADDING);
+    expect(PADDING).not.toContain(TOOTHLESS_PADDING);
+  });
+});
 
 function ticking(start: number): { now: () => number; set: (value: number) => void } {
   let value = start;
@@ -494,17 +553,85 @@ describe.each<[string, () => Promise<SessionStore>]>([
     // catch a fractional timestamp: `1000.5 === 1000.5` passes happily and the
     // bytes on the wire become `1000.5` where the other two ports write `1000`.
     // `Number.isInteger` on the STORED value is the only check that sees it.
+    //
+    // The clock is FRACTIONAL on purpose, and that is what makes this a check
+    // rather than a claim: with the flooring removed, `1000.75 + 90` really is
+    // written to the store as `1090.75` — PHP's equivalent mutation never
+    // actually stored a float, so its test could not have failed. The assertion
+    // below reads the STORED payload back, not the value handed to the writer.
     const store = await make();
     const tasks = new StoreTaskSource(store, 'tasks', { now: () => 1_000.75 });
     await tasks.add('the work');
-    await tasks.claim('w-1', 90.4);
+    await tasks.claim('w-1', 90);
 
     const raw = (await store.get('tasks')) as unknown as { tasks: AgentTaskRecord[] };
     const until = raw.tasks[0]!.claimed_until!;
 
     expect(Number.isInteger(until)).toBe(true);
+    expect(until).toBe(1_090);
     expect(JSON.stringify(until)).not.toContain('.');
     expect(canonicalTaskJson(raw.tasks[0]!)).toContain(`"claimed_until":${until},`);
+
+    // And prove the store CAN carry a float, so the assertion above is testing
+    // this code and not a limitation of the store.
+    await store.put('float-probe', { value: 1_090.75 });
+    expect(Number.isInteger(((await store.get('float-probe')) as { value: number }).value)).toBe(false);
+  });
+
+  it('refuses a lease of zero or less rather than clamping it', async () => {
+    // Clamping to one second fails closed, which is why it was the first
+    // answer. It is still a value quietly becoming a different value, and this
+    // repository has already shipped a config that silently became a different
+    // config and stayed green throughout.
+    const tasks = await source();
+    const task = await tasks.add('the work');
+
+    // NaN and the infinities go in the same list, and they are not padding for
+    // the sake of it. Every JavaScript number is a double, so they reach this
+    // code through the same door as `0` — and `NaN <= 0` is FALSE, so a bare
+    // positivity check lets NaN straight through to become a `claimed_until` of
+    // NaN. `Number.isFinite` is what closes that, and this row is what says so.
+    for (const lease of [0, -1, -300, 0.4, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+      expect(await codeOf(() => tasks.claim('w-1', lease))).toBe('task_lease_invalid');
+    }
+
+    // The trap spelled out, so the row above cannot be trimmed back by someone
+    // who reads `<= 0` and thinks NaN is covered by it.
+    expect(Number.NaN <= 0).toBe(false);
+    expect(Number.POSITIVE_INFINITY <= 0).toBe(false);
+
+    // Nothing was claimed on the way to any of those refusals.
+    expect((await tasks.find('t-1'))?.state()).toBe('todo');
+    expect(await tasks.pending()).toBe(1);
+
+    // The positive control, and the same rule on the extension path.
+    expect(await codeOf(() => tasks.claim('w-1', 1))).toBe('no error');
+    expect(
+      await codeOf(() =>
+        tasks.extendLease(task, 'w-1', 0, new RunLedger('r'), new RunBudget(8, null, 600)),
+      ),
+    ).toBe('task_lease_invalid');
+  });
+
+  it('finds a task by id, which is all an external caller has', async () => {
+    // On the CONTRACT, not just this class: `release()` takes a task and a tool
+    // call carries only `{"id": "t-1"}`.
+    const tasks: AgentTaskSource = await source();
+    await tasks.claim('w-1');
+
+    expect(await tasks.find('nope')).toBeNull();
+
+    await (tasks as StoreTaskSource).add('the work');
+    const found = await tasks.find('t-1');
+
+    expect(found?.id()).toBe('t-1');
+    expect(found?.instruction()).toBe('the work');
+
+    // Driven entirely through the contract, holding only the id.
+    const claimed = await tasks.claim('w-1');
+    await tasks.release((await tasks.find(claimed!.id()))!, 'w-1', 'done');
+
+    expect((await tasks.find('t-1'))?.state()).toBe('done');
   });
 
   it('refuses a blank worker id, and accepts a whitespace one', async () => {
@@ -519,12 +646,36 @@ describe.each<[string, () => Promise<SessionStore>]>([
       ),
     ).toBe('task_identifier_blank');
 
-    // NO TRIMMING, deliberately. `trim`, `strip` and `String.prototype.trim`
-    // each strip a different set of codepoints, so a trim here would have three
-    // ports disagreeing about whether an id is blank — the shape of
-    // prism-human-plus G-36. A single space is a legal worker id.
-    expect(await codeOf(() => tasks.claim(' '))).toBe('no error');
-    expect((await tasks.find('t-1'))?.claimedBy()).toBe(' ');
+    // NO TRIMMING, deliberately, and the CODEPOINTS MATTER. Every entry in
+    // `PADDING` is one JavaScript's own `trim()` would strip — the meta-test
+    // above enforces that — so a trimming implementation turns each of these
+    // into the empty string and gets refused, failing this row. A fixture the
+    // host language ignores anyway would pass against exactly the code it was
+    // written to catch, which is what happened to PHP's version of this test.
+    //
+    // This is the shape of prism-human-plus G-36, where each language's own
+    // trim closed one hole and opened a different one.
+    // COUNTED for the same reason as the padded outcomes: `vitest list` shows
+    // this `it` and cannot show whether the loop inside it ran over five
+    // fixtures or zero.
+    let accepted = 0;
+
+    for (const pad of PADDING) {
+      await tasks.add(`work for ${JSON.stringify(pad)}`);
+
+      // Claimed, not refused — and the id comes from the claim rather than
+      // from the add, because `claim()` takes the OLDEST claimable task and
+      // asserting against the one just added would be asserting the wrong row.
+      const claimed = await tasks.claim(pad);
+
+      expect(claimed).not.toBeNull();
+      expect(claimed?.claimedBy()).toBe(pad);
+      expect((await tasks.find(claimed!.id()))?.claimedBy()).toBe(pad);
+      accepted += 1;
+    }
+
+    expect(accepted).toBe(PADDING.length);
+    expect(accepted).toBeGreaterThanOrEqual(5);
   });
 
   it('refuses a blank task id, and a duplicate one', async () => {
@@ -690,6 +841,44 @@ describe('lease self-extension', () => {
     expect(spent.remainingSeconds(budget)).toBe(0);
     expect(
       await codeOf(async () => tasks.extendLease((await tasks.find(id))!, 'w-1', 300, spent, budget)),
+    ).toBe('run_not_permitted');
+  });
+
+  it('is REFUSED by a CANCELLED run, even with time on the clock', async () => {
+    // Reading the spec's "remaining wall-clock budget" literally left exactly
+    // this hole: a run someone had stopped could keep pushing its lease out and
+    // go on holding a task it may no longer do anything with.
+    const { tasks, id } = await held(600);
+    const budget = new RunBudget(8, null, 600);
+    const ledger = ledgerStartedSecondsAgo(1);
+
+    // The positive control FIRST, on the same ledger: it is the cancel that
+    // refuses this, not the clock.
+    expect(
+      await codeOf(async () => tasks.extendLease((await tasks.find(id))!, 'w-1', 30, ledger, budget)),
+    ).toBe('no error');
+    expect(ledger.remainingSeconds(budget)).toBeGreaterThan(0);
+
+    ledger.cancel('operator stopped the run');
+
+    expect(
+      await codeOf(async () => tasks.extendLease((await tasks.find(id))!, 'w-1', 30, ledger, budget)),
+    ).toBe('run_not_permitted');
+  });
+
+  it('is REFUSED once the run has spent its STEPS', async () => {
+    const { tasks, id } = await held(600);
+    const budget = new RunBudget(2, null, 600);
+    const ledger = ledgerStartedSecondsAgo(1);
+
+    expect(
+      await codeOf(async () => tasks.extendLease((await tasks.find(id))!, 'w-1', 30, ledger, budget)),
+    ).toBe('no error');
+
+    ledger.recordSteps(2);
+
+    expect(
+      await codeOf(async () => tasks.extendLease((await tasks.find(id))!, 'w-1', 30, ledger, budget)),
     ).toBe('run_not_permitted');
   });
 
@@ -915,19 +1104,71 @@ describe('an agent cannot complete its own task by default', () => {
       authorizer: new ToolAuthorizer({ enabled: true, call: () => true }),
     })(session);
 
-    for (const args of [{}, { outcome: 'complete' }, { outcome: 'DONE' }, { outcome: true }, { outcome: null }]) {
-      expect(await codeOf(() => Promise.resolve(tool.handle(args as JsonObject)))).toBe(
-        'task_outcome_invalid',
-      );
+    // PADDED values are the adversarial half, and they are BUILT from the
+    // fixture list rather than typed out, so the meta-test guarantees every one
+    // of them is a codepoint JavaScript's own `trim()` would remove. An
+    // implementation that trimmed the outcome before comparing would turn every
+    // one of these into a valid `done` and close the task; nothing here trims,
+    // so all of them are refused. Same rule as the identifiers, same reason.
+    const padded = PADDING.flatMap((pad) => [`${pad}done`, `done${pad}`, `${pad}done${pad}`]);
+    const rejected = [
+      'complete',
+      'DONE',
+      true,
+      // PRESENT-and-null is present. The model said something; it is just not
+      // something this tool acts on.
+      null,
+      // ABSENT, which the reference settled as a refusal too.
+      undefined,
+      ...padded,
+    ];
+
+    expect(padded).toHaveLength(PADDING.length * 3);
+
+    // COUNTED, because `vitest list` shows the `it` and not the iterations
+    // inside it. Python had a padded-outcome fixture that was defined and never
+    // wired into the loop that was supposed to use it — the NBSP and U+3000
+    // cases never executed, and a green run looked exactly the same. A count
+    // asserted against the fixture length is what makes that visible here.
+    let refused = 0;
+
+    for (const outcome of rejected) {
+      expect(
+        await codeOf(() => Promise.resolve(tool.handle({ outcome } as unknown as JsonObject))),
+      ).toBe('task_outcome_invalid');
+      refused += 1;
     }
 
-    // The capability question, not the message: after five malformed calls the
+    expect(refused).toBe(rejected.length);
+    expect(refused).toBe(5 + PADDING.length * 3);
+
+    // The capability question, not the message: after every malformed call the
     // task is still open.
     expect((await tasks.find(id))?.state()).toBe('claimed');
 
     // The positive control: the exact value works.
     expect(await codeOf(() => Promise.resolve(tool.handle({ outcome: 'done' })))).toBe('no error');
     expect((await tasks.find(id))?.state()).toBe('done');
+  });
+
+  it('REFUSES an absent outcome rather than assuming done', async () => {
+    // The argument for the other answer is real — calling a tool named
+    // `complete_task` looks like the declaration by itself — and the reference
+    // settled against it. Same code as a malformed value, so a model that
+    // omitted the argument is told to say which outcome it means.
+    const { tasks, session, id } = await heldTask();
+    const tool = agentCompletionTool({
+      source: tasks,
+      task: (await tasks.find(id))!,
+      worker: 'w-1',
+      authorizer: new ToolAuthorizer({ enabled: true, call: () => true }),
+    })(session);
+
+    expect(await codeOf(() => Promise.resolve(tool.handle({})))).toBe('task_outcome_invalid');
+    expect((await tasks.find(id))?.state()).toBe('claimed');
+
+    // The positive control: naming it works.
+    expect(await tool.handle({ outcome: 'done' })).toEqual({ id, state: 'done' });
   });
 
   it('lets the agent report a failure as well as a success', async () => {

@@ -78,11 +78,18 @@ export function agentCompletionTool(options: CompletionToolOptions): ToolFactory
     async handle(args: JsonObject): Promise<unknown> {
       const given = args.outcome;
 
-      // VALIDATED, not coerced, and this is the security-relevant line in the
-      // file. `outcome` is the one value the MODEL supplies, and it decides a
-      // terminal state. Mapping anything unrecognised onto `done` -- including
-      // a missing argument -- would mean a malformed call produces the more
-      // privileged result, which is an agent declaring victory by typo.
+      // REQUIRED and VALIDATED. `outcome` is the one value the MODEL supplies
+      // and it decides a terminal state, so mapping anything else onto `done`
+      // -- `"complete"`, `"DONE"`, `null`, or nothing at all -- would let a
+      // malformed call produce the more privileged result: an agent declaring
+      // victory by typo.
+      //
+      // ABSENT is refused too, and that is a ruling rather than an obvious
+      // reading. The argument for allowing it is real: calling a tool named
+      // `complete_task` looks like the declaration by itself. The reference
+      // settled it the other way, and the same code covers both, so a model
+      // that omitted the argument is told to say which outcome it means rather
+      // than having one chosen for it.
       if (given !== 'done' && given !== 'failed') {
         throw HarnessError.taskOutcomeInvalid(name, given);
       }

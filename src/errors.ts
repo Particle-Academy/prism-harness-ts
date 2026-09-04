@@ -36,6 +36,8 @@ export type HarnessErrorCode =
   | 'duplicate_task_id'
   /** A worker id or a task id was the empty string. */
   | 'task_identifier_blank'
+  /** A lease or extension of zero seconds or fewer was asked for. */
+  | 'task_lease_invalid'
   /** A task id was named that its source does not hold. */
   | 'task_not_found'
   /** A task that is already `done` or `failed` was released again. */
@@ -197,6 +199,24 @@ export class HarnessError extends Error {
     );
   }
 
+  /**
+   * A lease of zero seconds or fewer. REFUSED, not clamped.
+   *
+   * Clamping it to one second would fail closed, which is why this port did
+   * that first. The reference is right that it is still the wrong shape: a
+   * clamp is a value quietly becoming a DIFFERENT value, and this repository
+   * has already shipped a configuration that silently became a different
+   * configuration and stayed green the whole time. A caller asking for a
+   * zero-second lease has a bug, and the useful thing to hand back is the bug.
+   */
+  static taskLeaseInvalid(seconds: number): HarnessError {
+    return new HarnessError(
+      'task_lease_invalid',
+      `A lease of [${String(seconds)}] seconds was asked for. It must be at least one second: a ` +
+        'lease that has already expired when it is granted hands the same task to a second worker.',
+    );
+  }
+
   static taskNotFound(id: string): HarnessError {
     return new HarnessError('task_not_found', `No task with the id [${id}] is in this source.`);
   }
@@ -266,10 +286,14 @@ export class HarnessError extends Error {
    * The model named an outcome this tool will not act on.
    *
    * REFUSED, not coerced. The outcome is the one argument a model controls on
-   * this tool, and it decides a terminal state; mapping anything unrecognised
-   * onto `done` would mean a malformed argument produces the MORE privileged
-   * result -- an agent declaring victory by typo. Failing closed here costs a
-   * retry with a valid value.
+   * this tool, and it decides a terminal state; mapping `"complete"`, `"DONE"`,
+   * `null` or a MISSING argument onto `done` would mean a malformed call
+   * produces the MORE privileged result -- an agent declaring victory by typo.
+   * Failing closed here costs a retry with a valid value.
+   *
+   * Absent is covered by the same code deliberately. The argument for treating
+   * it as `done` is real -- calling a tool named `complete_task` looks like the
+   * declaration by itself -- and the reference settled against it.
    */
   static taskOutcomeInvalid(tool: string, given: unknown): HarnessError {
     return new HarnessError(

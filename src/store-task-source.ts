@@ -211,10 +211,7 @@ export class StoreTaskSource implements AgentTaskSource {
   async claim(worker: string, leaseSeconds: number = DEFAULT_LEASE_SECONDS): Promise<StoredAgentTask | null> {
     assertIdentifier(worker, 'worker id');
 
-    // A lease of zero is a claim that has already expired, which would hand the
-    // same task to a second worker in the same second -- the exact race this
-    // class prevents. Clamped rather than accepted, which fails closed.
-    const lease = Math.max(1, Math.trunc(leaseSeconds));
+    const lease = assertLease(leaseSeconds);
 
     return this.#store.withLock(this.#key, async () => {
       const now = this.#seconds();
@@ -317,13 +314,18 @@ export class StoreTaskSource implements AgentTaskSource {
   /**
    * Push this worker's lease out, and ONLY while it still holds it.
    *
-   * Bounded by the run's REMAINING WALL-CLOCK BUDGET, which is the whole
-   * argument. Unbounded self-extension is how a wedged worker holds a task
-   * forever, and a second timeout invented here would be one limit spelled two
-   * ways across an ecosystem -- which is how a limit ends up set in the place
-   * that is not enforced. `RunLedger.remainingSeconds()` against the
-   * `RunBudget` is already the stop condition, so extension stops when the
-   * run's own allowance does. Nothing new to enforce and nothing new to forget.
+   * Bounded by the RUN, which is the whole argument. Unbounded self-extension
+   * is how a wedged worker holds a task forever, and a second timeout invented
+   * here would be one limit spelled two ways across an ecosystem -- which is
+   * how a limit ends up set in the place that is not enforced. The `RunBudget`
+   * is already the stop condition, so extension stops when the run's own
+   * allowance does. Nothing new to enforce and nothing new to forget.
+   *
+   * TWO checks, not one. `exhaustion()` refuses outright -- cancelled, out of
+   * steps, out of money or out of time -- and `remainingSeconds()` then bounds
+   * how much is granted. Reading the spec's "remaining wall-clock budget"
+   * literally and checking only the second left a cancelled run able to keep
+   * extending; the reference settled it the other way.
    *
    * Granted seconds are `min(requested, remaining)`. A budget with no
    * wall-clock cap (`maxSeconds` null) grants what was asked, matching
@@ -348,7 +350,7 @@ export class StoreTaskSource implements AgentTaskSource {
   ): Promise<number> {
     assertIdentifier(worker, 'worker id');
 
-    const requested = Math.max(1, Math.trunc(seconds));
+    const requested = assertLease(seconds);
 
     return this.#store.withLock(this.#key, async () => {
       const now = this.#seconds();
@@ -372,18 +374,26 @@ export class StoreTaskSource implements AgentTaskSource {
         throw refusal;
       }
 
-      const remaining = ledger.remainingSeconds(budget);
+      // EXHAUSTION, not only the clock. The spec names the remaining
+      // wall-clock budget, and reading that literally was this port's first
+      // answer -- which left a CANCELLED run, or one that had spent its steps
+      // or its money, still able to push its lease out and hold a task it may
+      // no longer do anything with. `exhaustion()` is the existing stop
+      // condition and returns the REASON, so nothing new is invented and the
+      // four causes stay distinguishable.
+      const exhausted = ledger.exhaustion(budget);
 
-      if (remaining !== null && remaining <= 0) {
+      if (exhausted !== null) {
         if (changed) await this.#write(records, stored.nextId);
 
         throw HarnessError.runNotPermitted(
-          `The lease held by [${worker}] on the task [${raw.id}] cannot be extended: the run has no ` +
-            'wall-clock budget left. The run is the bound on how long a worker may hold a task, and ' +
-            'extending past it would be a second timeout wearing the first one\'s name.',
+          `The lease held by [${worker}] on the task [${raw.id}] cannot be extended: ${exhausted}. ` +
+            'The run is the bound on how long a worker may hold a task, and extending past it would ' +
+            'be a second timeout wearing the first one\'s name.',
         );
       }
 
+      const remaining = ledger.remainingSeconds(budget);
       const granted = remaining === null ? requested : Math.min(requested, remaining);
       const until = now + granted;
 
@@ -535,4 +545,27 @@ function assertIdentifier(value: string, what: string): void {
   if (value === '') {
     throw HarnessError.taskIdentifierBlank(what);
   }
+}
+
+/**
+ * A lease in whole seconds, REFUSING zero or less rather than clamping.
+ *
+ * Clamping to one second fails closed, which is why this was the first answer.
+ * It is still wrong: a clamp is a value quietly becoming a different value, and
+ * a caller who asked for a zero-second lease has a bug that a silent `1` hides.
+ *
+ * A positive fraction is still truncated, which is the same shape of quiet
+ * change on a smaller scale. Left as it is because only the `<= 0` rule has
+ * been ruled on across the three ports, and inventing the stricter rule here
+ * alone would be the unforced divergence the ruling exists to prevent. Raised
+ * rather than settled.
+ */
+function assertLease(seconds: number): number {
+  const whole = Math.trunc(seconds);
+
+  if (!Number.isFinite(whole) || whole <= 0) {
+    throw HarnessError.taskLeaseInvalid(seconds);
+  }
+
+  return whole;
 }

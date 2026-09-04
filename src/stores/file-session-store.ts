@@ -118,7 +118,11 @@ export class FileSessionStore implements SessionStore {
         // check-then-create is not, and the window between the two is exactly
         // where two workers both decide they hold the lock.
         const handle = await open(lockPath, 'wx');
-        await handle.writeFile(String(Date.now() + ttlSeconds * 1000), 'utf8');
+        // ONE write, and the terminator goes in it. The newline is what lets a
+        // reader tell a complete stamp from a torn one, so it must never be a
+        // second write that could be the half that did not land. See
+        // `#expired`, and note the format is shared with the other two ports.
+        await handle.writeFile(stamp(Date.now() + ttlSeconds * 1000), 'utf8');
         await handle.close();
 
         try {
@@ -176,26 +180,44 @@ export class FileSessionStore implements SessionStore {
     }
 
     // Nothing left to try but mark it dead. The TTL is the backstop, and it is
-    // why the lockfile carries one at all.
-    await writeFile(lockPath, '0', 'utf8').catch(() => undefined);
+    // why the lockfile carries one at all. TERMINATED like any other stamp: an
+    // unterminated `0` reads as a torn write, and a waiter would then sit on
+    // the mtime bound for a whole ttl instead of reclaiming it at once — the
+    // exact delay this path exists to avoid.
+    await writeFile(lockPath, stamp(0), 'utf8').catch(() => undefined);
   }
 
   /**
    * Whether this lock belonged to a holder that is gone.
    *
-   * ## An EMPTY lockfile is HELD, not expired in 1970
+   * ## An UNFINISHED stamp is HELD, not expired in 1970
    *
    * Taking the lock is an exclusive create and THEN a write of the expiry —
    * two operations, with a moment in between where the file exists and is
-   * empty. Reading it in that moment gave `Number('') === 0`, which is finite
-   * and is certainly `<= Date.now()`, so a waiter concluded the lock had
-   * expired, deleted it, and took a lock somebody was actively holding. Two
-   * callers, one key: the failure this lock exists to prevent, produced BY the
-   * mechanism meant to recover from a dead holder.
+   * incomplete. There are two ways to read it in that moment and both used to
+   * steal the lock:
    *
-   * It surfaced as a flaky test — about one run in eight — which is how it
-   * survived. A lock that is stolen only sometimes is worse than one that never
-   * works, because nothing goes red often enough to be believed.
+   *  - **Empty.** `Number('')` is `0`, which is finite and certainly
+   *    `<= Date.now()`.
+   *  - **Torn.** A partial write leaves a PREFIX of the timestamp —
+   *    `17356899` where `1735689900000` was meant — and every prefix of a
+   *    number is a SMALLER number. It parses, it is finite, and it is decades
+   *    in the past. This one is worse than the empty case precisely because it
+   *    does not look broken.
+   *
+   * Either way a waiter concluded the holder was long dead, deleted the lock,
+   * and took one somebody was actively holding. Two callers, one key: the
+   * failure this lock exists to prevent, produced BY the mechanism meant to
+   * recover from a dead holder. The empty case surfaced as a flaky test — about
+   * one run in eight — which is how it survived; the torn case would not have
+   * surfaced at all.
+   *
+   * The fix is the TERMINATOR. A stamp is digits followed by a newline, written
+   * in one write, so anything else is an unfinished write rather than a small
+   * number. Unreadable then means WAIT — `session_locked` after the wait
+   * period, which is loud and recoverable — instead of deleting a live holder's
+   * lock. The format is shared with the PHP and Python ports, because a worker
+   * in any of the three may be pointed at the same store directory.
    *
    * ## …but only until it is older than the ttl
    *
@@ -216,7 +238,10 @@ export class FileSessionStore implements SessionStore {
       return false;
     }
 
-    if (raw === '') {
+    // Digits AND a terminator, or this is not a finished stamp. Checked as a
+    // whole rather than by trying to parse and hoping a bad value fails to:
+    // the torn case parses perfectly and is the reason this check exists.
+    if (!STAMP.test(raw)) {
       try {
         const { mtimeMs } = await stat(lockPath);
 
@@ -226,7 +251,7 @@ export class FileSessionStore implements SessionStore {
       }
     }
 
-    const expiresAt = Number(raw);
+    const expiresAt = Number(raw.slice(0, -1));
 
     return Number.isFinite(expiresAt) && expiresAt <= Date.now();
   }
@@ -242,6 +267,22 @@ export class FileSessionStore implements SessionStore {
   #pathFor(key: string): string {
     return join(this.#directory, `${createHash('sha256').update(key).digest('hex').slice(0, 32)}.json`);
   }
+}
+
+/**
+ * A finished lock stamp: digits, then a newline. NOTHING ELSE.
+ *
+ * The terminator is the only thing that distinguishes a complete timestamp from
+ * a torn one, because a prefix of a timestamp is a perfectly valid smaller
+ * timestamp. Shared with the PHP and Python ports — a worker in any of the
+ * three may be pointed at the same store directory, and one that does not
+ * emit the newline has its locks waited out rather than reclaimed everywhere
+ * else.
+ */
+const STAMP = /^\d+\n$/;
+
+function stamp(expiresAt: number): string {
+  return `${String(Math.trunc(expiresAt))}\n`;
 }
 
 function isMissing(error: unknown): boolean {

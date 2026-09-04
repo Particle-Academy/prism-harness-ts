@@ -72,7 +72,7 @@ export interface AgentTask {
 /**
  * Where tasks come from.
  *
- * Three methods, and the first is the reason the interface exists.
+ * Four methods, and the first is the reason the interface exists.
  *
  * `claim()` is ONE call. "Read the next task" followed by "mark it mine" is two
  * round trips with a window between them, and two workers arriving in that
@@ -117,6 +117,21 @@ export interface AgentTaskSource {
    * every pass, and a consumer that wants one already has its own query.
    */
   pending(): Promise<number>;
+
+  /**
+   * The task with this id, as it stands now, or null.
+   *
+   * On the contract because `release()` takes a TASK and every external caller
+   * holds only an ID. A tool call carries `{"id": "t-1"}`; an HTTP route has
+   * `/tasks/t-1`; a worker resuming after a restart has whatever it wrote down.
+   * Without this the contract could be driven only by code that still had the
+   * object `claim()` returned, which is the one caller that does not need it.
+   *
+   * A FRESH read, with any expired lease already applied -- so a task whose
+   * lease ran out reports `todo` here even if the store has not been rewritten
+   * yet.
+   */
+  find(id: string): Promise<AgentTask | null>;
 }
 
 /**

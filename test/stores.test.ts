@@ -16,6 +16,23 @@ async function fileStore(): Promise<FileSessionStore> {
 }
 
 /**
+ * A FINISHED lock stamp: the expiry, then the terminator the reader requires.
+ *
+ * Every test below that plants a lockfile by hand goes through here, so none of
+ * them can accidentally plant a half-written one and then assert the reader's
+ * behaviour on the wrong input. The format is shared with the PHP and Python
+ * ports; `writes a stamp in the SHARED format` asserts the real writer emits
+ * exactly this, which is the only thing keeping this helper honest.
+ */
+function lockStamp(expiresAt: number): string {
+  // The newline as a code point rather than an escape: this file is edited by
+  // tooling that has mangled `\` sequences here before, and a terminator that
+  // silently became something else would make every test below assert the
+  // opposite of what it claims.
+  return `${String(Math.trunc(expiresAt))}${String.fromCharCode(10)}`;
+}
+
+/**
  * Both drivers must answer the same way. A test written against only the
  * in-memory one proves nothing about the driver a deployment actually uses,
  * and the two differ in exactly the places that matter — copying, expiry, and
@@ -244,12 +261,94 @@ describe('file store: a lockfile that exists but is not yet stamped', () => {
     expect(await store.withLock('k', () => 'taken', 10, 0.5)).toBe('taken');
   });
 
+  it('is treated as HELD when the stamp is TRUNCATED, not expired in 1970', async () => {
+    // The empty case reached through a different door, and the more dangerous
+    // one because it does not look broken. A torn write leaves a PREFIX of the
+    // timestamp — `17356899` where `1735689900000` was meant — and every prefix
+    // of a number is a smaller number. So it parses, it is finite, and it is
+    // decades in the past: the reader concludes the holder is long dead and
+    // deletes a lock somebody is holding right now.
+    //
+    // Refusing anything that is not terminated is what tells "torn" apart from
+    // "small". Unreadable has to mean WAIT.
+    const { store, lockPath } = await lockedDirectory();
+    let ranWhileHeld = false;
+
+    await writeFile(lockPath, String(Date.now() + 10_000).slice(0, 8), 'utf8');
+
+    await expect(
+      store.withLock(
+        'k',
+        () => {
+          ranWhileHeld = true;
+        },
+        10,
+        0.05,
+      ),
+    ).rejects.toMatchObject({ code: 'session_locked' });
+
+    expect(ranWhileHeld).toBe(false);
+  });
+
+  it('is still reclaimed once a TRUNCATED stamp is older than the ttl', async () => {
+    // Same bound as the empty case, and for the same reason: a torn write from
+    // a process that then died must not wedge the key forever.
+    const { store, lockPath } = await lockedDirectory();
+
+    await writeFile(lockPath, String(Date.now() + 10_000).slice(0, 8), 'utf8');
+
+    const longAgo = new Date(Date.now() - 60_000);
+    await utimes(lockPath, longAgo, longAgo);
+
+    expect(await store.withLock('k', () => 'taken', 10, 0.5)).toBe('taken');
+  });
+
+  it('writes a stamp its OWN reader accepts', async () => {
+    // A ROUND TRIP through the real writer and the real reader. Every other
+    // test in this block plants a lockfile by hand, so all of them would stay
+    // green if the writer stopped emitting the terminator the reader now
+    // demands — Python's mutation run found exactly that hole in its own
+    // suite. This is the test that closes it.
+    //
+    // The outer lock is taken with a ttl of zero, so its stamp is already in
+    // the past by the time anything reads it. The inner caller therefore has to
+    // PARSE what the writer wrote in order to reclaim: a stamp the reader
+    // cannot read falls through to the mtime bound, which has not elapsed, and
+    // the inner call would time out instead.
+    const { store } = await lockedDirectory();
+
+    const reclaimed = await store.withLock(
+      'k',
+      async () => store.withLock('k', () => 'reclaimed', 10, 1),
+      0,
+      5,
+    );
+
+    expect(reclaimed).toBe('reclaimed');
+  });
+
+  it('writes a stamp in the SHARED format: an integer and a terminator', async () => {
+    // The lockfile format is cross-language surface. A PHP, TypeScript or
+    // Python worker pointed at one store directory has to agree on it, and
+    // Python already requires the trailing newline: without it every lock this
+    // port takes reads as unterminated there, so a Python worker waits our
+    // locks out rather than reclaiming a dead one. Safe direction, real
+    // divergence. Asserted on the bytes, from inside a held lock.
+    const { store, lockPath } = await lockedDirectory();
+
+    const raw = await store.withLock('k', async () => readFile(lockPath, 'utf8'), 10, 5);
+
+    expect(raw.endsWith('\n')).toBe(true);
+    expect(raw.slice(0, -1)).toMatch(/^\d+$/);
+    expect(Number.isInteger(Number(raw.slice(0, -1)))).toBe(true);
+  });
+
   it('still reclaims a stamped lock whose expiry has passed', async () => {
     // The pre-existing behaviour, asserted so the fix above cannot quietly take
     // it away: a lock left by a dead holder must not wedge the key.
     const { store, lockPath } = await lockedDirectory();
 
-    await writeFile(lockPath, String(Date.now() - 1_000), 'utf8');
+    await writeFile(lockPath, lockStamp(Date.now() - 1_000), 'utf8');
 
     expect(await store.withLock('k', () => 'taken', 10, 0.5)).toBe('taken');
   });
@@ -258,7 +357,7 @@ describe('file store: a lockfile that exists but is not yet stamped', () => {
     const { store, lockPath } = await lockedDirectory();
     let ran = false;
 
-    await writeFile(lockPath, String(Date.now() + 60_000), 'utf8');
+    await writeFile(lockPath, lockStamp(Date.now() + 60_000), 'utf8');
 
     await expect(
       store.withLock(
@@ -308,8 +407,10 @@ describe('FileSessionStore', () => {
     );
     expect(files).toBeNull(); // no lock is held yet
 
-    // Plant an already-expired lock, as a killed process would leave behind.
-    await writeFile(await lockPath(directory, store), String(Date.now() - 1000), 'utf8');
+    // Plant an already-expired lock, as a killed process would leave behind —
+    // in the REAL format, terminator and all. Without the newline this is a
+    // torn write rather than an old one, and the reader is right to wait.
+    await writeFile(await lockPath(directory, store), lockStamp(Date.now() - 1000), 'utf8');
 
     expect(await store.withLock('k', () => 'recovered')).toBe('recovered');
   });
@@ -358,7 +459,8 @@ describe('FileSessionStore', () => {
     const directory = await mkdtemp(join(tmpdir(), 'prism-harness-store-'));
     const store = new FileSessionStore(directory);
     await store.put('k', {});
-    await writeFile(await lockPath(directory, store), '0', 'utf8');
+    // `#release` writes a TERMINATED zero, so this plants what it plants.
+    await writeFile(await lockPath(directory, store), lockStamp(0), 'utf8');
 
     const started = Date.now();
     // A wait far shorter than the 10s lock ttl: reclaiming has to come from the
