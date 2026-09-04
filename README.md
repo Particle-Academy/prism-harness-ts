@@ -43,7 +43,7 @@ requirements:
 | Slot | Holds | Losing it means |
 |---|---|---|
 | `ephemeral` | active mode, selected model, run bookkeeping | falls back to a default |
-| `durable` | threads, stored capabilities | work is gone |
+| `durable` | threads, stored capabilities, agent task lists | work is gone |
 
 **A store that reports itself volatile is REFUSED for the durable slot**, at the
 moment a session is opened. That is the guard the package exists for: a cache is
@@ -70,6 +70,69 @@ that look identical and never meet.
 and writing the new messages as one operation. Two turns landing concurrently
 would otherwise both read position 4 and both write position 5, silently losing
 a message — the race the reference tracks as prism-harness#2.
+
+## Agent task lists
+
+An agent given a goal has to keep working across many requests. It needs a list
+of what remains, and that list has to survive the request, the worker, a crash
+and a deploy.
+
+```ts
+const tasks = session.tasks();
+
+await tasks.addMany(['read the issue', 'write the patch', 'run the gates']);
+
+const task = await tasks.claim('worker-1');   // ONE atomic call
+
+if (task !== null) {
+  // …do the work…
+  await tasks.release(task, 'worker-1', 'done');
+}
+
+await tasks.pending();   // a COUNT, which is what a loop needs to stop
+```
+
+There is **no task model, no schema and no migration**. Two contracts and
+adapters: `AgentTaskSource` is where tasks come from, `AgentTask` is one unit of
+work. `StoreTaskSource` is the default, backed by the durable slot; a consumer
+with an existing table wraps their own record with `asAgentTask()` or mixes
+`withAgentTask()` into their class. Both satisfy one contract.
+
+Four states — `todo`, `claimed`, `done`, `failed` — and the transitions are
+pinned across all three languages:
+
+| | |
+|---|---|
+| `claim()` is one call | Read-then-mark is two operations with a window between them, and two workers arriving in that window get the same task. |
+| A claim carries an owner AND an expiry | Five minutes by default. An expired claim returns the task to **`todo`**, never to `failed`: a worker dying is not the task failing, and conflating them burns a retry that never ran. |
+| `claimed` is written before the work begins | So "started and died" is distinguishable from "never started". |
+| `done` and `failed` are terminal | Re-releasing one is an error, not a silent no-op. |
+| A worker may extend its own lease | Only while it still holds it, and bounded by the run's remaining wall-clock budget (`RunLedger.remainingSeconds()`). There is no second timeout to set — or to forget to set. The new expiry is `now + granted` even when that shortens the lease: the grant is what the run can still afford. |
+| `release()` names the worker | Not in the spec's sketch, and added because without it a completion tool can close any task in the list — including one another worker is midway through. A release by anyone but the holder is refused, and the refusal does not say who the holder is. |
+
+**A volatile store is refused**, the same way the durable slot is. A
+half-finished task list that vanishes on a deploy is indistinguishable from a
+finished one.
+
+**An empty worker id or task id is refused, and nothing is trimmed first.**
+`trim`, `strip` and `String.prototype.trim` each strip a different set of
+codepoints, so trimming would have three ports disagreeing about whether the
+same id is blank. A single space is a legal id. That is the `prism-human-plus`
+G-36 lesson applied before it costs anything.
+
+**An agent cannot mark its own task complete.** `release()` is the
+application's call, made from evidence. A consumer who wants the agent to close
+its own tasks builds `agentCompletionTool()` and authorizes it through the
+existing `ToolAuthorizer` — which must be enabled, because an authorizer that is
+off allows every call and would grant the authority while reading as a control.
+If the model can declare its own work done, "run until the goal is met" becomes
+"run until it decides it is met", and a run that has stalled ends by declaring
+victory.
+
+Stopping is the existing `RunBudget` — cost, turns and wall-clock. Dependency
+ordering is not here: drive [`fancy-flow`](https://github.com/Particle-Academy/fancy-flow)
+for that. A task list that grows a scheduler has rebuilt a workflow engine
+badly.
 
 ## Drivers
 

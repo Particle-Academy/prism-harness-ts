@@ -52,6 +52,35 @@ export type {
   PendingApproval,
 } from './runtime.js';
 
+export {
+  DEFAULT_LEASE_SECONDS,
+  TASK_STATES,
+  asAgentTask,
+  attributesToRecord,
+  canonicalTaskJson,
+  isTaskState,
+  isTerminalState,
+  recordToAttributes,
+  taskRecordFrom,
+  withAgentTask,
+} from './tasks.js';
+export type {
+  AgentTask,
+  AgentTaskAttributeSource,
+  AgentTaskAttributes,
+  AgentTaskRecord,
+  AgentTaskSource,
+  LeasedAgentTask,
+  TaskOutcome,
+  TaskState,
+} from './tasks.js';
+
+export { StoreTaskSource, StoredAgentTask } from './store-task-source.js';
+export type { Clock, StoreTaskSourceOptions } from './store-task-source.js';
+
+export { agentCompletionTool } from './task-tools.js';
+export type { CompletionToolOptions } from './task-tools.js';
+
 export { SkillRegistry } from './skills.js';
 
 export { SubagentRunner } from './subagent-runner.js';

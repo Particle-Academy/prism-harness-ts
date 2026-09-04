@@ -31,7 +31,34 @@ export type HarnessErrorCode =
   /** A tool call was refused by the call-time policy. */
   | 'call_not_authorized'
   /** A skill file was asked for that would resolve outside its own skill. */
-  | 'skill_path_refused';
+  | 'skill_path_refused'
+  /** A task was added under an id the source already holds. */
+  | 'duplicate_task_id'
+  /** A worker id or a task id was the empty string. */
+  | 'task_identifier_blank'
+  /** A task id was named that its source does not hold. */
+  | 'task_not_found'
+  /** A task that is already `done` or `failed` was released again. */
+  | 'task_already_terminal'
+  /**
+   * A worker acted on a task it is not holding.
+   *
+   * ONE code for every shape of "not yours": nobody holds it, someone else
+   * does, or your own lease has expired. Decision 0020 would rather see those
+   * split, and the first draft here did split them -- but decision 0004 pins
+   * codes ACROSS LANGUAGES, and the Python port settled on one. A consumer
+   * branching on a code that exists in one port and not another is worse than a
+   * coarse code that means the same thing everywhere. The sentence still says
+   * which case it was.
+   */
+  | 'task_lease_not_held'
+  /**
+   * A completion tool was called with an outcome that is not `done` or `failed`.
+   *
+   * NOT in the set the Python port settled, and raised rather than dropped --
+   * see `taskOutcomeInvalid` for why coercing instead is a security defect.
+   */
+  | 'task_outcome_invalid';
 
 export interface HarnessErrorOptions {
   cause?: unknown;
@@ -144,6 +171,132 @@ export class HarnessError extends Error {
    */
   static skillPathRefused(detail: string): HarnessError {
     return new HarnessError('skill_path_refused', `Refused to read a skill file: ${detail}.`);
+  }
+
+  /**
+   * A task list pointed at a store whose contents can vanish.
+   *
+   * The SAME code as `volatileDurableStore`, deliberately. It is the same
+   * misconfiguration reaching the same conclusion, and a consumer branching on
+   * "durable state was pointed somewhere it cannot live" should not have to
+   * know which feature noticed. Prose is free per prism-parity decision 0004;
+   * the code is not.
+   *
+   * A half-finished task list that vanishes on a deploy is indistinguishable
+   * from a finished one, which is why this refuses at construction rather than
+   * degrading to a default.
+   */
+  static volatileTaskSource(): HarnessError {
+    return new HarnessError(
+      'unsafe_state_configuration',
+      'An agent task list was pointed at a store that reports itself VOLATILE. The list is durable ' +
+        'state: losing it is a correctness failure, because a half-finished list that vanishes on a ' +
+        'deploy looks exactly like a finished one. Point it at a durable store, or -- if this store ' +
+        'really does persist -- declare it durable when you register it. That declaration is an ' +
+        'assertion about your infrastructure, not a preference.',
+    );
+  }
+
+  static taskNotFound(id: string): HarnessError {
+    return new HarnessError('task_not_found', `No task with the id [${id}] is in this source.`);
+  }
+
+  static duplicateTaskId(id: string): HarnessError {
+    return new HarnessError(
+      'duplicate_task_id',
+      `A task with the id [${id}] is already in this source. Ids are unique within a source, and ` +
+        'reusing one would let two units of work share a claim.',
+    );
+  }
+
+  /**
+   * An empty identifier, compared against `""` EXACTLY.
+   *
+   * DELIBERATELY NOT TRIMMED, in any of the three languages. PHP's `trim`,
+   * JavaScript's `String.prototype.trim` and Python's `str.strip` each strip a
+   * different set of codepoints, so trimming here would produce three different
+   * answers for the same input -- which is precisely how `prism-human-plus`
+   * G-36 happened. A worker id of one space is accepted, and that is the
+   * correct behaviour rather than an oversight.
+   */
+  static taskIdentifierBlank(what: string): HarnessError {
+    return new HarnessError(
+      'task_identifier_blank',
+      `The ${what} is the empty string. An identifier that is not an identifier would make one ` +
+        'claim indistinguishable from another.',
+    );
+  }
+
+  /**
+   * An error, never a silent no-op.
+   *
+   * A second `release()` means two things believe they own the outcome of one
+   * task, and swallowing it leaves whichever wrote last as the answer with
+   * nothing recording that they disagreed.
+   */
+  static taskAlreadyTerminal(id: string, state: string): HarnessError {
+    return new HarnessError(
+      'task_already_terminal',
+      `The task [${id}] is already [${state}], which is terminal. Re-releasing it is refused rather ` +
+        'than ignored: two callers believing they own one outcome is worth reporting.',
+    );
+  }
+
+  /**
+   * "You are not holding this" -- and NOT WHO IS.
+   *
+   * The holder is deliberately left out of the sentence. This error can be
+   * raised inside a tool call, and a tool's failure comes back to the model as
+   * readable text: naming the other worker would hand an agent the identity of
+   * a peer it has no business knowing, from a refusal. The caller that needs to
+   * know who holds a task can ask the source.
+   *
+   * Covers three situations -- nobody holds it, someone else does, and your own
+   * lease expired -- because all three have the same answer: claim it again.
+   */
+  static taskLeaseNotHeld(id: string, worker: string, detail: string): HarnessError {
+    return new HarnessError(
+      'task_lease_not_held',
+      `The worker [${worker}] is not holding the task [${id}]: ${detail}. Claim it again rather ` +
+        'than acting on it.',
+    );
+  }
+
+  /**
+   * The model named an outcome this tool will not act on.
+   *
+   * REFUSED, not coerced. The outcome is the one argument a model controls on
+   * this tool, and it decides a terminal state; mapping anything unrecognised
+   * onto `done` would mean a malformed argument produces the MORE privileged
+   * result -- an agent declaring victory by typo. Failing closed here costs a
+   * retry with a valid value.
+   */
+  static taskOutcomeInvalid(tool: string, given: unknown): HarnessError {
+    return new HarnessError(
+      'task_outcome_invalid',
+      `The tool [${tool}] was called with the outcome [${String(given)}]. It must be exactly [done] ` +
+        'or [failed]; anything else is refused rather than guessed at, because guessing would let a ' +
+        'malformed argument close a task.',
+    );
+  }
+
+  /**
+   * A self-completion tool built against an authorizer that is switched off.
+   *
+   * The same code, and the same argument, as `policyDefinedButDisabled`: a
+   * control that is never consulted reads as a control to every reader and is
+   * not one. An agent closing its own tasks is exactly the authority that must
+   * not be granted by accident.
+   */
+  static completionToolWithoutAuthorizer(name: string): HarnessError {
+    return new HarnessError(
+      'unsafe_authorization_configuration',
+      `The tool [${name}] would let the agent mark its own task complete, but the ToolAuthorizer it ` +
+        'was given is disabled, so nothing would ever be asked whether that call may proceed. An ' +
+        'agent that can close its own tasks turns "run until the goal is met" into "run until it ' +
+        'decides it is met". Enable the authorizer and give it a call policy, or do not register ' +
+        'this tool.',
+    );
   }
 
   static noAgentRuntime(action: string): HarnessError {

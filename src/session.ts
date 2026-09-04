@@ -2,6 +2,8 @@ import { createHash } from 'node:crypto';
 import type { JsonObject, JsonValue } from './json.js';
 import { isJsonObject } from './json.js';
 import type { SessionStore } from './stores/session-store.js';
+import { StoreTaskSource } from './store-task-source.js';
+import type { StoreTaskSourceOptions } from './store-task-source.js';
 import { Thread } from './thread.js';
 
 /**
@@ -134,6 +136,20 @@ export class Session {
   /** The stored conversation this session is bound to. */
   thread(): Thread {
     return new Thread(this.#durable, `${this.key()}:thread`);
+  }
+
+  /**
+   * The agent task list this session is bound to.
+   *
+   * The DURABLE half, alongside the thread, for the same reason: a
+   * half-finished task list that vanishes on a deploy is indistinguishable from
+   * a finished one. A volatile durable slot has already been refused by the
+   * store manager before this can be reached, and `StoreTaskSource` refuses one
+   * again on its own -- the second check is what makes a source built directly
+   * against a store as safe as one reached through here.
+   */
+  tasks(options: StoreTaskSourceOptions = {}): StoreTaskSource {
+    return new StoreTaskSource(this.#durable, `${this.key()}:tasks`, options);
   }
 
   async capability(name: string): Promise<JsonObject | null> {

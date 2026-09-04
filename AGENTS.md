@@ -7,22 +7,26 @@ the rules that bind, and the review skills.
 ## Gates — run them on EXIT CODES
 
 ```sh
-npm run typecheck   # tsc --noEmit; COVERS test/
+npm run typecheck   # tsc -p tsconfig.typecheck.json; COVERS src/ AND test/
 npm run build
 npx vitest run
 ```
+
+`typecheck` has its own tsconfig because `tsconfig.json` builds, and a build
+config cannot include `test/` without emitting it into `dist/`. It used to run
+against the build config and silently checked `src/` only — the line above said
+otherwise, which is a claim rather than a check. Verify it with
+`npx tsc -p tsconfig.typecheck.json --listFiles | grep test/` if you change it.
 
 Never pipe a gate into `head`/`tail`/`grep` and read `$?` — that is the
 FILTER's exit code, not the gate's. Redirect to a file, echo `$?`, then look.
 
 ## What this package holds
 
-Threads, session state, and store drivers. Nothing else yet — see the port gaps
-register in the envelope for what the PHP reference has that this does not
-(modes, skills, tool permissions, approvals, subagents, budgets, events, the
-config doctor).
+Threads, session state, store drivers, and agent task lists. See the port gaps
+register in the envelope for what the PHP reference has that this does not.
 
-## Three things that are load-bearing
+## Four things that are load-bearing
 
 1. **`Session.key()` must stay byte-identical to PHP's.** sha1 of the
    participant type, truncated to 12. It is what lets all three languages share
@@ -33,6 +37,16 @@ config doctor).
 
 3. **Thread positions are assigned inside the lock.** Read-then-write outside
    one loses a message when two turns land together, and nothing reports it.
+
+4. **A task record's `claimed_by` and `claimed_until` are `| null`, never
+   optional, and `claimed_until` is an INTEGER.** An optional property holding
+   `undefined` is dropped by `JSON.stringify`, and a dropped key is different
+   bytes from a key that is present and null. JavaScript also has no int/float
+   distinction, so a fractional timestamp passes every equality assertion and
+   still writes `1090.75` where the other ports write `1090` — assert
+   `Number.isInteger` on the STORED value, not equality. Both traps are ones
+   PHP cannot express; this is the port that can.
+   `specs/agent-task-lists.md` in `prism-parity` pins the exact string.
 
 ## Traps already hit here
 
