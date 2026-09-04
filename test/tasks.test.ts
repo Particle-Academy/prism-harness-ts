@@ -631,6 +631,64 @@ describe.each<[string, () => Promise<SessionStore>]>([
     expect((await tasks.find('t-1'))?.state()).toBe('done');
   });
 
+  it('refuses an outcome that is not one of the two, and WRITES NOTHING', async () => {
+    // `TaskOutcome` is a compile-time union and does not exist at run time, so
+    // the annotation on `release()` stops nothing: an outcome off a queue, an
+    // HTTP body or a JSON config arrives as an ordinary string. The cast here
+    // is what such a caller does, not a test convenience.
+    //
+    // Found by the cross-language corpus (G-39). Without the guard the string
+    // was written into the list as a `state` that is not one of the four, and
+    // nothing refused until a READER mapped the row back -- in any language.
+    const store = await make();
+    const tasks = new StoreTaskSource(store, 'tasks', { now: () => 1_000 });
+    await tasks.add('the work');
+
+    const claimed = await tasks.claim('w-1', 300);
+
+    for (const outcome of ['complete', ' done', 'DONE', 'Done', '', 'todo', 'claimed']) {
+      expect(await codeOf(() => tasks.release(claimed!, 'w-1', outcome as TaskOutcome))).toBe(
+        'task_outcome_invalid',
+      );
+    }
+
+    // Absent and null reach it too, from an untyped caller.
+    expect(
+      await codeOf(() => tasks.release(claimed!, 'w-1', undefined as unknown as TaskOutcome)),
+    ).toBe('task_outcome_invalid');
+    expect(await codeOf(() => tasks.release(claimed!, 'w-1', null as unknown as TaskOutcome))).toBe(
+      'task_outcome_invalid',
+    );
+
+    // THE ASSERTION THAT MATTERS. A refusal that still wrote the row would be a
+    // code comparison passing over a poisoned list: the state is untouched, the
+    // holder is untouched, and the task is still claimable by its owner.
+    const raw = (await store.get('tasks')) as unknown as { tasks: AgentTaskRecord[] };
+
+    expect(raw.tasks[0]?.state).toBe('claimed');
+    expect(raw.tasks[0]?.claimed_by).toBe('w-1');
+    expect((await tasks.find('t-1'))?.state()).toBe('claimed');
+
+    // The positive control: both real outcomes still go through.
+    expect(await codeOf(() => tasks.release(claimed!, 'w-1', 'done'))).toBe('no error');
+  });
+
+  it('refuses the OUTCOME first when the call is wrong in two ways at once', async () => {
+    // Observable ordering, chosen to match the reference: PHP converts the
+    // string through the TaskOutcome enum in the argument expression, so the
+    // outcome is judged before `release()` is entered. A blank worker AND an
+    // invalid outcome therefore report the outcome in all three languages.
+    const tasks = await source();
+    const task = await tasks.add('the work');
+
+    expect(await codeOf(() => tasks.release(task, '', 'complete' as TaskOutcome))).toBe(
+      'task_outcome_invalid',
+    );
+
+    // …and each guard still fires on its own.
+    expect(await codeOf(() => tasks.release(task, '', 'done'))).toBe('task_identifier_blank');
+  });
+
   it('does not return a failed task to todo on its own', async () => {
     // Automatic retry is a policy; policy needs backoff and attempt counts, and
     // that is the scheduler this must not become.

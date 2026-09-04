@@ -288,22 +288,25 @@ export class HarnessError extends Error {
   }
 
   /**
-   * The model named an outcome this tool will not act on.
+   * An outcome that is not `done` or `failed` was named.
    *
-   * REFUSED, not coerced. The outcome is the one argument a model controls on
-   * this tool, and it decides a terminal state; mapping `"complete"`, `"DONE"`,
-   * `null` or a MISSING argument onto `done` would mean a malformed call
-   * produces the MORE privileged result -- an agent declaring victory by typo.
-   * Failing closed here costs a retry with a valid value.
+   * REFUSED, not coerced. The outcome decides a TERMINAL state; mapping
+   * `"complete"`, `"DONE"`, `null` or a MISSING argument onto `done` would mean
+   * a malformed call produces the MORE privileged result -- an agent declaring
+   * victory by typo. Failing closed here costs a retry with a valid value.
    *
    * Absent is covered by the same code deliberately. The argument for treating
    * it as `done` is real -- calling a tool named `complete_task` looks like the
    * declaration by itself -- and the reference settled against it.
+   *
+   * `where` names the door that refused rather than always a tool, because
+   * there are two: the completion tool a model can call, and
+   * `StoreTaskSource.release()`, which is reachable from any untyped caller.
    */
-  static taskOutcomeInvalid(tool: string, given: unknown): HarnessError {
+  static taskOutcomeInvalid(where: string, given: unknown): HarnessError {
     return new HarnessError(
       'task_outcome_invalid',
-      `The tool [${tool}] was called with the outcome [${String(given)}]. It must be exactly [done] ` +
+      `[${where}] was given the outcome [${String(given)}]. It must be exactly [done] ` +
         'or [failed]; anything else is refused rather than guessed at, because guessing would let a ' +
         'malformed argument close a task.',
     );

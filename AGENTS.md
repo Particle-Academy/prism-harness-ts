@@ -37,17 +37,21 @@ PRISM_PARITY_CASES=<abs path>/prism-parity/suites/agent-task-claim/cases.json \
 node <parity>/tools/sync-corpus.mjs    # the loaders ship their own copies
 ```
 
-Off unless that variable is set. Two rows DIVERGE from the reference and are
-recorded as divergences rather than skipped — see the suite manifest's `ts` gap
-and G-39. Do not make a row agree by validating in the runner: a runner that
-supplies the guard measures the runner.
+Off unless that variable is set. All 20 rows the reference can express agree,
+and atc-0017 — which PHP cannot express — is answered rather than skipped. Two
+of them did NOT agree when the runner landed; they were recorded as divergences
+first and closing G-39 is what made them green.
+
+Do not make a row agree by validating in the runner: the runner passes the
+outcome through unvalidated on purpose, and that is what keeps atc-0011 and
+atc-0012 a test of `release()`'s guard rather than of the type in front of it.
 
 ## What this package holds
 
 Threads, session state, store drivers, and agent task lists. See the port gaps
 register in the envelope for what the PHP reference has that this does not.
 
-## Four things that are load-bearing
+## Five things that are load-bearing
 
 1. **`Session.key()` must stay byte-identical to PHP's.** sha1 of the
    participant type, truncated to 12. It is what lets all three languages share
@@ -68,6 +72,14 @@ register in the envelope for what the PHP reference has that this does not.
    `Number.isInteger` on the STORED value, not equality. Both traps are ones
    PHP cannot express; this is the port that can.
    `specs/agent-task-lists.md` in `prism-parity` pins the exact string.
+
+5. **A union type is not a guard, and every value crossing a door needs a
+   RUNTIME one.** `assertLease` takes `unknown` on purpose; `release()`'s
+   outcome did not, and a string that is not `done` or `failed` was written into
+   the durable list as a fifth state — refused by nothing until another language
+   tried to read the row. `assertOutcome` closed it (G-39). The rule generalises:
+   an annotation stops a TypeScript caller and stops nothing arriving from a
+   queue, an HTTP body or a JSON config.
 
 ## Traps already hit here
 

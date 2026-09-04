@@ -251,8 +251,13 @@ export class StoreTaskSource implements AgentTaskSource {
    * from `todo` to `done`, and a lease that expired mid-flight has already put
    * the task back where anyone can take it, so the worker that finally finished
    * may no longer be the one whose result counts.
+   *
+   * And refuses an OUTCOME that is not one of the two, BEFORE anything else --
+   * see `assertOutcome`, and the ordering note there.
    */
   async release(task: AgentTask, worker: string, outcome: TaskOutcome): Promise<void> {
+    const recorded = assertOutcome(outcome);
+
     assertIdentifier(worker, 'worker id');
 
     await this.#store.withLock(this.#key, async () => {
@@ -277,7 +282,7 @@ export class StoreTaskSource implements AgentTaskSource {
       // The owner and the expiry go to null. A terminal task is held by nobody,
       // and leaving a stale holder on it would make `claimed_by` mean two
       // different things depending on the state it sits beside.
-      records[index] = makeRecord(raw.id, raw.instruction, outcome, null, null);
+      records[index] = makeRecord(raw.id, raw.instruction, recorded, null, null);
 
       await this.#write(records, stored.nextId);
     });
@@ -545,6 +550,44 @@ function assertIdentifier(value: string, what: string): void {
   if (value === '') {
     throw HarnessError.taskIdentifierBlank(what);
   }
+}
+
+/**
+ * Exactly `done` or `failed`. Anything else is refused, never coerced.
+ *
+ * `TaskOutcome` is a union of string literals, which means it exists at COMPILE
+ * TIME AND NOWHERE ELSE. The annotation on `release()` stops nothing at run
+ * time: an outcome arriving from a queue payload, an HTTP body, a JSON config
+ * or any JavaScript caller reaches this method as an ordinary string, and the
+ * parameter is `unknown` here for the same reason `assertLease`'s is. Every
+ * door, not just the typed one.
+ *
+ * ## What made this a hole rather than a naming difference
+ *
+ * Found by `prism-parity/suites/agent-task-claim` (atc-0011, atc-0012), and it
+ * needed the cross-language corpus to see: the reference converts the string
+ * through a `TaskOutcome` ENUM at the call site and Python does the same, so
+ * both refuse before anything is written. Without this guard, `"complete"` was
+ * written into the DURABLE LIST as a `state` that is not one of the four, and
+ * nothing refused until a reader mapped the row back -- `unmappable_content`,
+ * for every language that opens that list. A TypeScript writer could poison a
+ * list a PHP or Python worker then could not read, and the language that
+ * reported the failure was not the one that caused it. See G-39.
+ *
+ * ## Refused FIRST, before the worker id and the holder check
+ *
+ * The order is observable and is chosen to match the reference, where the
+ * conversion happens in the argument expression and therefore before `release()`
+ * is entered at all. So a call that is wrong in two ways at once -- a blank
+ * worker AND an invalid outcome -- reports the outcome in all three languages.
+ * Nothing in the corpus pins this; it is pinned in this package's own suite.
+ */
+function assertOutcome(outcome: unknown): TaskOutcome {
+  if (outcome !== 'done' && outcome !== 'failed') {
+    throw HarnessError.taskOutcomeInvalid('StoreTaskSource.release()', outcome);
+  }
+
+  return outcome;
 }
 
 /**

@@ -546,7 +546,7 @@
         },
         "ts": {
           "outcome": "refused",
-          "code": "unmappable_content",
+          "code": "task_outcome_invalid",
           "record": null,
           "pending": null
         },
@@ -589,7 +589,7 @@
         },
         "ts": {
           "outcome": "refused",
-          "code": "unmappable_content",
+          "code": "task_outcome_invalid",
           "record": null,
           "pending": null
         },

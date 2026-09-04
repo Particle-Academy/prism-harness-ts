@@ -25,9 +25,13 @@ import {
  * per-language suite cannot see, because each one asserts against the value its
  * own code produced.
  *
- * Two rows DIVERGE from the PHP reference and are recorded as divergences
- * rather than skipped, because a skip would hide the finding. See the block
- * comment above `perform()` and the manifest's `ts` gap.
+ * Every one of the 20 rows the reference can express now agrees, and atc-0017 —
+ * which PHP cannot express — is answered rather than skipped. That was NOT true
+ * when this runner was written: atc-0011 and atc-0012 were recorded as
+ * divergences first, and closing G-39 is what made them agree. The order
+ * matters, and is the reason the divergence was recorded rather than fixed on
+ * sight: a row that only ever existed green proves nothing about the guard that
+ * makes it green.
  */
 
 /** The recorded shape of one row's outcome. Codes, never prose — decision 0004. */
@@ -172,8 +176,10 @@ function stringField(when: RowWhen, field: 'worker' | 'task_id' | 'outcome'): st
  * runner rather than the port, and record agreement the package has not earned
  * — the exact defect this repository exists to catch, one level up.
  *
- * What the port does with it is recorded in `result.ts` for atc-0011 and
- * atc-0012, and asserted below.
+ * The cast must therefore STAY, now that atc-0011 and atc-0012 pass. It is what
+ * keeps them a test of `StoreTaskSource.release()`'s runtime guard rather than
+ * of the type annotation in front of it — delete it and both rows would go on
+ * passing with the guard removed.
  */
 async function perform(source: StoreTaskSource, when: RowWhen): Promise<StoredAgentTask | null> {
   switch (when.op) {
@@ -338,46 +344,40 @@ describe.skipIf(Boolean(recordingInto))('agreement with the PHP reference', () =
     expect(canonical(await run(row))).toBe(canonical(row.result.php));
   });
 
-  it('agrees on 18 of the 20 rows the reference can express', () => {
-    expect(agreeing).toHaveLength(18);
+  it('agrees on ALL 20 rows the reference can express', () => {
+    expect(agreeing).toHaveLength(20);
     expect(comparable).toHaveLength(20);
   });
 
-  it('diverges on exactly the rows the manifest names', () => {
-    expect(diverging.map((row) => row.id)).toEqual(['atc-0011', 'atc-0012']);
+  it('diverges on nothing — and this is where a divergence would be named', () => {
+    // It named atc-0011 and atc-0012 until G-39 was closed. Kept as an
+    // assertion rather than deleted: a suite that had no place to record a
+    // divergence would have to hide the next one somewhere else.
+    expect(diverging.map((row) => row.id)).toEqual([]);
   });
 
-  it.each(diverging)('$id refuses like the reference but under a DIFFERENT code ($title)', async (row) => {
-    // Two assertions, and both matter. Recording a row as a "divergence" would
-    // otherwise let a real hole — an outcome accepted outright — hide behind
-    // the word. The refusal is asserted first, the disagreement second.
-    const produced = await run(row);
-
-    expect(produced.outcome).toBe('refused');
-    expect(produced.code).not.toBe((row.result.php as RowOutcome).code);
-  });
-
-  it('refuses the invalid outcome only at the READER, after the write has landed', async () => {
-    // The whole content of the divergence, stated as a fact about the stored
-    // list rather than as a code comparison.
+  it('refuses the invalid outcome AT THE DOOR, with NOTHING written', async () => {
+    // The G-39 regression test, stated as a fact about the stored list rather
+    // than as a code comparison — because the code comparison alone passed
+    // while the list was being poisoned.
     //
-    // `release()` validates the worker id and NOT the outcome: `TaskOutcome` is
-    // a compile-time union, so a string from a queue payload or a JSON config
-    // reaches `makeRecord()` unchallenged and is written to the durable list as
-    // a state that is not one of the four. Nothing refuses until something
-    // tries to READ the list back — at which point `taskRecordFrom()` refuses
-    // it as unmappable, for this port AND for the other two, because the bytes
-    // on the shared surface are now junk.
+    // `release()` now refuses an outcome that is not one of the two before it
+    // takes the lock, so `task_outcome_invalid` matches PHP and Python AND the
+    // seeded row is untouched. Assert both: a port that refused after writing
+    // would satisfy the first half and still hand every other language a row it
+    // cannot map.
     for (const id of ['atc-0011', 'atc-0012']) {
       const row = corpus.cases.find((entry) => entry.id === id)!;
       const { result, store } = await execute(row);
 
-      expect(result.code).toBe('unmappable_content');
+      expect(result.code).toBe('task_outcome_invalid');
+      expect(result.code).toBe((row.result.php as RowOutcome).code);
 
       const written = storedTasks(store)[0]!;
 
-      expect(written.state).toBe(row.when.outcome);
-      expect(written.claimed_by).toBeNull();
+      expect(written.state).toBe('claimed');
+      expect(written.claimed_by).toBe('w-1');
+      expect(written.state).not.toBe(row.when.outcome);
     }
   });
 
@@ -417,20 +417,21 @@ describe.skipIf(Boolean(recordingInto))('where the THREE languages stand', () =>
     expect(corpus.cases.filter((row) => row.result.py === null).map((row) => row.id)).toEqual([]);
   });
 
-  it('has THREE rows the languages answer differently, and they are not the same three', () => {
-    expect(disagreeing.map((row) => row.id)).toEqual(['atc-0011', 'atc-0012', 'atc-0017']);
+  it('has ONE row left that the languages answer differently', () => {
+    expect(disagreeing.map((row) => row.id)).toEqual(['atc-0017']);
   });
 
-  it('leaves this port ALONE on the outcome rows: PHP and Python refuse at the door', () => {
-    // The isolation matters more than the disagreement. Python's `TaskOutcome`
-    // is a runtime enum like PHP's, so both refuse `complete` and ` done`
-    // before anything is written. This port is the only one of the three that
-    // writes first — see G-39.
+  it('has all three refusing an invalid outcome at the door, under one code', () => {
+    // This was the row where this port stood alone (G-39). Kept as a
+    // three-language assertion rather than deleted with the fix: the value of
+    // the guard is that a list written HERE can be read THERE, which is a claim
+    // about the other two languages as much as this one.
     for (const id of ['atc-0011', 'atc-0012']) {
       const row = corpus.cases.find((entry) => entry.id === id)!;
 
+      expect(canonical(row.result.ts)).toBe(canonical(row.result.php));
       expect(canonical(row.result.py)).toBe(canonical(row.result.php));
-      expect((row.result.ts as RowOutcome).code).toBe('unmappable_content');
+      expect((row.result.ts as RowOutcome).code).toBe('task_outcome_invalid');
     }
   });
 
