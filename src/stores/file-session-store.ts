@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
-import { mkdir, open, readFile, rename, rm, unlink, writeFile } from 'node:fs/promises';
+import { mkdir, open, readFile, rename, rm, stat, unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { JsonObject } from '../json.js';
 import { isJsonObject } from '../json.js';
@@ -133,7 +133,7 @@ export class FileSessionStore implements SessionStore {
         // it. Left alone it would wedge the key forever, which is worse than
         // the small race in reclaiming it — and the reclaim is itself a
         // create-exclusive, so only one waiter can win.
-        if (await this.#expired(lockPath)) {
+        if (await this.#expired(lockPath, ttlSeconds)) {
           await unlink(lockPath).catch(() => undefined);
           continue;
         }
@@ -180,16 +180,55 @@ export class FileSessionStore implements SessionStore {
     await writeFile(lockPath, '0', 'utf8').catch(() => undefined);
   }
 
-  async #expired(lockPath: string): Promise<boolean> {
-    try {
-      const expiresAt = Number(await readFile(lockPath, 'utf8'));
+  /**
+   * Whether this lock belonged to a holder that is gone.
+   *
+   * ## An EMPTY lockfile is HELD, not expired in 1970
+   *
+   * Taking the lock is an exclusive create and THEN a write of the expiry —
+   * two operations, with a moment in between where the file exists and is
+   * empty. Reading it in that moment gave `Number('') === 0`, which is finite
+   * and is certainly `<= Date.now()`, so a waiter concluded the lock had
+   * expired, deleted it, and took a lock somebody was actively holding. Two
+   * callers, one key: the failure this lock exists to prevent, produced BY the
+   * mechanism meant to recover from a dead holder.
+   *
+   * It surfaced as a flaky test — about one run in eight — which is how it
+   * survived. A lock that is stolen only sometimes is worse than one that never
+   * works, because nothing goes red often enough to be believed.
+   *
+   * ## …but only until it is older than the ttl
+   *
+   * Treating an empty lockfile as held forever would let a process that died
+   * inside that window wedge the key permanently, which is the worse failure
+   * of the two. The file's own mtime bounds it: the window is microseconds in a
+   * live process, so a file still empty a whole ttl later belonged to one that
+   * did not survive it. Nothing extra has to be written for that to work.
+   */
+  async #expired(lockPath: string, ttlSeconds: number): Promise<boolean> {
+    let raw: string;
 
-      return Number.isFinite(expiresAt) && expiresAt <= Date.now();
+    try {
+      raw = await readFile(lockPath, 'utf8');
     } catch {
       // Gone between the failed create and this read: treat it as not expired
       // and let the next attempt take it cleanly.
       return false;
     }
+
+    if (raw === '') {
+      try {
+        const { mtimeMs } = await stat(lockPath);
+
+        return mtimeMs + ttlSeconds * 1000 <= Date.now();
+      } catch {
+        return false;
+      }
+    }
+
+    const expiresAt = Number(raw);
+
+    return Number.isFinite(expiresAt) && expiresAt <= Date.now();
   }
 
   /**

@@ -1,4 +1,5 @@
-import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, utimes, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { describe, expect, it } from 'vitest';
@@ -95,8 +96,16 @@ describe.each<[string, () => Promise<SessionStore>]>([
 
     await Promise.all([first, second]);
 
-    // The second caller must not begin before the first has finished.
-    expect(order).toEqual(['first-in', 'first-out', 'second-in']);
+    // MUTUAL EXCLUSION is what both drivers promise: the two critical sections
+    // must not overlap. WHICH of them wins is not promised by the file driver
+    // and cannot be — both callers race an exclusive `open`, and the loser is
+    // decided by the OS. Asserting the arrival order here instead failed about
+    // one run in twenty, and a gate that is red one time in twenty is a gate
+    // nobody believes. The ordering guarantee the in-memory driver does make is
+    // asserted on its own, below.
+    expect(order).toHaveLength(3);
+    expect(order).toContain('second-in');
+    expect(order.indexOf('first-out')).toBe(order.indexOf('first-in') + 1);
   });
 
   it('does not serialise DIFFERENT keys against each other', async () => {
@@ -118,9 +127,22 @@ describe.each<[string, () => Promise<SessionStore>]>([
     const store = await make();
     let ranWhileHeld = false;
 
+    // Wait for the first caller to ACTUALLY hold the lock before the second
+    // tries. Starting both and assuming the first wins is not safe on the file
+    // driver: both callers race an exclusive `open` and the OS picks, so the
+    // "waiter" sometimes took the lock cleanly and this test failed claiming a
+    // promise had resolved. That was the test being wrong, not the lock.
+    let acquired!: () => void;
+    const holding = new Promise<void>((resolve) => {
+      acquired = resolve;
+    });
+
     const held = store.withLock('k', async () => {
+      acquired();
       await new Promise((resolve) => setTimeout(resolve, 200));
     });
+
+    await holding;
 
     await expect(
       store.withLock(
@@ -136,6 +158,120 @@ describe.each<[string, () => Promise<SessionStore>]>([
 
     expect(ranWhileHeld).toBe(false);
     await held;
+  });
+});
+
+describe('memory store lock ordering', () => {
+  it('queues waiters in ARRIVAL order', async () => {
+    // The in-memory driver chains waiters onto a promise, so it can promise
+    // FIFO and does. Asserted here rather than in the shared block because the
+    // file driver cannot promise it: two callers race an exclusive create and
+    // the OS picks. Keeping the stronger assertion where it is true beats
+    // deleting it because one driver of two cannot meet it.
+    const store = new MemorySessionStore();
+    const order: string[] = [];
+
+    const runners = ['a', 'b', 'c'].map((name) =>
+      store.withLock('k', async () => {
+        order.push(name);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }),
+    );
+
+    await Promise.all(runners);
+
+    expect(order).toEqual(['a', 'b', 'c']);
+  });
+});
+
+/**
+ * The window between creating the lockfile and stamping it.
+ *
+ * Taking the lock is `open(…, 'wx')` and THEN writing the expiry — two
+ * operations, with a moment where the file exists and is empty. A waiter
+ * reading it in that moment used to compute `Number('') === 0`, conclude the
+ * lock had expired in 1970, delete it, and take a lock somebody was actively
+ * holding. That is the same key handed to two callers, which is the one thing
+ * this lock exists to prevent.
+ *
+ * It was not theoretical and it was not rare: it failed the suite above about
+ * one run in eight, as a timing flake, which is how it survived.
+ *
+ * These tests recreate the window directly rather than racing for it, because a
+ * test that has to win a race to fail is a test that passes for the wrong
+ * reason most of the time.
+ */
+describe('file store: a lockfile that exists but is not yet stamped', () => {
+  async function lockedDirectory(): Promise<{ store: FileSessionStore; lockPath: string }> {
+    const directory = await mkdtemp(join(tmpdir(), 'prism-harness-lockwindow-'));
+    const digest = createHash('sha256').update('k').digest('hex').slice(0, 32);
+
+    return { store: new FileSessionStore(directory), lockPath: join(directory, `${digest}.json.lock`) };
+  }
+
+  it('is treated as HELD, not as expired in 1970', async () => {
+    const { store, lockPath } = await lockedDirectory();
+    let ranWhileHeld = false;
+
+    await writeFile(lockPath, '', 'utf8');
+
+    await expect(
+      store.withLock(
+        'k',
+        () => {
+          ranWhileHeld = true;
+        },
+        10,
+        0.05,
+      ),
+    ).rejects.toMatchObject({ code: 'session_locked' });
+
+    expect(ranWhileHeld).toBe(false);
+  });
+
+  it('is still reclaimed once it is older than the ttl', async () => {
+    // The other half of the fix. Treating an empty lockfile as held FOREVER
+    // would let a process that died inside that window wedge the key, which is
+    // a worse failure than the one being fixed. The file's own age is the
+    // bound, so nothing new has to be written to make it recoverable.
+    const { store, lockPath } = await lockedDirectory();
+
+    await writeFile(lockPath, '', 'utf8');
+
+    const longAgo = new Date(Date.now() - 60_000);
+    await utimes(lockPath, longAgo, longAgo);
+
+    expect(await store.withLock('k', () => 'taken', 10, 0.5)).toBe('taken');
+  });
+
+  it('still reclaims a stamped lock whose expiry has passed', async () => {
+    // The pre-existing behaviour, asserted so the fix above cannot quietly take
+    // it away: a lock left by a dead holder must not wedge the key.
+    const { store, lockPath } = await lockedDirectory();
+
+    await writeFile(lockPath, String(Date.now() - 1_000), 'utf8');
+
+    expect(await store.withLock('k', () => 'taken', 10, 0.5)).toBe('taken');
+  });
+
+  it('does not reclaim a stamped lock whose expiry is in the future', async () => {
+    const { store, lockPath } = await lockedDirectory();
+    let ran = false;
+
+    await writeFile(lockPath, String(Date.now() + 60_000), 'utf8');
+
+    await expect(
+      store.withLock(
+        'k',
+        () => {
+          ran = true;
+        },
+        10,
+        0.05,
+      ),
+    ).rejects.toMatchObject({ code: 'session_locked' });
+
+    expect(ran).toBe(false);
   });
 });
 
