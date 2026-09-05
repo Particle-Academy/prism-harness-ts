@@ -3,7 +3,6 @@
   "version": "0.1.0",
   "description": "Durable agent sessions for TypeScript — threads, session state and store drivers.",
   "type": "module",
-  "private": true,
   "sideEffects": false,
   "engines": {
     "node": ">=20"
