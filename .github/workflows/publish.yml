@@ -1,4 +1,9 @@
-name: Release
+name: Publish
+
+# Named `publish.yml` to match the rest of the estate, and the FILENAME is
+# load-bearing: an npm Trusted Publisher binds to a repository plus a workflow
+# filename, so renaming this file breaks publishing until the entry on
+# npmjs.com is updated to match. It is not a cosmetic name.
 
 # Publishing is a tag push, and nothing else. There is no manual dispatch and no
 # "publish from a branch" path, because both let a release exist that no commit
