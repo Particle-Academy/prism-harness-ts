@@ -72,7 +72,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
-      contents: write
+      # `read`, not write: this job only builds and publishes. Creating the
+      # GitHub release is a separate job with its own write grant, so nothing
+      # here needs to modify the repository.
+      contents: read
       # OIDC. This is what replaces a stored npm token: there is no long-lived
       # credential in this repository's secrets to leak, rotate or exfiltrate,
       # and it is what lets npm attach a provenance attestation.
@@ -110,18 +113,6 @@ jobs:
       # the version is asserted rather than assumed -- an npm too old does not
       # fall back to something safe, it asks for a token that is not there and
       # fails at the end of a release.
-      - name: npm new enough for trusted publishing
-        run: |
-          npm install -g npm@latest
-          version="$(npm --version)"
-          echo "npm ${version}"
-
-          major="${version%%.*}"
-          if [ "${major}" -lt 11 ]; then
-            echo "::error::npm ${version} cannot use trusted publishing; 11.5.1 or later is required."
-            exit 1
-          fi
-
       # No NODE_AUTH_TOKEN, deliberately. Publishing is authorised by the OIDC
       # token minted from `id-token: write` above, against a trusted publisher
       # configured for this package on npmjs.com -- so there is no long-lived
@@ -131,8 +122,28 @@ jobs:
       # defines. An undefined secret expands to an EMPTY STRING rather than
       # failing, so the step would have run with blank auth and produced npm's
       # error rather than a statement of what was actually wrong.
+      # Published by a PINNED npm, run through npx rather than installed.
+      #
+      # Three separate traps, all of which cost the Fancy estate time first:
+      #   - setup-node with Node 22 bundles npm 10, and OIDC needs 11.5+
+      #   - `npm install -g npm@latest` FAILS with MODULE_NOT_FOUND:
+      #     promise-retry -- npm cannot reliably replace itself in place
+      #   - `npm@latest` via npx is not safe either: 12.0.0 broke provenance
+      #
+      # So the version is pinned, not floated. Match this pin to the rest of the
+      # estate rather than bumping it here alone.
+      #
+      # No NODE_AUTH_TOKEN, deliberately: authorisation is the OIDC token minted
+      # by `id-token: write` above, against a Trusted Publisher configured for
+      # this package on npmjs.com. This previously passed `secrets.NPM_TOKEN`,
+      # which no repository here defines -- and an undefined secret expands to an
+      # EMPTY STRING rather than failing, so it would have produced npm's own
+      # auth error at the end of a release instead of naming the real problem.
+      #
+      # `--access public` on EVERY publish, not just the first: scoped packages
+      # default to restricted.
       - name: Publish
-        run: npm publish --provenance --access public
+        run: npx -y npm@11.18.0 publish --provenance --access public
 
   release:
     name: Create the GitHub release
