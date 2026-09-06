@@ -105,10 +105,34 @@ jobs:
       # tarball, and npm shows it on the package page. It is the npm half of the
       # same argument as verifying Packagist actually serves a version: a
       # consumer should be able to check the artefact rather than trust it.
+      # Trusted publishing needs npm >= 11.5.1, and Node 22 ships npm 10.x. So
+      # the npm that does the publish is NOT the one setup-node installed, and
+      # the version is asserted rather than assumed -- an npm too old does not
+      # fall back to something safe, it asks for a token that is not there and
+      # fails at the end of a release.
+      - name: npm new enough for trusted publishing
+        run: |
+          npm install -g npm@latest
+          version="$(npm --version)"
+          echo "npm ${version}"
+
+          major="${version%%.*}"
+          if [ "${major}" -lt 11 ]; then
+            echo "::error::npm ${version} cannot use trusted publishing; 11.5.1 or later is required."
+            exit 1
+          fi
+
+      # No NODE_AUTH_TOKEN, deliberately. Publishing is authorised by the OIDC
+      # token minted from `id-token: write` above, against a trusted publisher
+      # configured for this package on npmjs.com -- so there is no long-lived
+      # credential in this repository's secrets to leak, rotate or exfiltrate.
+      #
+      # This previously passed `secrets.NPM_TOKEN`, which no repository here
+      # defines. An undefined secret expands to an EMPTY STRING rather than
+      # failing, so the step would have run with blank auth and produced npm's
+      # error rather than a statement of what was actually wrong.
       - name: Publish
         run: npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   release:
     name: Create the GitHub release
