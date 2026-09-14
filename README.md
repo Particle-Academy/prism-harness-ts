@@ -115,6 +115,52 @@ new ModeRegistry({
 A value that is not a map is refused when the mode is resolved, with
 `mode_malformed`.
 
+## What your model client receives
+
+`request.messages` is the thread, oldest first, in the shape the PHP reference
+stores Prism's messages:
+
+| `type` | Carries |
+|---|---|
+| `user` | `content`, and `additional_content` when the turn has attachments |
+| `assistant` | `content`, `tool_calls` (`id`, `name`, `arguments`, `result_id`, `reasoning_id`, `reasoning_summary`), `additional_content`, `tool_approval_requests` |
+| `tool_result` | `tool_results` (`tool_call_id`, `tool_name`, `args`, `result`, `tool_call_result_id`, `artifacts`), `tool_approval_responses` |
+
+Consecutive tool result rows reach the client as one, so each call's result is
+sent to the provider once. Return a call's provider ids as `resultId`,
+`reasoningId` and `reasoningSummary`, and provider state for the turn as
+`additionalContent`: they are recorded and come back in `messages`.
+
+## Approvals
+
+A mode names the tools a person must approve:
+
+```ts
+guarded: { system_prompt: '...', tools: ['read', 'delete'], requires_approval: ['delete'] },
+```
+
+A step that calls one stops with `finishReason: 'awaiting_approval'`. The calls
+that need nobody have already run. Record a decision for every pending approval,
+then resume with an empty prompt:
+
+```ts
+const response = await runtime.send(session, 'Clean up the failed run');
+
+if (response.finishReason === 'awaiting_approval') {
+  for (const pending of response.pendingApprovals) {
+    await recordApproval(session, pending.id, true); // or false, 'not on production'
+  }
+
+  await runtime.send(session, '');
+}
+```
+
+On resume the approved calls run once and denied calls return their reason, and
+then the model continues. The model is not asked to make the calls again. A
+pending call with no decision is refused with "No approval response provided".
+A call that has a result never runs again. Who may approve is your application's
+decision: authorize before calling `recordApproval()`.
+
 ## Agent task lists
 
 An agent given a goal has to keep working across many requests. It needs a list

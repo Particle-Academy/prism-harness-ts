@@ -1,5 +1,16 @@
 import { randomUUID } from 'node:crypto';
-import type { JsonObject } from './json.js';
+import type { JsonObject, JsonValue } from './json.js';
+import {
+  assistantRow,
+  threadView,
+  toolResultEntry,
+  toolResultRow,
+  type ApprovalDecisionEntry,
+  type ApprovalRequestEntry,
+  type AssistantRow,
+  type ToolResultEntry,
+  type ToolResultRow,
+} from './thread-rows.js';
 import { admitAttachments } from './attachments.js';
 import { HarnessError } from './errors.js';
 import type { HarnessEvents } from './events.js';
@@ -38,6 +49,15 @@ export interface LlmToolCall {
   id: string;
   name: string;
   arguments: JsonObject;
+  /**
+   * The ids a provider keys the call's result and reasoning by, when they differ
+   * from `id`. OpenAI's Responses API answers a `function_call` by its `call_id`,
+   * and replays the reasoning item it came from by id. Recorded on the call, as
+   * prism's ToolCall stores them, so the next request can send them back.
+   */
+  resultId?: string | null;
+  reasoningId?: string | null;
+  reasoningSummary?: readonly JsonValue[] | null;
 }
 
 export interface LlmResponse {
@@ -73,7 +93,9 @@ export interface AgentResponse {
 }
 
 export interface PendingApproval {
+  /** The APPROVAL id: what `recordApproval()` answers. Not the tool call id. */
   id: string;
+  toolCallId: string;
   tool: string;
   arguments: JsonObject;
 }
@@ -168,20 +190,29 @@ export class AgentRuntime {
       at: new Date().toISOString(),
     });
 
-    if (prompt !== '') {
-      // With attachments, the shape prism-ts's UserMessage.toObject() writes: the
-      // media parts, then the turn's own text as a trailing text part, which
-      // fromObject() strips back off. Without them, unchanged.
-      const turn: JsonObject =
-        attachments.length === 0
-          ? { type: 'user', content: prompt }
-          : { type: 'user', content: prompt, additional_content: [...attachments, { text: prompt }], additional_attributes: {} };
-
-      await thread.record([turn], runId);
-    }
-
     try {
-      return await this.#loop(session, mode, run, runId, provider, model, toolNames);
+      const resolved = await this.#tools.resolve(toolNames ?? mode.tools, session);
+      const offered = this.#authorizer ? await this.#authorizer.allowed(session, resolved) : [...resolved.values()];
+      const called: string[] = [];
+
+      // Decisions recorded since the run stopped are acted on FIRST, before a
+      // new prompt is recorded, so the results land after the calls they answer
+      // rather than after the new turn.
+      await this.#resolveApprovals(session, mode, offered, runId, called);
+
+      if (prompt !== '') {
+        // With attachments, the shape prism-ts's UserMessage.toObject() writes:
+        // the media parts, then the turn's own text as a trailing text part,
+        // which fromObject() strips back off. Without them, unchanged.
+        const turn: JsonObject =
+          attachments.length === 0
+            ? { type: 'user', content: prompt }
+            : { type: 'user', content: prompt, additional_content: [...attachments, { text: prompt }], additional_attributes: {} };
+
+        await thread.record([turn], runId);
+      }
+
+      return await this.#loop(session, mode, run, runId, provider, model, offered, called);
     } catch (error) {
       const failure = error instanceof Error ? error.message : String(error);
       await session.failRun(runId, failure);
@@ -205,15 +236,10 @@ export class AgentRuntime {
     runId: string,
     provider: string,
     model: string,
-    toolNames?: readonly string[],
+    offered: readonly HarnessTool[],
+    called: string[],
   ): Promise<AgentResponse> {
     const thread = session.thread();
-    const resolved = await this.#tools.resolve(toolNames ?? mode.tools, session);
-    const offered = this.#authorizer
-      ? await this.#authorizer.allowed(session, resolved)
-      : [...resolved.values()];
-
-    const called: string[] = [];
     let text = '';
     let finishReason = 'stop';
 
@@ -228,7 +254,7 @@ export class AgentRuntime {
 
       const response = await this.#client({
         systemPrompt: mode.systemPrompt,
-        messages: (await thread.messages()).map((entry) => entry.message),
+        messages: threadView((await thread.messages()).map((entry) => entry.message)),
         tools: offered,
         provider,
         model,
@@ -241,93 +267,118 @@ export class AgentRuntime {
       finishReason = response.finishReason;
 
       const toolCalls = response.toolCalls ?? [];
+      const gated = toolCalls.filter((call) => mode.needsApproval(call.name));
+      const requests: ApprovalRequestEntry[] = gated.map((call) => ({
+        approval_id: `apr_${randomUUID().replaceAll('-', '')}`,
+        tool_call_id: call.id,
+      }));
 
       // The next step's request is built from this row, so it keeps what a
-      // provider needs to be sent back: each call's arguments (a tool_use without
-      // its input is refused) and the provider state for the turn (G-58).
-      await thread.record(
-        [
-          {
-            type: 'assistant',
-            content: response.text,
-            tool_calls: toolCalls.map((call) => ({ id: call.id, name: call.name, arguments: call.arguments })),
-            additional_content: { ...(response.additionalContent ?? {}) },
-          },
-        ],
-        runId,
-      );
+      // provider needs sent back: each call's arguments and provider ids, the
+      // turn's provider state, and the approvals it is waiting on (G-58).
+      await thread.record([assistantRow(response.text, toolCalls, response.additionalContent, requests)], runId);
 
       if (toolCalls.length === 0) {
         return await this.#finish(session, runId, called, finishReason, text, run, null);
       }
 
-      const pending = await this.#pendingApprovals(session, mode, toolCalls);
+      // The calls that need nobody run now, as in the reference, and their
+      // results are recorded even when the step then stops for a person.
+      const results: ToolResultEntry[] = [];
 
-      if (pending.length > 0) {
-        // FAILS CLOSED. The run stops here and the request is already in the
-        // thread, so a different process can pick it up after a human answers.
-        await thread.record(
-          [{ type: 'tool_approval_request', approvals: pending as unknown as JsonObject[] }],
-          runId,
-        );
+      for (const call of toolCalls.filter((candidate) => !gated.includes(candidate))) {
+        called.push(call.name);
+        results.push(await this.#invoke(offered, call));
+      }
 
+      if (results.length > 0) {
+        await thread.record([toolResultRow(results)], runId);
+      }
+
+      if (requests.length > 0) {
+        // FAILS CLOSED. The gated calls have not run, and the requests are in
+        // the thread, so a different process can resume after a person answers.
         return {
           runId,
           text,
           steps: run.ledger.steps,
           toolCalls: called,
           finishReason: 'awaiting_approval',
-          pendingApprovals: pending,
+          pendingApprovals: gated.map((call, index) => ({
+            id: requests[index]!.approval_id,
+            toolCallId: call.id,
+            tool: call.name,
+            arguments: call.arguments,
+          })),
           stoppedBecause: null,
         };
-      }
-
-      for (const call of toolCalls) {
-        called.push(call.name);
-        await thread.record([await this.#invoke(offered, call)], runId);
       }
     }
   }
 
   /**
-   * Which of these calls needs a human, and has not had one.
+   * Act on the decisions recorded for the last turn that stopped for a person.
    *
-   * An approval already answered in the thread is NOT asked again — that is the
-   * whole point of recording it durably. An answered-and-denied approval is
-   * also not asked again; it is simply not executed.
+   * The model is NOT asked again. Asked again, a provider issues the call
+   * afresh under a new id, and a decision recorded against the old one never
+   * matches. The calls that stopped the run are answered where they are:
+   *
+   * - approved: run, once;
+   * - denied: the reason, as the result the model sees;
+   * - no decision: refused, "No approval response provided". Record every
+   *   decision before resuming.
+   *
+   * A call that already has a result is done and never runs again, whatever
+   * its decision says. The results are recorded as one tool result row holding
+   * every result and decision for the turn, as the reference writes it.
    */
-  async #pendingApprovals(
+  async #resolveApprovals(
     session: Session,
     mode: AgentMode,
-    toolCalls: readonly LlmToolCall[],
-  ): Promise<PendingApproval[]> {
-    const gated = toolCalls.filter((call) => mode.needsApproval(call.name));
+    offered: readonly HarnessTool[],
+    runId: string,
+    called: string[],
+  ): Promise<void> {
+    const view = threadView((await session.thread().messages()).map((entry) => entry.message));
+    let index = view.length - 1;
 
-    if (gated.length === 0) return [];
-
-    const answered = await this.#answeredApprovals(session);
-
-    return gated
-      .filter((call) => !answered.has(call.id))
-      .map((call) => ({ id: call.id, tool: call.name, arguments: call.arguments }));
-  }
-
-  async #answeredApprovals(session: Session): Promise<Map<string, boolean>> {
-    const answered = new Map<string, boolean>();
-
-    for (const entry of await session.thread().messages()) {
-      if (entry.message.type !== 'tool_approval_response') continue;
-
-      const id = entry.message.approval_id;
-      const approved = entry.message.approved;
-
-      if (typeof id === 'string') answered.set(id, approved === true);
+    while (index >= 0 && !(view[index]!.type === 'assistant' && (view[index] as AssistantRow).tool_calls.length > 0)) {
+      index -= 1;
     }
 
-    return answered;
+    if (index === -1) return;
+
+    const assistant = view[index] as AssistantRow;
+    const answered = view.slice(index + 1).find((row) => row.type === 'tool_result') as ToolResultRow | undefined;
+    const results = new Map((answered?.tool_results ?? []).map((entry) => [entry.tool_call_id, entry]));
+    const decisions = new Map((answered?.tool_approval_responses ?? []).map((entry) => [entry.approval_id, entry]));
+    const approvalIds = new Map(assistant.tool_approval_requests.map((request) => [request.tool_call_id, request.approval_id]));
+    const resolved: ToolResultEntry[] = [];
+
+    for (const call of assistant.tool_calls) {
+      if (results.has(call.id)) continue;
+
+      const gated = approvalIds.has(call.id) || mode.needsApproval(call.name);
+      const approvalId = approvalIds.get(call.id);
+      const decision: ApprovalDecisionEntry | undefined = approvalId === undefined ? undefined : decisions.get(approvalId);
+      const input = { id: call.id, name: call.name, arguments: call.arguments, resultId: call.result_id };
+
+      if (!gated) continue;
+
+      if (decision?.approved === true) {
+        called.push(call.name);
+        resolved.push(await this.#invoke(offered, input));
+      } else {
+        resolved.push(toolResultEntry(input, decision === undefined ? 'No approval response provided' : (decision.reason ?? 'User denied tool execution')));
+      }
+    }
+
+    if (resolved.length === 0) return;
+
+    await session.thread().record([toolResultRow([...results.values(), ...resolved], [...decisions.values()])], runId);
   }
 
-  async #invoke(offered: readonly HarnessTool[], call: LlmToolCall): Promise<JsonObject> {
+  async #invoke(offered: readonly HarnessTool[], call: LlmToolCall): Promise<ToolResultEntry> {
     const tool = offered.find((candidate) => candidate.name === call.name);
 
     if (tool === undefined) {
@@ -340,25 +391,14 @@ export class AgentRuntime {
     try {
       const result = await tool.handle(call.arguments);
 
-      return {
-        type: 'tool_result',
-        tool_call_id: call.id,
-        name: call.name,
-        result: typeof result === 'string' ? result : JSON.stringify(result ?? null),
-      };
+      return toolResultEntry(call, typeof result === 'string' ? result : JSON.stringify(result ?? null));
     } catch (error) {
       // A failed tool is a RESULT, not a crashed run: the model can often
       // recover, and losing the whole turn to one bad call is worse. A refused
       // call is different and is left to propagate — see `authorizedTool`.
       if (error instanceof HarnessError && error.code === 'call_not_authorized') throw error;
 
-      return {
-        type: 'tool_result',
-        tool_call_id: call.id,
-        name: call.name,
-        result: `The tool failed: ${error instanceof Error ? error.message : String(error)}`,
-        failed: true,
-      };
+      return toolResultEntry(call, `The tool failed: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
@@ -403,6 +443,12 @@ export class AgentRuntime {
  * already scoped to a participant, so nobody can answer another participant's
  * approval through it, but "this user may approve THIS action" is a question
  * only the host can answer. Authorize before calling.
+ *
+ * Nothing runs until the next `send()`, which acts on every decision recorded
+ * by then and refuses any pending call still without one. With several pending,
+ * record them all first.
+ *
+ * `approvalId` is `PendingApproval.id`, not the tool call id.
  */
 export async function recordApproval(
   session: Session,
@@ -412,15 +458,5 @@ export async function recordApproval(
 ): Promise<void> {
   const run = await session.run();
 
-  await session.thread().record(
-    [
-      {
-        type: 'tool_approval_response',
-        approval_id: approvalId,
-        approved,
-        reason,
-      },
-    ],
-    run?.id ?? null,
-  );
+  await session.thread().record([toolResultRow([], [{ approval_id: approvalId, approved, reason }])], run?.id ?? null);
 }

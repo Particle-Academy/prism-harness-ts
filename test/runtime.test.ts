@@ -19,6 +19,7 @@ import {
   type HarnessEvent,
   type HarnessTool,
   type LlmRequest,
+  type LlmToolCall,
   type LlmResponse,
   type Session,
 } from '../src/index.js';
@@ -120,7 +121,7 @@ describe('a plain turn', () => {
 });
 
 describe('what the next step is sent back (G-58)', () => {
-  it("records each call's arguments and the turn's provider state, and sends them on the next step", async () => {
+  it("records each call's arguments, provider ids and the turn's provider state, and sends them on the next step", async () => {
     // The next request is built from the thread. Recorded with an id and a name
     // only, a client had no input to send for the tool_use it was replaying, and
     // nowhere to find the thinking signature Anthropic requires with it.
@@ -130,7 +131,7 @@ describe('what the next step is sent back (G-58)', () => {
       {
         text: 'Checking.',
         finishReason: 'tool_calls',
-        toolCalls: [{ id: 'c1', name: 'echo', arguments: { value: 'x' } }],
+        toolCalls: [{ id: 'fc_1', name: 'echo', arguments: { value: 'x' }, resultId: 'call_1', reasoningId: 'rs_1' }],
         additionalContent: { thinking: 'Use the tool.', thinking_signature: 'sig-1' },
       },
       { text: 'Done.', finishReason: 'stop' },
@@ -143,12 +144,24 @@ describe('what the next step is sent back (G-58)', () => {
 
     await runtime(client).send(session, 'Use the tool');
 
-    expect(requests[1]?.messages.find((message) => message.type === 'assistant')).toEqual({
-      type: 'assistant',
-      content: 'Checking.',
-      tool_calls: [{ id: 'c1', name: 'echo', arguments: { value: 'x' } }],
-      additional_content: { thinking: 'Use the tool.', thinking_signature: 'sig-1' },
-    });
+    expect(requests[1]?.messages.slice(1)).toEqual([
+      {
+        type: 'assistant',
+        content: 'Checking.',
+        tool_calls: [
+          { id: 'fc_1', name: 'echo', arguments: { value: 'x' }, result_id: 'call_1', reasoning_id: 'rs_1', reasoning_summary: null },
+        ],
+        additional_content: { thinking: 'Use the tool.', thinking_signature: 'sig-1' },
+        tool_approval_requests: [],
+      },
+      {
+        type: 'tool_result',
+        tool_results: [
+          { tool_call_id: 'fc_1', tool_name: 'echo', args: { value: 'x' }, result: 'echoed:x', tool_call_result_id: 'call_1', artifacts: [] },
+        ],
+        tool_approval_responses: [],
+      },
+    ]);
   });
 
   it('records empty provider state when the client reports none', async () => {
@@ -162,7 +175,30 @@ describe('what the next step is sent back (G-58)', () => {
       content: 'Hello.',
       tool_calls: [],
       additional_content: {},
+      tool_approval_requests: [],
     });
+  });
+
+  it('records all of a step’s results as ONE row, as the reference does', async () => {
+    const session = await aSession();
+    const { client } = scripted([
+      {
+        text: '',
+        finishReason: 'tool_calls',
+        toolCalls: [
+          { id: 'c1', name: 'echo', arguments: { value: 'a' } },
+          { id: 'c2', name: 'echo', arguments: { value: 'b' } },
+        ],
+      },
+      { text: 'Done.', finishReason: 'stop' },
+    ]);
+
+    await runtime(client).send(session, 'go');
+
+    const rows = (await session.thread().messages()).map((m) => m.message);
+
+    expect(rows.map((row) => row.type)).toEqual(['user', 'assistant', 'tool_result', 'assistant']);
+    expect((rows[2]?.tool_results as { result: string }[]).map((entry) => entry.result)).toEqual(['echoed:a', 'echoed:b']);
   });
 });
 
@@ -214,90 +250,174 @@ describe('budgets', () => {
 });
 
 describe('approvals', () => {
+  function counting(counts: Record<string, number>) {
+    return new ToolRegistry()
+      .register({ name: 'echo', handle: (args) => { counts.echo = (counts.echo ?? 0) + 1; return `echoed:${String(args.value ?? '')}`; } })
+      .register({ name: 'shout', handle: (args) => { counts.shout = (counts.shout ?? 0) + 1; return `SHOUTED:${String(args.value ?? '')}`; } });
+  }
+
+  const guardedModes = new ModeRegistry({
+    default: 'guarded',
+    modes: { guarded: { system_prompt: 'Careful.', tools: ['echo', 'shout'], max_steps: 4, requires_approval: ['echo'] } },
+  });
+
+  function guardedRuntime(client: (request: LlmRequest) => Promise<LlmResponse>, counts: Record<string, number>) {
+    return new AgentRuntime({ client, modes: guardedModes, tools: counting(counts) });
+  }
+
+  /** A model that asks for the calls ONCE and then answers; a real provider does not re-issue a call under the same id. */
+  function once(toolCalls: LlmToolCall[], requests: LlmRequest[] = []) {
+    return async (request: LlmRequest): Promise<LlmResponse> => {
+      requests.push(request);
+
+      return requests.length === 1
+        ? { text: '', finishReason: 'tool_calls', toolCalls }
+        : { text: `Finished after ${requests.length - 1}.`, finishReason: 'stop' };
+    };
+  }
+
   it('STOPS and does not run a gated tool that has no approval', async () => {
     // Failing closed is the only safe direction: an unanswered approval that
     // executed anyway is exactly what the mechanism exists to prevent.
     const session = await aSession('guarded');
-    let handled = 0;
-    const tools = new ToolRegistry().register({
-      name: 'echo',
-      handle: () => {
-        handled += 1;
+    const counts: Record<string, number> = {};
 
-        return 'ran';
-      },
-    });
-    const { client } = scripted([
-      { text: '', finishReason: 'tool_calls', toolCalls: [{ id: 'c1', name: 'echo', arguments: { value: 'x' } }] },
-    ]);
+    const response = await guardedRuntime(once([{ id: 'c1', name: 'echo', arguments: { value: 'x' } }]), counts).send(session, 'go');
 
-    const response = await runtime(client, { tools }).send(session, 'go');
-
-    expect(handled).toBe(0);
+    expect(counts).toEqual({});
     expect(response.finishReason).toBe('awaiting_approval');
-    expect(response.pendingApprovals).toEqual([{ id: 'c1', tool: 'echo', arguments: { value: 'x' } }]);
-  });
-
-  it('writes the request to the THREAD, so another process can resume it', async () => {
-    const session = await aSession('guarded');
-    const { client } = scripted([
-      { text: '', finishReason: 'tool_calls', toolCalls: [{ id: 'c1', name: 'echo', arguments: {} }] },
+    expect(response.pendingApprovals).toEqual([
+      { id: expect.stringMatching(/^apr_[0-9a-f]{32}$/), toolCallId: 'c1', tool: 'echo', arguments: { value: 'x' } },
     ]);
-
-    await runtime(client).send(session, 'go');
-
-    const types = (await session.thread().messages()).map((m) => m.message.type);
-    expect(types).toContain('tool_approval_request');
   });
 
-  it('runs the tool once the approval is recorded, on a RESUMED turn', async () => {
-    // The approval a person grants this morning is a durable row, so the worker
-    // that resumes tonight — a different process, possibly after a deploy —
-    // reads the same answer.
+  it('writes the request onto the assistant row, so another process can resume it', async () => {
     const session = await aSession('guarded');
-    let handled = 0;
-    const tools = new ToolRegistry().register({
-      name: 'echo',
-      handle: () => {
-        handled += 1;
 
-        return 'ran';
-      },
-    });
+    const response = await guardedRuntime(once([{ id: 'c1', name: 'echo', arguments: {} }]), {}).send(session, 'go');
 
-    let turn = 0;
-    const client = async (): Promise<LlmResponse> => {
-      turn += 1;
+    const assistant = (await session.thread().messages()).find((m) => m.message.type === 'assistant')?.message;
+    expect(assistant?.tool_approval_requests).toEqual([{ approval_id: response.pendingApprovals[0]!.id, tool_call_id: 'c1' }]);
+  });
 
-      return turn <= 2
-        ? { text: '', finishReason: 'tool_calls', toolCalls: [{ id: 'c1', name: 'echo', arguments: {} }] }
-        : { text: 'Finished.', finishReason: 'stop' };
-    };
+  it('runs the calls that need nobody, and records their results, before stopping for the rest', async () => {
+    const session = await aSession('guarded');
+    const counts: Record<string, number> = {};
 
-    const agent = runtime(client, { tools });
+    const response = await guardedRuntime(
+      once([
+        { id: 'c1', name: 'echo', arguments: { value: 'x' } },
+        { id: 'c2', name: 'shout', arguments: { value: 'y' } },
+      ]),
+      counts,
+    ).send(session, 'go');
 
-    await agent.send(session, 'go');
-    expect(handled).toBe(0);
+    expect(counts).toEqual({ shout: 1 });
+    expect(response.pendingApprovals.map((pending) => pending.toolCallId)).toEqual(['c1']);
+    expect((await session.thread().messages()).map((m) => m.message.type)).toEqual(['user', 'assistant', 'tool_result']);
+  });
 
-    await recordApproval(session, 'c1', true);
+  it('runs an approved call ONCE on the resumed turn, without asking the model again', async () => {
+    // A real provider asked again issues the call afresh under a new id, so a
+    // decision recorded against the old id would never match. The call that
+    // stopped the run is answered where it is.
+    const session = await aSession('guarded');
+    const counts: Record<string, number> = {};
+    const requests: LlmRequest[] = [];
+    const agent = guardedRuntime(once([{ id: 'c1', name: 'echo', arguments: { value: 'x' } }], requests), counts);
+
+    const first = await agent.send(session, 'go');
+    await recordApproval(session, first.pendingApprovals[0]!.id, true);
     const resumed = await agent.send(session, '');
 
-    expect(handled).toBe(1);
-    expect(resumed.text).toBe('Finished.');
+    expect(counts).toEqual({ echo: 1 });
+    expect(resumed.text).toBe('Finished after 1.');
+    expect(resumed.toolCalls).toEqual(['echo']);
+    // The model saw one tool result turn holding the result and the decision.
+    expect(requests[1]?.messages.at(-1)).toMatchObject({
+      type: 'tool_result',
+      tool_results: [{ tool_call_id: 'c1', result: 'echoed:x' }],
+      tool_approval_responses: [{ approved: true }],
+    });
   });
 
-  it('does not ask twice once an approval is answered', async () => {
+  it('sends a denied call the reason, and a call with no decision a refusal, and runs neither', async () => {
     const session = await aSession('guarded');
-    const { client } = scripted([
-      { text: '', finishReason: 'tool_calls', toolCalls: [{ id: 'c1', name: 'echo', arguments: {} }] },
-      { text: 'done', finishReason: 'stop' },
+    const counts: Record<string, number> = {};
+    const requests: LlmRequest[] = [];
+    const agent = new AgentRuntime({
+      client: once(
+        [
+          { id: 'c1', name: 'echo', arguments: { value: 'a' } },
+          { id: 'c2', name: 'echo', arguments: { value: 'b' } },
+        ],
+        requests,
+      ),
+      modes: guardedModes,
+      tools: counting(counts),
+    });
+
+    const first = await agent.send(session, 'go');
+    await recordApproval(session, first.pendingApprovals[0]!.id, false, 'not today');
+    await agent.send(session, '');
+
+    expect(counts).toEqual({});
+    expect((requests[1]?.messages.at(-1)?.tool_results as { tool_call_id: string; result: string }[])).toEqual([
+      expect.objectContaining({ tool_call_id: 'c1', result: 'not today' }),
+      expect.objectContaining({ tool_call_id: 'c2', result: 'No approval response provided' }),
+    ]);
+  });
+
+  it('runs every approved call when all decisions are recorded before resuming', async () => {
+    const session = await aSession('guarded');
+    const counts: Record<string, number> = {};
+    const agent = guardedRuntime(
+      once([
+        { id: 'c1', name: 'echo', arguments: { value: 'a' } },
+        { id: 'c2', name: 'echo', arguments: { value: 'b' } },
+      ]),
+      counts,
+    );
+
+    const first = await agent.send(session, 'go');
+    for (const pending of first.pendingApprovals) await recordApproval(session, pending.id, true);
+    await agent.send(session, '');
+
+    expect(counts).toEqual({ echo: 2 });
+  });
+
+  it('never runs an approved call again once it has a result', async () => {
+    // The decision stays in the thread, and every later turn reads it again.
+    const session = await aSession('guarded');
+    const counts: Record<string, number> = {};
+    const agent = guardedRuntime(once([{ id: 'c1', name: 'echo', arguments: { value: 'x' } }]), counts);
+
+    const first = await agent.send(session, 'go');
+    await recordApproval(session, first.pendingApprovals[0]!.id, true);
+    await agent.send(session, '');
+    await agent.send(session, 'And again?');
+    await agent.send(session, '');
+
+    expect(counts).toEqual({ echo: 1 });
+  });
+
+  it('resumes an approval recorded by 0.3.0, in the rows it wrote', async () => {
+    // 0.3.0 kept the request in its own row, keyed by the CALL id, and answered
+    // it in a tool_approval_response row.
+    const session = await aSession('guarded');
+    const counts: Record<string, number> = {};
+
+    await session.thread().record([
+      { type: 'user', content: 'go' },
+      { type: 'assistant', content: '', tool_calls: [{ id: 'c1', name: 'echo', arguments: { value: 'x' } }], additional_content: {} },
+      { type: 'tool_approval_request', approvals: [{ id: 'c1', tool: 'echo', arguments: { value: 'x' } }] },
+      { type: 'tool_approval_response', approval_id: 'c1', approved: true, reason: null },
     ]);
 
-    await runtime(client).send(session, 'go');
-    await recordApproval(session, 'c1', true);
-    const resumed = await runtime(client).send(session, '');
+    const resumed = await guardedRuntime(async () => ({ text: 'Finished.', finishReason: 'stop' }), counts).send(session, '');
 
-    expect(resumed.pendingApprovals).toEqual([]);
+    expect(counts).toEqual({ echo: 1 });
+    expect(resumed.text).toBe('Finished.');
   });
 });
 
@@ -316,8 +436,7 @@ describe('tools', () => {
 
     expect(response.text).toBe('Recovered.');
     const result = (await session.thread().messages()).find((m) => m.message.type === 'tool_result');
-    expect(result?.message.failed).toBe(true);
-    expect(String(result?.message.result)).toContain('exploded');
+    expect(String((result?.message.tool_results as { result: string }[])[0]?.result)).toContain('exploded');
   });
 
   it('lets a REFUSED call propagate rather than feeding it back to the model', async () => {

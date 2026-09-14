@@ -42,6 +42,16 @@ export { diagnose } from './doctor.js';
 export type { DoctorFinding, DoctorReport, DoctorSubjects } from './doctor.js';
 
 export { AgentRuntime, recordApproval } from './runtime.js';
+export { assistantRow, threadView, toolResultEntry, toolResultRow } from './thread-rows.js';
+export type {
+  ApprovalDecisionEntry,
+  ApprovalRequestEntry,
+  AssistantRow,
+  ToolCallInput,
+  ToolCallRow,
+  ToolResultEntry,
+  ToolResultRow,
+} from './thread-rows.js';
 export type {
   AgentResponse,
   AgentRuntimeOptions,
