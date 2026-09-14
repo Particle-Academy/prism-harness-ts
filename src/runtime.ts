@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { JsonObject } from './json.js';
+import { admitAttachments } from './attachments.js';
 import { HarnessError } from './errors.js';
 import type { HarnessEvents } from './events.js';
 import type { AgentMode, ModeRegistry } from './modes.js';
@@ -25,6 +26,12 @@ export interface LlmRequest {
   tools: readonly HarnessTool[];
   provider: string;
   model: string;
+  /**
+   * The mode's `provider_options`, unchanged. A client passes them to its
+   * provider call (for prism-ts, `withProviderOptions()`); the harness does not
+   * interpret them.
+   */
+  providerOptions: Readonly<JsonObject>;
 }
 
 export interface LlmToolCall {
@@ -121,7 +128,11 @@ export class AgentRuntime {
     prompt: string,
     toolNames?: readonly string[],
     context?: RunContext,
+    additionalContent: readonly unknown[] = [],
   ): Promise<AgentResponse> {
+    // Refused before a run exists: a bad attachment is a mistake in the call,
+    // and it should not cost a run, events or budget.
+    const attachments = admitAttachments(prompt, additionalContent);
     const mode = this.#modes.resolve(await session.mode());
     const provider = (await session.provider()) ?? 'unknown';
     const model = (await session.model()) ?? 'unknown';
@@ -150,7 +161,15 @@ export class AgentRuntime {
     });
 
     if (prompt !== '') {
-      await thread.record([{ type: 'user', content: prompt }], runId);
+      // With attachments, the shape prism-ts's UserMessage.toObject() writes: the
+      // media parts, then the turn's own text as a trailing text part, which
+      // fromObject() strips back off. Without them, unchanged.
+      const turn: JsonObject =
+        attachments.length === 0
+          ? { type: 'user', content: prompt }
+          : { type: 'user', content: prompt, additional_content: [...attachments, { text: prompt }], additional_attributes: {} };
+
+      await thread.record([turn], runId);
     }
 
     try {
@@ -205,6 +224,7 @@ export class AgentRuntime {
         tools: offered,
         provider,
         model,
+        providerOptions: mode.providerOptions,
       });
 
       run.ledger.recordSteps(1);

@@ -60,7 +60,15 @@ export type HarnessErrorCode =
    * NOT in the set the Python port settled, and raised rather than dropped --
    * see `taskOutcomeInvalid` for why coercing instead is a security defect.
    */
-  | 'task_outcome_invalid';
+  | 'task_outcome_invalid'
+  /** A turn attachment was built from a URL or a path. */
+  | 'attachment_by_reference'
+  /** A turn attachment is not an image, document, audio or video. */
+  | 'attachment_not_media'
+  /** A turn attachment carries no bytes, no file id and no chunks. */
+  | 'attachment_empty'
+  /** Attachments were offered with an empty prompt, which sends no user message. */
+  | 'attachment_without_prompt';
 
 export interface HarnessErrorOptions {
   cause?: unknown;
@@ -335,6 +343,43 @@ export class HarnessError extends Error {
     return new HarnessError(
       'no_agent_runtime',
       `This session cannot ${action}: it was built without an agent runtime.`,
+    );
+  }
+  /**
+   * A turn attachment built from a URL or a path.
+   *
+   * A URL from request input is somebody else's choice of address, and a path's
+   * contents would go to a third-party model. The same four attachment codes are
+   * raised by the PHP reference and the Python port.
+   */
+  static attachmentByReference(index: number, what: string): HarnessError {
+    return new HarnessError(
+      'attachment_by_reference',
+      `Attachment [${index}] was built from ${what}. A turn sends media as its bytes or as a provider file id, ` +
+        'never as a URL or path for someone else to resolve. Read the content yourself and attach the bytes.',
+    );
+  }
+
+  static attachmentNotMedia(index: number, type: string): HarnessError {
+    return new HarnessError(
+      'attachment_not_media',
+      `Attachment [${index}] is ${type}, not an image, document, audio or video. A turn's text belongs in the prompt.`,
+    );
+  }
+
+  static attachmentEmpty(index: number): HarnessError {
+    return new HarnessError(
+      'attachment_empty',
+      `Attachment [${index}] carries nothing to send: no bytes, no file id and no chunks.`,
+    );
+  }
+
+  /** An empty prompt resumes a paused run and sends no user message, so attachments would vanish. */
+  static attachmentWithoutPrompt(): HarnessError {
+    return new HarnessError(
+      'attachment_without_prompt',
+      'Attachments need a prompt to travel with. An empty prompt resumes a paused run and sends no user ' +
+        'message, so these attachments would be dropped without a word.',
     );
   }
 }

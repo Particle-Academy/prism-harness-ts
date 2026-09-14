@@ -85,3 +85,6 @@ export { SkillRegistry } from './skills.js';
 
 export { SubagentRunner } from './subagent-runner.js';
 export type { SubagentOutcome, SubagentResult } from './subagent-runner.js';
+
+export { admitAttachments } from './attachments.js';
+export type { Attachment, MediaLike } from './attachments.js';

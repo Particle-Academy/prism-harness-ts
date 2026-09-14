@@ -1,4 +1,6 @@
 import { HarnessError } from './errors.js';
+import type { JsonObject } from './json.js';
+import { isJsonObject } from './json.js';
 import type { Subagent } from './subagents.js';
 import { subagentFromConfig } from './subagents.js';
 
@@ -9,6 +11,8 @@ export interface ModeConfig {
   max_steps?: number;
   subagents?: Record<string, unknown>;
   requires_approval?: readonly string[];
+  /** Passed unchanged to the model client on every run in this mode. Must be a map. */
+  provider_options?: Record<string, unknown>;
 }
 
 export interface ModeRegistryConfig {
@@ -34,6 +38,8 @@ export class AgentMode {
     readonly subagents: Readonly<Record<string, Subagent>> = {},
     /** Tools that must not run until a human says so. */
     readonly requiresApproval: readonly string[] = [],
+    /** Options handed to the provider on every run in this mode, unchanged. */
+    readonly providerOptions: Readonly<JsonObject> = {},
   ) {}
 
   /**
@@ -98,6 +104,7 @@ export class ModeRegistry {
       maxSteps,
       this.#subagentsFor(wanted, mode),
       strings(mode.requires_approval),
+      providerOptionsFor(wanted, mode.provider_options),
     );
   }
 
@@ -139,4 +146,22 @@ export class ModeRegistry {
 
 function strings(value: readonly unknown[] | undefined): string[] {
   return (value ?? []).filter((entry): entry is string => typeof entry === 'string');
+}
+
+/**
+ * A mode's provider options, refused rather than ignored when they are not a map.
+ *
+ * A list or a scalar would reach the provider as nothing, and the mode would run
+ * without the option its author believes is on.
+ */
+function providerOptionsFor(name: string, declared: unknown): Readonly<JsonObject> {
+  if (declared === undefined) {
+    return {};
+  }
+
+  if (!isJsonObject(declared)) {
+    throw HarnessError.modeMalformed(name, 'provider_options must be a map of option names to values');
+  }
+
+  return declared;
 }
