@@ -126,6 +126,12 @@ export interface AgentRuntimeOptions {
  * the only safe direction: an unanswered approval that executed anyway is
  * exactly the outcome the whole mechanism exists to prevent.
  */
+/** How long resolving approvals may hold the session lock: long enough for a tool to run. */
+const RESOLUTION_LOCK_SECONDS = 300;
+
+/** How long a second worker waits for that lock before giving up without running anything. */
+const RESOLUTION_WAIT_SECONDS = 30;
+
 export class AgentRuntime {
   readonly #client: LlmClient;
 
@@ -339,6 +345,55 @@ export class AgentRuntime {
     runId: string,
     called: string[],
   ): Promise<void> {
+    // A read without the lock first: nearly every send() has nothing to resolve
+    // and should not wait on the session lock to find that out.
+    if ((await this.#unresolved(session, mode)) === null) return;
+
+    // Then under the session lock, reading again inside it. Two workers resuming
+    // the same session at once would otherwise both find the approved call with
+    // no result, and both run it. The second now waits, finds the result the
+    // first recorded, and runs nothing. If it cannot get the lock it throws
+    // SessionLocked, and nothing runs.
+    await session.lock(
+      async (live) => {
+        const work = await this.#unresolved(live, mode);
+
+        if (work === null) return;
+
+        const resolved: ToolResultEntry[] = [];
+
+        for (const call of work.calls) {
+          const input = { id: call.id, name: call.name, arguments: call.arguments, resultId: call.result_id };
+          const approvalId = work.approvalIds.get(call.id);
+          const decision = approvalId === undefined ? undefined : work.decisions.get(approvalId);
+
+          if (decision?.approved === true) {
+            called.push(call.name);
+            resolved.push(await this.#runApproved(offered, input));
+          } else {
+            resolved.push(
+              toolResultEntry(input, decision === undefined ? 'No approval response provided' : (decision.reason ?? 'User denied tool execution')),
+            );
+          }
+        }
+
+        await live.thread().record([toolResultRow([...work.results.values(), ...resolved], [...work.decisions.values()])], runId);
+      },
+      RESOLUTION_LOCK_SECONDS,
+      RESOLUTION_WAIT_SECONDS,
+    );
+  }
+
+  /**
+   * The gated calls of the last tool-calling turn that have no result yet, with
+   * what is needed to answer them, or null when there are none.
+   */
+  async #unresolved(session: Session, mode: AgentMode): Promise<{
+    calls: AssistantRow['tool_calls'];
+    results: Map<string, ToolResultEntry>;
+    decisions: Map<string, ApprovalDecisionEntry>;
+    approvalIds: Map<string, string>;
+  } | null> {
     const view = threadView((await session.thread().messages()).map((entry) => entry.message));
     let index = view.length - 1;
 
@@ -346,36 +401,46 @@ export class AgentRuntime {
       index -= 1;
     }
 
-    if (index === -1) return;
+    if (index === -1) return null;
 
     const assistant = view[index] as AssistantRow;
     const answered = view.slice(index + 1).find((row) => row.type === 'tool_result') as ToolResultRow | undefined;
     const results = new Map((answered?.tool_results ?? []).map((entry) => [entry.tool_call_id, entry]));
     const decisions = new Map((answered?.tool_approval_responses ?? []).map((entry) => [entry.approval_id, entry]));
     const approvalIds = new Map(assistant.tool_approval_requests.map((request) => [request.tool_call_id, request.approval_id]));
-    const resolved: ToolResultEntry[] = [];
 
-    for (const call of assistant.tool_calls) {
-      if (results.has(call.id)) continue;
+    // A call that has a result is DONE, whatever its decision says. A call that
+    // needs nobody is not this method's to run.
+    const calls = assistant.tool_calls.filter(
+      (call) => !results.has(call.id) && (approvalIds.has(call.id) || mode.needsApproval(call.name)),
+    );
 
-      const gated = approvalIds.has(call.id) || mode.needsApproval(call.name);
-      const approvalId = approvalIds.get(call.id);
-      const decision: ApprovalDecisionEntry | undefined = approvalId === undefined ? undefined : decisions.get(approvalId);
-      const input = { id: call.id, name: call.name, arguments: call.arguments, resultId: call.result_id };
+    return calls.length === 0 ? null : { calls, results, decisions, approvalIds };
+  }
 
-      if (!gated) continue;
-
-      if (decision?.approved === true) {
-        called.push(call.name);
-        resolved.push(await this.#invoke(offered, input));
-      } else {
-        resolved.push(toolResultEntry(input, decision === undefined ? 'No approval response provided' : (decision.reason ?? 'User denied tool execution')));
-      }
+  /**
+   * Run a call a person approved, or record why it could not run.
+   *
+   * Recorded rather than thrown. Resolution runs at the start of every send(),
+   * so a call that throws here, because its tool is no longer offered to this
+   * run or the authorizer now refuses it, would throw again on every later
+   * send(), and the session could never move on. The approval stands, but the
+   * call does not run.
+   */
+  async #runApproved(offered: readonly HarnessTool[], call: LlmToolCall): Promise<ToolResultEntry> {
+    if (!offered.some((tool) => tool.name === call.name)) {
+      return toolResultEntry(call, `Not run: ${call.name} is not available to this run.`);
     }
 
-    if (resolved.length === 0) return;
+    try {
+      return await this.#invoke(offered, call);
+    } catch (error) {
+      if (error instanceof HarnessError && error.code === 'call_not_authorized') {
+        return toolResultEntry(call, `Not run: this call to ${call.name} is not authorized.`);
+      }
 
-    await session.thread().record([toolResultRow([...results.values(), ...resolved], [...decisions.values()])], runId);
+      throw error;
+    }
   }
 
   async #invoke(offered: readonly HarnessTool[], call: LlmToolCall): Promise<ToolResultEntry> {

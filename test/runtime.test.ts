@@ -401,6 +401,68 @@ describe('approvals', () => {
     expect(counts).toEqual({ echo: 1 });
   });
 
+  it('runs an approved call once when two workers resume the same session at once', async () => {
+    // Without the session lock both read the approved call with no result, and
+    // both run it.
+    const directory = await mkdtemp(join(tmpdir(), 'prism-harness-concurrent-'));
+    const harness = new PrismHarness({
+      drivers: { memory: () => new MemorySessionStore(), files: () => new FileSessionStore(directory) },
+      stores: { ephemeral: 'memory', durable: 'files' },
+    });
+    const open = async () => {
+      const session = harness.for({ type: 'User', id: 1 }).session('support');
+      await session.usingMode('guarded');
+
+      return session;
+    };
+    const counts: Record<string, number> = {};
+    const tools = new ToolRegistry()
+      .register({
+        name: 'echo',
+        handle: async () => {
+          counts.echo = (counts.echo ?? 0) + 1;
+          await new Promise((resolve) => setTimeout(resolve, 50));
+
+          return 'ran';
+        },
+      })
+      .register({ name: 'shout', handle: () => 'SHOUT' });
+    const agent = () =>
+      new AgentRuntime({
+        client: async (request) =>
+          request.messages.some((row) => row.type === 'assistant')
+            ? { text: 'Finished.', finishReason: 'stop' }
+            : { text: '', finishReason: 'tool_calls', toolCalls: [{ id: 'c1', name: 'echo', arguments: {} }] },
+        modes: guardedModes,
+        tools,
+      });
+
+    const first = await agent().send(await open(), 'go');
+    await recordApproval(await open(), first.pendingApprovals[0]!.id, true);
+
+    await Promise.all([agent().send(await open(), ''), agent().send(await open(), '')]);
+
+    expect(counts).toEqual({ echo: 1 });
+  });
+
+  it('records an approved call whose tool is no longer offered as not run, rather than failing every later turn', async () => {
+    const session = await aSession('guarded');
+    const counts: Record<string, number> = {};
+    const first = await guardedRuntime(once([{ id: 'c1', name: 'echo', arguments: {} }]), counts).send(session, 'go');
+    await recordApproval(session, first.pendingApprovals[0]!.id, true);
+
+    // This run is offered shout only.
+    const withoutEcho = guardedRuntime(async () => ({ text: 'Finished.', finishReason: 'stop' }), counts);
+
+    await withoutEcho.send(session, '', ['shout']);
+    const again = await withoutEcho.send(session, 'Next', ['shout']);
+
+    expect(counts).toEqual({});
+    expect(again.text).toBe('Finished.');
+    const results = (await session.thread().messages()).map((m) => m.message).filter((row) => row.type === 'tool_result');
+    expect(JSON.stringify(results)).toContain('Not run: echo is not available to this run.');
+  });
+
   it('resumes an approval recorded by 0.3.0, in the rows it wrote', async () => {
     // 0.3.0 kept the request in its own row, keyed by the CALL id, and answered
     // it in a tool_approval_response row.
