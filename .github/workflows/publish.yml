@@ -215,7 +215,7 @@ jobs:
     name: Verify it is installable
     needs: release
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -226,14 +226,17 @@ jobs:
       #
       # npm's registry is eventually consistent after a publish, so this polls
       # rather than checking once, and says what to DO when it never appears.
+      # Fifteen minutes, not five: prism-opentelemetry-ts 0.2.0 was served after
+      # the five-minute poll gave up, and only a rerun went green.
+      # --prefer-online so a cached "not found" is not read back as the answer.
       - name: npm must serve this version
         run: |
           pkg="$(node -p "require('./package.json').name")"
           want="${GITHUB_REF_NAME#v}"
           echo "Waiting for ${pkg}@${want} on npm."
 
-          for attempt in 1 2 3 4 5 6 7 8 9 10; do
-            if npm view "${pkg}@${want}" version >/dev/null 2>&1; then
+          for attempt in $(seq 1 30); do
+            if npm view "${pkg}@${want}" version --prefer-online >/dev/null 2>&1; then
               echo "${pkg}@${want} is installable."
               exit 0
             fi
