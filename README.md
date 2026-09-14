@@ -108,7 +108,7 @@ to your provider call (with `prism-ts`, `withProviderOptions()`):
 
 ```ts
 new ModeRegistry({
-  modes: { overseer: { system_prompt: '...', provider_options: { thinking: { enabled: true } } } },
+  modes: { overseer: { system_prompt: '...', provider_options: { thinking: { type: 'adaptive' } } } },
 });
 ```
 
