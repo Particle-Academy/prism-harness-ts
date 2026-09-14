@@ -18,6 +18,7 @@ import {
   recordApproval,
   type HarnessEvent,
   type HarnessTool,
+  type LlmRequest,
   type LlmResponse,
   type Session,
 } from '../src/index.js';
@@ -66,7 +67,7 @@ async function aSession(mode = 'chat'): Promise<Session> {
   return session;
 }
 
-function runtime(client: () => Promise<LlmResponse>, extra: Partial<{ tools: ToolRegistry; authorizer: ToolAuthorizer; events: HarnessEvents }> = {}) {
+function runtime(client: (request: LlmRequest) => Promise<LlmResponse>, extra: Partial<{ tools: ToolRegistry; authorizer: ToolAuthorizer; events: HarnessEvents }> = {}) {
   return new AgentRuntime({
     client,
     modes,
@@ -115,6 +116,53 @@ describe('a plain turn', () => {
     await runtime(client).send(session, '');
 
     expect((await session.thread().messages()).map((m) => m.message.type)).toEqual(['assistant']);
+  });
+});
+
+describe('what the next step is sent back (G-58)', () => {
+  it("records each call's arguments and the turn's provider state, and sends them on the next step", async () => {
+    // The next request is built from the thread. Recorded with an id and a name
+    // only, a client had no input to send for the tool_use it was replaying, and
+    // nowhere to find the thinking signature Anthropic requires with it.
+    const session = await aSession();
+    const requests: LlmRequest[] = [];
+    const responses: LlmResponse[] = [
+      {
+        text: 'Checking.',
+        finishReason: 'tool_calls',
+        toolCalls: [{ id: 'c1', name: 'echo', arguments: { value: 'x' } }],
+        additionalContent: { thinking: 'Use the tool.', thinking_signature: 'sig-1' },
+      },
+      { text: 'Done.', finishReason: 'stop' },
+    ];
+    const client = async (request: LlmRequest): Promise<LlmResponse> => {
+      requests.push(request);
+
+      return responses[requests.length - 1]!;
+    };
+
+    await runtime(client).send(session, 'Use the tool');
+
+    expect(requests[1]?.messages.find((message) => message.type === 'assistant')).toEqual({
+      type: 'assistant',
+      content: 'Checking.',
+      tool_calls: [{ id: 'c1', name: 'echo', arguments: { value: 'x' } }],
+      additional_content: { thinking: 'Use the tool.', thinking_signature: 'sig-1' },
+    });
+  });
+
+  it('records empty provider state when the client reports none', async () => {
+    const session = await aSession();
+    const { client } = scripted([{ text: 'Hello.', finishReason: 'stop' }]);
+
+    await runtime(client).send(session, 'Hi');
+
+    expect((await session.thread().messages()).at(-1)?.message).toEqual({
+      type: 'assistant',
+      content: 'Hello.',
+      tool_calls: [],
+      additional_content: {},
+    });
   });
 });
 

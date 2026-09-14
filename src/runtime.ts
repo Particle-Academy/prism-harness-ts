@@ -47,6 +47,14 @@ export interface LlmResponse {
   finishReason: string;
   /** Null when the provider does not report one. NOT zero — see `RunLedger.recordCost`. */
   costUsd?: number | null;
+  /**
+   * What the provider needs sent back with this turn on the next request, such
+   * as Anthropic's `thinking` and `thinking_signature`. Recorded with the
+   * assistant turn as `additional_content`, the key prism's AssistantMessage
+   * uses, so a client built on prism-ts can pass `response.additionalContent`
+   * straight through and read it back from `messages`.
+   */
+  additionalContent?: Readonly<JsonObject>;
 }
 
 export type LlmClient = (request: LlmRequest) => Promise<LlmResponse>;
@@ -234,12 +242,16 @@ export class AgentRuntime {
 
       const toolCalls = response.toolCalls ?? [];
 
+      // The next step's request is built from this row, so it keeps what a
+      // provider needs to be sent back: each call's arguments (a tool_use without
+      // its input is refused) and the provider state for the turn (G-58).
       await thread.record(
         [
           {
             type: 'assistant',
             content: response.text,
-            tool_calls: toolCalls.map((call) => ({ id: call.id, name: call.name })),
+            tool_calls: toolCalls.map((call) => ({ id: call.id, name: call.name, arguments: call.arguments })),
+            additional_content: { ...(response.additionalContent ?? {}) },
           },
         ],
         runId,
