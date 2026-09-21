@@ -16,6 +16,7 @@ import { HarnessError } from './errors.js';
 import type { HarnessEvents } from './events.js';
 import type { AgentMode, ModeRegistry } from './modes.js';
 import type { Session } from './session.js';
+import { schemaName, schemaProblems } from './structured.js';
 import { RunBudget, RunContext } from './subagents.js';
 import type { HarnessTool, ToolAuthorizer, ToolRegistry } from './tools.js';
 
@@ -43,6 +44,15 @@ export interface LlmRequest {
    * interpret them.
    */
   providerOptions: Readonly<JsonObject>;
+  /**
+   * The JSON Schema a structured turn asks the answer to satisfy.
+   *
+   * Absent on an ordinary turn. A client passes it to its provider's structured
+   * mode (for prism-ts, `Prism.structured().withSchema()`) and returns what it
+   * parsed as `structured`; the harness checks that against this same schema
+   * before the caller sees it.
+   */
+  schema?: Readonly<JsonObject>;
 }
 
 export interface LlmToolCall {
@@ -75,6 +85,14 @@ export interface LlmResponse {
    * straight through and read it back from `messages`.
    */
   additionalContent?: Readonly<JsonObject>;
+  /**
+   * The document a structured turn parsed out of `text`.
+   *
+   * Null when the text held none — an apology in prose, a truncated answer, a
+   * fence that never closed. The harness tells that case apart from a document
+   * with the wrong shape, because the caller's next move differs.
+   */
+  structured?: JsonValue | null;
 }
 
 export type LlmClient = (request: LlmRequest) => Promise<LlmResponse>;
@@ -90,6 +108,18 @@ export interface AgentResponse {
   pendingApprovals: readonly PendingApproval[];
   /** Set when the run stopped because the tree ran out of budget, or was cancelled. */
   stoppedBecause: string | null;
+}
+
+/**
+ * One structured run's result: the document, and the text it was read from.
+ *
+ * BOTH, not one. `structured` is what the caller asked for, and `text` is what
+ * the model actually sent — which is also exactly what the thread stored, so a
+ * transcript and a parse can be compared rather than trusted.
+ */
+export interface StructuredAgentResponse extends AgentResponse {
+  /** Checked against the schema before it got here; a run that could not produce one threw. */
+  structured: JsonValue;
 }
 
 export interface PendingApproval {
@@ -166,6 +196,52 @@ export class AgentRuntime {
     context?: RunContext,
     additionalContent: readonly unknown[] = [],
   ): Promise<AgentResponse> {
+    return await this.#turn(session, prompt, toolNames, context, additionalContent);
+  }
+
+  /**
+   * A turn whose answer is a document.
+   *
+   * The same run as `send()` — same mode, same tools, same budget, same events,
+   * same approvals — with a schema the answer has to satisfy. The schema
+   * travels on the request for the client to hand its provider, and what comes
+   * back is checked against it here before the caller sees it.
+   *
+   * WHAT THE THREAD KEEPS IS THE TEXT, with the parsed document beside it as
+   * `structured` in the assistant row's `additional_content`. Never instead of
+   * it: a later turn replays this conversation as messages, and a transcript
+   * that reads differently because of the SHAPE of the request that produced it
+   * is a difference nothing reports.
+   *
+   * A FAILED DOCUMENT IS STILL RECORDED, and then thrown. The exchange
+   * happened, and a thread that omits the answer it did not like cannot explain
+   * the retry sitting next to it. The run is marked failed and `run.failed` is
+   * emitted, as for any other failure.
+   *
+   * @throws HarnessError `structured_unreadable` or `structured_schema_violation`
+   */
+  async sendStructured(
+    session: Session,
+    prompt: string,
+    schema: Readonly<JsonObject>,
+    toolNames?: readonly string[],
+    context?: RunContext,
+    additionalContent: readonly unknown[] = [],
+  ): Promise<StructuredAgentResponse> {
+    const response = await this.#turn(session, prompt, toolNames, context, additionalContent, schema);
+
+    // Narrowed by #turn: with a schema it always returns the structured shape.
+    return response as StructuredAgentResponse;
+  }
+
+  async #turn(
+    session: Session,
+    prompt: string,
+    toolNames?: readonly string[],
+    context?: RunContext,
+    additionalContent: readonly unknown[] = [],
+    schema?: Readonly<JsonObject>,
+  ): Promise<AgentResponse> {
     // Refused before a run exists: a bad attachment is a mistake in the call,
     // and it should not cost a run, events or budget.
     const attachments = admitAttachments(prompt, additionalContent);
@@ -218,9 +294,22 @@ export class AgentRuntime {
         await thread.record([turn], runId);
       }
 
-      return await this.#loop(session, mode, run, runId, provider, model, offered, called);
+      return await this.#loop(session, mode, run, runId, provider, model, offered, called, schema);
     } catch (error) {
-      const failure = error instanceof Error ? error.message : String(error);
+      // THE MODEL'S OWN WORDS DO NOT BELONG IN A RUN ROW OR AN EVENT. A schema
+      // violation names the values that missed, so its message carries pieces
+      // of the document — and an event carrying those would put model output in
+      // every listener's telemetry, which is the same reason tool arguments are
+      // names-only here. The document is already in the thread, in full, where
+      // it is read deliberately rather than shipped by default. An error that
+      // holds one records its CODE.
+      const failure =
+        error instanceof HarnessError && error.document !== undefined
+          ? error.code
+          : error instanceof Error
+            ? error.message
+            : String(error);
+
       await session.failRun(runId, failure);
       this.#events?.emit({
         type: 'run.failed',
@@ -244,6 +333,7 @@ export class AgentRuntime {
     model: string,
     offered: readonly HarnessTool[],
     called: string[],
+    schema?: Readonly<JsonObject>,
   ): Promise<AgentResponse> {
     const thread = session.thread();
     let text = '';
@@ -265,6 +355,7 @@ export class AgentRuntime {
         provider,
         model,
         providerOptions: mode.providerOptions,
+        ...(schema === undefined ? {} : { schema }),
       });
 
       run.ledger.recordSteps(1);
@@ -282,10 +373,27 @@ export class AgentRuntime {
       // The next step's request is built from this row, so it keeps what a
       // provider needs sent back: each call's arguments and provider ids, the
       // turn's provider state, and the approvals it is waiting on (G-58).
-      await thread.record([assistantRow(response.text, toolCalls, response.additionalContent, requests)], runId);
+      const answering = schema !== undefined && toolCalls.length === 0;
+      const metadata: JsonObject | undefined = answering
+        ? { ...(response.additionalContent ?? {}), structured: response.structured ?? null }
+        : (response.additionalContent as JsonObject | undefined);
+
+      await thread.record([assistantRow(response.text, toolCalls, metadata, requests)], runId);
 
       if (toolCalls.length === 0) {
-        return await this.#finish(session, runId, called, finishReason, text, run, null);
+        if (schema !== undefined) {
+          // Recorded first, then checked: the exchange happened either way, and
+          // a failure here fails the run through the caller's catch.
+          this.#assertDocument(schema, response);
+        }
+
+        const finished = await this.#finish(session, runId, called, finishReason, text, run, null);
+
+        if (schema === undefined) return finished;
+
+        const structured: StructuredAgentResponse = { ...finished, structured: response.structured as JsonValue };
+
+        return structured;
       }
 
       // The calls that need nobody run now, as in the reference, and their
@@ -464,6 +572,25 @@ export class AgentRuntime {
       if (error instanceof HarnessError && error.code === 'call_not_authorized') throw error;
 
       return toolResultEntry(call, `The tool failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  /**
+   * Refuse a document the caller cannot use, naming which of the two it is.
+   *
+   * Text holding no document at all and a document with the wrong shape are
+   * separate codes because the next move differs: the first is a prompting or
+   * budget problem, the second a schema one.
+   */
+  #assertDocument(schema: Readonly<JsonObject>, response: LlmResponse): void {
+    if (response.structured === undefined || response.structured === null) {
+      throw HarnessError.structuredUnreadable(response.text);
+    }
+
+    const problems = schemaProblems(schema as JsonObject, response.structured, schemaName(schema));
+
+    if (problems.length > 0) {
+      throw HarnessError.structuredSchemaViolation(response.text, problems);
     }
   }
 

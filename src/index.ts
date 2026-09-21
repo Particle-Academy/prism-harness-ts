@@ -60,7 +60,9 @@ export type {
   LlmResponse,
   LlmToolCall,
   PendingApproval,
+  StructuredAgentResponse,
 } from './runtime.js';
+export { schemaName, schemaProblems } from './structured.js';
 
 export {
   DEFAULT_LEASE_SECONDS,

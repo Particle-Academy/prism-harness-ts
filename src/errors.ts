@@ -68,19 +68,41 @@ export type HarnessErrorCode =
   /** A turn attachment carries no bytes, no file id and no chunks. */
   | 'attachment_empty'
   /** Attachments were offered with an empty prompt, which sends no user message. */
-  | 'attachment_without_prompt';
+  | 'attachment_without_prompt'
+  /** A structured turn came back with text holding no readable document. */
+  | 'structured_unreadable'
+  /** A structured turn returned a document its schema refuses. */
+  | 'structured_schema_violation';
 
 export interface HarnessErrorOptions {
   cause?: unknown;
+  /** The model's own text, on a structured failure. See `HarnessError.document`. */
+  document?: string;
+  /** Every way a document missed its schema, on a structured failure. */
+  problems?: readonly string[];
 }
 
 export class HarnessError extends Error {
   readonly code: HarnessErrorCode;
 
+  /**
+   * The model's own text, on a structured failure.
+   *
+   * It travels on the error because the first question anyone asks is "what did
+   * it actually say", and an error that answers it turns a support thread into
+   * a log line. It is model output: log it where you log model output.
+   */
+  readonly document?: string;
+
+  /** Every way a document missed its schema, rather than only the first. */
+  readonly problems: readonly string[];
+
   constructor(code: HarnessErrorCode, message: string, options: HarnessErrorOptions = {}) {
     super(message, options);
     this.name = 'HarnessError';
     this.code = code;
+    this.document = options.document;
+    this.problems = options.problems ?? [];
   }
 
   static sessionLocked(key: string, waitSeconds: number): HarnessError {
@@ -380,6 +402,36 @@ export class HarnessError extends Error {
       'attachment_without_prompt',
       'Attachments need a prompt to travel with. An empty prompt resumes a paused run and sends no user ' +
         'message, so these attachments would be dropped without a word.',
+    );
+  }
+
+  /**
+   * A structured turn whose text held no document at all.
+   *
+   * Separate from the schema violation because the caller's next move differs:
+   * an apology in prose or a truncated answer is a prompting or a budget
+   * problem, and a document with the wrong shape is a schema one.
+   */
+  static structuredUnreadable(document: string): HarnessError {
+    return new HarnessError(
+      'structured_unreadable',
+      'The model returned no readable document for a structured turn. Its text is on this error as document.',
+      { document },
+    );
+  }
+
+  /**
+   * Valid JSON, wrong shape.
+   *
+   * NOT coerced, not trimmed to the fields that fit, and never an empty
+   * document: one that fails the contract arriving as `{}` reads to the code
+   * receiving it exactly like a considered answer of "nothing".
+   */
+  static structuredSchemaViolation(document: string, problems: readonly string[]): HarnessError {
+    return new HarnessError(
+      'structured_schema_violation',
+      `The model returned a document that does not satisfy the schema: ${problems.join(' ')}`,
+      { document, problems },
     );
   }
 }
