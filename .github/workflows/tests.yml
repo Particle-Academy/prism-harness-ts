@@ -14,6 +14,7 @@ jobs:
   test:
     name: node ${{ matrix.node }} on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    needs: third-party
     timeout-minutes: 10
     strategy:
       fail-fast: false
