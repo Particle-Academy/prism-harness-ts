@@ -5,7 +5,9 @@ TypeScript port of [`particle-academy/prism-harness`](https://github.com/Particl
 
 Zero runtime dependencies. Node 22+.
 
-This package is private while coordinated parity work is in progress.
+```
+npm install @particle-academy/prism-harness
+```
 
 ```ts
 import { FileSessionStore, MemorySessionStore, PrismHarness } from '@particle-academy/prism-harness';
