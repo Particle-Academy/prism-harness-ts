@@ -42,12 +42,17 @@ interface RowOutcome {
   pending: number | null;
 }
 
-/** 0002: a language that cannot express a row SKIPS it, with a mandatory reason. */
-interface RowSkipped {
-  skipped: string;
-}
-
-type RowResult = RowOutcome | RowSkipped;
+/**
+ * 0002: a language that cannot express a row SKIPS it, with a mandatory reason.
+ *
+ * The reason lives in a top-level `skip` map and that language's `result` is
+ * `null`. It used to sit INSIDE the result as `{ skipped: '…' }`, and the
+ * difference is not cosmetic: a reader asking `'skipped' in result` sees `null`
+ * under the current shape, concludes the row is comparable, and compares a
+ * verdict against nothing. That is why this reader had to move before the
+ * fixture did.
+ */
+type SkipMap = Partial<Record<'php' | 'ts' | 'py', string>>;
 
 interface SeedTask {
   id: string;
@@ -71,7 +76,8 @@ interface Row {
   notes: string;
   given: { tasks: SeedTask[]; now: number };
   when: RowWhen;
-  result: { php: RowResult | null; ts: RowResult | null; py: RowResult | null };
+  result: { php: RowOutcome | null; ts: RowOutcome | null; py: RowOutcome | null };
+  skip?: SkipMap;
 }
 
 interface Corpus {
@@ -300,11 +306,15 @@ function canonical(value: unknown): string {
   return `{${entries.map(([key, held]) => `${JSON.stringify(key)}:${canonical(held)}`).join(',')}}`;
 }
 
-const isSkipped = (result: RowResult | null): result is RowSkipped =>
-  result !== null && typeof result === 'object' && 'skipped' in result;
+// A row is skipped for a language when the suite says so AND that language's
+// result is absent. Both halves are required: a reason with a verdict beside it
+// would mean the suite is claiming two different things about one row, and a
+// null result with no reason is the mandatory-reason rule being broken.
+const isSkipped = (row: Row, language: 'php' | 'ts' | 'py'): boolean =>
+  row.skip?.[language] !== undefined && row.result[language] === null;
 
-const comparable = corpus.cases.filter((row) => !isSkipped(row.result.php));
-const referenceSkipped = corpus.cases.filter((row) => isSkipped(row.result.php));
+const comparable = corpus.cases.filter((row) => !isSkipped(row, 'php'));
+const referenceSkipped = corpus.cases.filter((row) => isSkipped(row, 'php'));
 
 describe.skipIf(Boolean(recordingInto))('the cross-language agent-task-claim corpus', () => {
   it('is the whole suite, not a subset someone trimmed to green', () => {
@@ -392,7 +402,7 @@ describe.skipIf(Boolean(recordingInto))('agreement with the PHP reference', () =
 
     const row = referenceSkipped[0]!;
 
-    expect(isSkipped(row.result.ts)).toBe(false);
+    expect(isSkipped(row, 'ts')).toBe(false);
     expect(await run(row)).toEqual({
       outcome: 'refused',
       code: 'task_lease_invalid',
@@ -449,8 +459,8 @@ describe.skipIf(Boolean(recordingInto))('where the THREE languages stand', () =>
     // failed when Python's fix landed.
     const row = corpus.cases.find((entry) => entry.id === 'atc-0017')!;
 
-    expect(isSkipped(row.result.php)).toBe(true);
-    expect(isSkipped(row.result.ts)).toBe(false);
+    expect(isSkipped(row, 'php')).toBe(true);
+    expect(isSkipped(row, 'ts')).toBe(false);
     expect((row.result.ts as RowOutcome).code).toBe('task_lease_invalid');
     expect(canonical(row.result.py)).toBe(canonical(row.result.ts));
   });
