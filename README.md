@@ -109,6 +109,8 @@ as `request.providerOptions`, on every step of every run in that mode. Pass them
 to your provider call (with `prism-ts`, `withProviderOptions()`):
 
 ```ts
+import { ModeRegistry } from '@particle-academy/prism-harness';
+
 new ModeRegistry({
   modes: { overseer: { system_prompt: '...', provider_options: { thinking: { type: 'adaptive' } } } },
 });
@@ -168,6 +170,8 @@ the text, so a thread that contains a structured answer reads like any other.
 **A document that misses the schema is refused, not repaired.**
 
 ```ts
+import { HarnessError } from '@particle-academy/prism-harness';
+
 try {
   const plan = (await runtime.sendStructured(session, brief, schema)).structured;
 } catch (error) {
@@ -203,7 +207,11 @@ in the other for the same stated reason.
 A mode names the tools a person must approve:
 
 ```ts
-guarded: { system_prompt: '...', tools: ['read', 'delete'], requires_approval: ['delete'] },
+new ModeRegistry({
+  modes: {
+    guarded: { system_prompt: '...', tools: ['read', 'delete'], requires_approval: ['delete'] },
+  },
+});
 ```
 
 A step that calls one stops with `finishReason: 'awaiting_approval'`. The calls
@@ -211,6 +219,8 @@ that need nobody have already run. Record a decision for every pending approval,
 then resume with an empty prompt:
 
 ```ts
+import { recordApproval } from '@particle-academy/prism-harness';
+
 const response = await runtime.send(session, 'Clean up the failed run');
 
 if (response.finishReason === 'awaiting_approval') {
