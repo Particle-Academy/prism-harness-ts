@@ -3,7 +3,7 @@
 Durable agent sessions — threads, session state and store drivers. The
 TypeScript port of [`particle-academy/prism-harness`](https://github.com/Particle-Academy/prism-harness).
 
-Zero runtime dependencies. Node 20+.
+Zero runtime dependencies. Node 22+.
 
 This package is private while coordinated parity work is in progress.
 
