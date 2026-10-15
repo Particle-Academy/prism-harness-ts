@@ -341,6 +341,18 @@ badly.
   as held, bounded by the file's own age so a process that died mid-write cannot
   wedge the key either.
 
+  **Threads are append-only logs** (`<digest>.jsonl` beside the payload file):
+  one line per message, one write and an `fsync` per `record()`, so recording
+  costs the size of the new messages however long the thread already is.
+  Before 0.7.0, every message re-read and rewrote the whole conversation. A
+  thread stored that way is read as before and moved into the log the first
+  time it grows. A line cut off by a crash is dropped, and the next append
+  starts after the last complete line. A damaged line anywhere else is refused
+  with `unmappable_content` rather than silently skipped.
+
+  The thread log is **not yet shared with the PHP and Python ports**: a Python
+  worker pointed at the same directory does not read it.
+
 Implement `SessionStore` for anything else. Declare your own `durability()`:
 only you know whether your Redis is persistent or a disposable cache, and that
 declaration is an assertion about your infrastructure, not a preference.

@@ -77,3 +77,41 @@ export interface SessionStore {
    */
   durability(): Durability;
 }
+
+/**
+ * OPTIONAL: an append-only log per key, which a store may offer for threads.
+ *
+ * A thread only ever grows at the end, and through `get`/`put` every new
+ * message costs a read, parse, serialise and rewrite of the WHOLE conversation.
+ * That is quadratic over a session: Genie 2 measured a 9 MB thread being
+ * rewritten for every chat row. A store that can append says so by
+ * implementing this, and `Thread` then writes one line per message. A store
+ * that does not keeps working through `get`/`put` exactly as before.
+ *
+ * Every method is called with the key's `withLock` held by the caller.
+ */
+export interface AppendLogStore {
+  /** Durably append entries in order. One line each; nothing earlier is rewritten. */
+  appendLog(key: string, entries: readonly JsonObject[]): Promise<void>;
+
+  /**
+   * Every complete entry, or null when no log exists for the key.
+   *
+   * A torn LAST line (a write cut off by a crash) is dropped. A damaged line
+   * anywhere else is history that cannot be read, and is refused loudly.
+   */
+  readLog(key: string): Promise<JsonObject[] | null>;
+
+  /** How many complete entries, or null when no log exists. Need not read them all. */
+  logLength(key: string): Promise<number | null>;
+
+  /** Drop every entry; the log then exists and is empty. */
+  clearLog(key: string): Promise<void>;
+}
+
+export function supportsAppendLog(store: SessionStore): store is SessionStore & AppendLogStore {
+  const candidate = store as Partial<AppendLogStore>;
+
+  return typeof candidate.appendLog === 'function' && typeof candidate.readLog === 'function'
+    && typeof candidate.logLength === 'function' && typeof candidate.clearLog === 'function';
+}
