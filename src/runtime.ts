@@ -364,7 +364,8 @@ export class AgentRuntime {
       finishReason = response.finishReason;
 
       const toolCalls = response.toolCalls ?? [];
-      const gated = toolCalls.filter((call) => mode.needsApproval(call.name));
+      const failedFinish = finishReason === 'error' || finishReason === 'unknown' ? finishReason : null;
+      const gated = failedFinish === null ? toolCalls.filter((call) => mode.needsApproval(call.name)) : [];
       const requests: ApprovalRequestEntry[] = gated.map((call) => ({
         approval_id: `apr_${randomUUID().replaceAll('-', '')}`,
         tool_call_id: call.id,
@@ -379,6 +380,16 @@ export class AgentRuntime {
         : (response.additionalContent as JsonObject | undefined);
 
       await thread.record([assistantRow(response.text, toolCalls, metadata, requests)], runId);
+
+      if (failedFinish !== null) {
+        // Complete the transcript with refusals, never approval requests, so a
+        // later resume cannot dispatch calls from this failed response.
+        if (toolCalls.length > 0) {
+          await thread.record([toolResultRow(toolCalls.map(call =>
+            toolResultEntry(call, `Not run: model step failed (${failedFinish}).`)))], runId);
+        }
+        throw HarnessError.modelStepFailed(failedFinish);
+      }
 
       if (toolCalls.length === 0) {
         if (schema !== undefined) {

@@ -18,6 +18,8 @@ export type HarnessErrorCode =
   | 'tool_not_available'
   /** A run was refused — by budget, by depth, or by a cancelled ledger. */
   | 'run_not_permitted'
+  /** A model returned a terminal error/unknown finish; its tools must not run. */
+  | 'model_step_failed'
   /** A stored payload could not be mapped back into a value object. */
   | 'unmappable_content'
   /** A session was asked to do something that needs a runtime it does not have. */
@@ -76,6 +78,7 @@ export type HarnessErrorCode =
 
 export interface HarnessErrorOptions {
   cause?: unknown;
+  finishReason?: 'error' | 'unknown';
   /** The model's own text, on a structured failure. See `HarnessError.document`. */
   document?: string;
   /** Every way a document missed its schema, on a structured failure. */
@@ -84,6 +87,7 @@ export interface HarnessErrorOptions {
 
 export class HarnessError extends Error {
   readonly code: HarnessErrorCode;
+  readonly finishReason?: 'error' | 'unknown';
 
   /**
    * The model's own text, on a structured failure.
@@ -101,6 +105,10 @@ export class HarnessError extends Error {
     super(message, options);
     this.name = 'HarnessError';
     this.code = code;
+    if (options.finishReason !== undefined && options.finishReason !== 'error' && options.finishReason !== 'unknown') {
+      throw new TypeError('Model step finish reason must be error or unknown');
+    }
+    this.finishReason = options.finishReason;
     this.document = options.document;
     this.problems = options.problems ?? [];
   }
@@ -147,6 +155,13 @@ export class HarnessError extends Error {
 
   static runNotPermitted(reason: string): HarnessError {
     return new HarnessError('run_not_permitted', reason);
+  }
+
+  static modelStepFailed(finishReason: 'error' | 'unknown'): HarnessError {
+    if (finishReason !== 'error' && finishReason !== 'unknown') {
+      throw new TypeError('Model step finish reason must be error or unknown');
+    }
+    return new HarnessError('model_step_failed', `Model step failed: ${finishReason}.`, { finishReason });
   }
 
   static unmappableContent(description: string, options: HarnessErrorOptions = {}): HarnessError {

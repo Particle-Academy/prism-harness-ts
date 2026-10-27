@@ -202,6 +202,15 @@ reporting a constraint it did not actually check. The same rules as the PHP
 reference, message for message, so a document refused in one language is refused
 in the other for the same stated reason.
 
+## Failed model steps
+
+A client response with `finishReason: 'error'` or `'unknown'` ends the run with
+`HarnessError.code === 'model_step_failed'`. Its `finishReason` identifies which
+of those two finishes occurred; the error message contains no model output.
+The step, cost, and assistant response are recorded before the error is raised.
+Tools requested by that response are refused, with no pending approval authority,
+so approving or resuming later cannot execute them. A new turn can still be sent.
+
 ## Approvals
 
 A mode names the tools a person must approve:

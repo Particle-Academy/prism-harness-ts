@@ -7,6 +7,7 @@ import {
   MAX_DEPTH,
   FileSessionStore,
   HarnessEvents,
+  HarnessError,
   MemorySessionStore,
   ModeRegistry,
   PrismHarness,
@@ -77,6 +78,50 @@ function runtime(client: (request: LlmRequest) => Promise<LlmResponse>, extra: P
     events: extra.events,
   });
 }
+
+describe('failed model steps are terminal', () => {
+  const cases = (['error', 'unknown'] as const).flatMap(finishReason =>
+    (['chat', 'guarded'] as const).flatMap(mode =>
+      (['send', 'structured'] as const).flatMap(shape =>
+        [false, true].map(withTools => ({ finishReason, mode, shape, withTools })))));
+  it.each(cases)('refuses $finishReason/$mode/$shape (tools=$withTools) and cannot dispatch on resume', async ({ finishReason, mode, shape, withTools }) => {
+      const session = await aSession(mode);
+      const context = RunContext.root('failed', new RunBudget(4));
+      let modelCalls = 0, toolCalls = 0;
+      const rt = runtime(async () => ++modelCalls === 1
+        ? { text: 'partial', finishReason, costUsd: 0.04, toolCalls: withTools ? [{ id: 'failed-call', name: 'echo', arguments: { value: 'must-not-run' } }] : [] }
+        : { text: 'resumed', finishReason: 'stop', costUsd: 0.01 },
+      { tools: new ToolRegistry().register({ name: 'echo', handle: () => { toolCalls++; return 'unexpected'; } }) });
+      let failure: unknown;
+      try {
+        if (shape === 'structured') {
+          await rt.sendStructured(session, 'go', { type: 'object', properties: { ok: { type: 'boolean' } }, required: ['ok'] }, undefined, context);
+        } else {
+          await rt.send(session, 'go', undefined, context);
+        }
+      } catch (error) { failure = error; }
+      expect(modelCalls).toBe(1);
+      expect(toolCalls).toBe(0);
+      expect(context.ledger.steps).toBe(1);
+      expect(context.ledger.costUsd).toBe(0.04);
+      expect(failure).toMatchObject({ code: 'model_step_failed', finishReason, message: `Model step failed: ${finishReason}.` });
+      expect(await session.run()).toMatchObject({ status: 'failed', failure: `Model step failed: ${finishReason}.` });
+      const rows = (await session.thread().messages()).map(entry => entry.message);
+      const assistant = rows.find(row => row.type === 'assistant');
+      expect(assistant?.tool_approval_requests).toEqual([]);
+      expect(rows.some(row => row.type === 'tool_result' && JSON.stringify(row).includes('Not run'))).toBe(withTools);
+      await recordApproval(session, 'failed-call', true);
+      await rt.send(session, '');
+      expect(modelCalls).toBe(2);
+      expect(toolCalls).toBe(0);
+  });
+  it('bounds failure reasons from an untyped caller without echoing invalid values', () => {
+    expect(() => HarnessError.modelStepFailed('owned-not-a-reason' as never))
+      .toThrow(/^Model step finish reason must be error or unknown$/);
+    expect(() => new HarnessError('model_step_failed', 'bounded', { finishReason: 'owned-not-a-reason' as never }))
+      .toThrow(/^Model step finish reason must be error or unknown$/);
+  });
+});
 
 describe('a plain turn', () => {
   it('returns the text and records both messages in the thread', async () => {
