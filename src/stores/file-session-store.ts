@@ -271,12 +271,6 @@ export class FileSessionStore implements SessionStore, AppendLogStore {
         // `#expired`, and note the format is shared with the other two ports.
         await handle.writeFile(stamp(Date.now() + ttlSeconds * 1000), 'utf8');
         await handle.close();
-
-        try {
-          return await callback();
-        } finally {
-          await this.#release(lockPath);
-        }
       } catch (error) {
         if (!isHeld(error)) throw error;
 
@@ -294,6 +288,15 @@ export class FileSessionStore implements SessionStore, AppendLogStore {
         }
 
         await sleep(25);
+        continue;
+      }
+
+      // Acquisition alone is retried. Callback errors are never contention:
+      // replaying one can duplicate side effects that already completed.
+      try {
+        return await callback();
+      } finally {
+        await this.#release(lockPath);
       }
     }
   }
@@ -469,7 +472,7 @@ function isHeld(error: unknown): boolean {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => {
-    const timer = setTimeout(resolve, ms);
-    timer.unref?.();
+    // An awaited retry must keep a standalone worker alive until it settles.
+    setTimeout(resolve, ms);
   });
 }
