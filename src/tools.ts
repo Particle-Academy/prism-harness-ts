@@ -34,6 +34,7 @@ export interface ResolvedTool {
   owner: string;
   source: 'static' | 'factory' | 'provider';
 }
+export interface RegistryOptions { refuseDuplicates?: boolean; }
 
 export class ToolRegistry {
   readonly #tools = new Map<string, HarnessTool>();
@@ -41,9 +42,20 @@ export class ToolRegistry {
   readonly #metadata = new Map<string, Omit<ResolvedTool, 'tool'>>();
   readonly #providers = new Map<string, { provider: ToolProvider; owner: string }>();
   readonly #agents = new Map<string, ToolRegistry>();
+  readonly #staticOwners = new Map<string, string>();
+  readonly #factoryOwners = new Map<string, string>();
+  readonly #refuseDuplicates: boolean;
+  private readonly namespace: string | null;
+  private readonly root?: ToolRegistry;
 
-  constructor(private readonly namespace: string | null = null, private readonly root?: ToolRegistry) {
-    validateAgent(namespace);
+  constructor(options: RegistryOptions | string | null = null, root?: ToolRegistry) {
+    if (options !== null && typeof options !== 'string' && (typeof options !== 'object' || Array.isArray(options))) throw new TypeError('Registry options must be an options object, agent string or null');
+    this.namespace = typeof options === 'string' ? options : null;
+    this.root = root;
+    const setting = options !== null && typeof options === 'object' ? options.refuseDuplicates : (root === undefined ? undefined : root.#refuseDuplicates);
+    if (setting !== undefined && typeof setting !== 'boolean') throw new TypeError('refuseDuplicates must be a boolean');
+    this.#refuseDuplicates = setting ?? false;
+    validateAgent(this.namespace);
     for (const key of ['namespace', 'root']) Object.defineProperty(this, key, { writable: false, configurable: false });
   }
 
@@ -60,6 +72,7 @@ export class ToolRegistry {
   register(tool: HarnessTool, owner?: string): this {
     this.#claim(tool.name, owner, 'static');
     this.#tools.set(tool.name, tool);
+    this.#staticOwners.set(tool.name, registrationOwner(owner, this.namespace));
     return this;
   }
 
@@ -71,6 +84,7 @@ export class ToolRegistry {
   registerFactory(name: string, factory: ToolFactory, owner?: string): this {
     this.#claim(name, owner, 'factory');
     this.#factories.set(name, factory);
+    this.#factoryOwners.set(name, registrationOwner(owner, this.namespace));
     return this;
   }
 
@@ -79,7 +93,7 @@ export class ToolRegistry {
     const id = name ?? (this.namespace === null ? `provider:${this.#providers.size}` : undefined);
     if (!id) throw new TypeError('A named provider requires a registration name.');
     const previous = this.#providers.get(id);
-    if (previous) throw new RegistrationCollision(this.namespace, id, previous.owner, label);
+    if (this.#strict() && previous) throw new RegistrationCollision(this.namespace, id, previous.owner, label);
     this.#providers.set(id, { provider, owner: label });
     return this;
   }
@@ -87,12 +101,14 @@ export class ToolRegistry {
   replace(tool: HarnessTool, predecessorOwner: string, owner?: string): this {
     this.#claim(tool.name, owner, 'static', predecessorOwner);
     this.#tools.set(tool.name, tool);
+    this.#staticOwners.set(tool.name, registrationOwner(owner, this.namespace));
     return this;
   }
 
   replaceFactory(name: string, factory: ToolFactory, predecessorOwner: string, owner?: string): this {
     this.#claim(name, owner, 'factory', predecessorOwner);
     this.#factories.set(name, factory);
+    this.#factoryOwners.set(name, registrationOwner(owner, this.namespace));
     return this;
   }
 
@@ -107,10 +123,13 @@ export class ToolRegistry {
     const label = registrationOwner(owner, this.namespace), previous = this.#metadata.get(name);
     if (predecessor !== undefined) {
       if (!previous || previous.owner !== predecessor) throw new Error('Replacement must name the registered predecessor owner.');
-    } else if (previous) throw new RegistrationCollision(this.namespace, name, previous.owner, label);
-    this.#tools.delete(name); this.#factories.delete(name);
+    } else if (this.#strict() && previous) throw new RegistrationCollision(this.namespace, name, previous.owner, label);
+    if (this.#strict() || predecessor !== undefined) {
+      this.#tools.delete(name); this.#factories.delete(name); this.#staticOwners.delete(name); this.#factoryOwners.delete(name);
+    }
     this.#metadata.set(name, { owner: label, source });
   }
+  #strict(): boolean { return this.namespace !== null || this.#refuseDuplicates; }
 
   /** Every name this registry can produce without a session. */
   names(): string[] {
@@ -142,7 +161,7 @@ export class ToolRegistry {
       for (const { provider, owner } of this.#providers.values()) {
         for (const tool of await provider(session)) {
           const previous = metadata.get(tool.name);
-          if (previous) throw new RegistrationCollision(this.namespace, tool.name, previous.owner, owner);
+          if (this.#strict() && previous) throw new RegistrationCollision(this.namespace, tool.name, previous.owner, owner);
           provided.set(tool.name, tool); metadata.set(tool.name, { owner, source: 'provider' });
         }
       }
@@ -159,7 +178,7 @@ export class ToolRegistry {
       const tool = this.#tools.get(name) ?? provided.get(name);
 
       if (tool !== undefined) {
-        resolved.set(name, { tool, ...metadata.get(name)! });
+        resolved.set(name, { tool, ...(this.#tools.has(name) ? {owner:this.#staticOwners.get(name)!,source:'static' as const} : metadata.get(name)!) });
         continue;
       }
 
@@ -174,13 +193,13 @@ export class ToolRegistry {
       }
 
       const built = factory(session);
-      if (this.namespace !== null && built.name !== name) throw new Error(`Session-bound tool factory [${name}] returned [${built.name}].`);
+      if (this.#strict() && built.name !== name) throw new Error(`Session-bound tool factory [${name}] returned [${built.name}].`);
       if (built.name !== name) {
         const previous = metadata.get(built.name);
-        if (previous) throw new RegistrationCollision(this.namespace, built.name, previous.owner, metadata.get(name)!.owner);
+        if (this.#strict() && previous) throw new RegistrationCollision(this.namespace, built.name, previous.owner, metadata.get(name)!.owner);
         metadata.set(built.name, metadata.get(name)!);
       }
-      resolved.set(name, { tool: built, ...metadata.get(name)! });
+      resolved.set(name, { tool: built, owner:this.#factoryOwners.get(name)!, source:'factory' });
     }
 
     return resolved;

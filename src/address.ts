@@ -53,9 +53,9 @@ export class SessionAddress {
 
   constructor(participant: Participant | null, readonly scope: string, readonly agent: string | null = null) {
     validateAgent(agent);
-    if (!utf8(scope) || (participant !== null && (!utf8(participant.type)
+    if ((agent !== null || participant instanceof ParticipantRef) && (!utf8(scope) || (participant !== null && (!utf8(participant.type)
       || (typeof participant.id !== 'string' && (typeof participant.id !== 'number' || !Number.isSafeInteger(participant.id)))
-      || !utf8(String(participant.id))))) throw new TypeError('Harness addresses require valid UTF-8 and integer or string ids.');
+      || !utf8(String(participant.id)))))) throw new TypeError('Harness addresses require valid UTF-8 and integer or string ids.');
     this.participantType = participant?.type ?? null;
     this.participantId = participant === null ? null : String(participant.id);
     Object.freeze(this);

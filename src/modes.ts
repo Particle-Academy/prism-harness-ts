@@ -18,6 +18,7 @@ export interface ModeConfig {
 }
 
 export interface ModeRegistryConfig {
+  refuseDuplicates?: boolean;
   owner?: string;
   agents?: Record<string, ModeRegistryConfig>;
   default?: string;
@@ -64,6 +65,7 @@ export class ModeRegistry {
   readonly #owners = new Map<string, string>();
 
   constructor(private readonly config: ModeRegistryConfig = {}, private readonly agent: string | null = null, private readonly root?: ModeRegistry) {
+    if (config.refuseDuplicates !== undefined && typeof config.refuseDuplicates !== 'boolean') throw new TypeError('refuseDuplicates must be a boolean');
     validateAgent(agent);
     for (const name of Object.keys(config.modes ?? {})) this.#owners.set(name, registrationOwner(config.owner, agent));
     for (const key of ['config', 'agent', 'root']) Object.defineProperty(this, key, { writable: false, configurable: false });
@@ -76,7 +78,7 @@ export class ModeRegistry {
     let view = root.#agents.get(agent);
     if (!view) {
       const configured = root.config.agents?.[agent] ?? {};
-      view = new ModeRegistry({ ...structuredClone(configured), default: configured.default ?? root.default() }, agent, root);
+      view = new ModeRegistry({ ...structuredClone(configured), refuseDuplicates:root.config.refuseDuplicates, default: configured.default ?? root.default() }, agent, root);
       root.#agents.set(agent, view);
     }
     return view;
@@ -84,7 +86,7 @@ export class ModeRegistry {
 
   register(name: string, mode: ModeConfig, owner?: string): this {
     const label = registrationOwner(owner, this.agent), previous = this.#owners.get(name);
-    if (previous !== undefined) throw new RegistrationCollision(this.agent, name, previous, label);
+    if ((this.agent !== null || this.config.refuseDuplicates === true) && previous !== undefined) throw new RegistrationCollision(this.agent, name, previous, label);
     this.#set(name, mode, label);
     return this;
   }

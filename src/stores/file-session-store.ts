@@ -6,6 +6,8 @@ import type { JsonObject } from '../json.js';
 import { isJsonObject } from '../json.js';
 import { HarnessError } from '../errors.js';
 import { withFileOwnerLock, pendingFileOwnerReleases } from './file-owner-lock.js';
+import { fileLockIdentityStatus } from './file-lock-identity.js';
+import type { FileLockIdentityStatus } from './file-lock-identity.js';
 import type { PendingFileLockRelease } from './file-owner-lock.js';
 import type { AppendLogStore, Durability, SessionStore } from './session-store.js';
 
@@ -54,6 +56,9 @@ export class FileSessionStore implements SessionStore, AppendLogStore {
   /** Local filesystem on one host; SMB/NFS sharing is unsupported. */
   sharingScope(): 'host' { return 'host'; }
   lockScope(): 'host' | 'process' | 'distributed' | 'unsupported' { return 'host'; }
+
+  /** Process discovery snapshot; this observer never starts metadata discovery. */
+  identityStatus(): FileLockIdentityStatus { return fileLockIdentityStatus(); }
 
   async get(key: string): Promise<JsonObject | null> {
     let raw: string;

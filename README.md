@@ -58,11 +58,19 @@ creates no session, thread or index entry and makes no model/provider request
 or logical state change. Reads may physically purge expired entries, exactly as
 an ordinary store read does. Explicit state writes during resolution refuse.
 
-The mode list is the ceiling even when a caller supplies tool names. Named
-agents inherit no legacy authority. Builtins require explicit registration and
-mode selection. Same-owner duplicates are refused; use
+For named agents, the mode list is the ceiling even when a caller supplies tool
+names. Legacy sessions retain caller-list selection by default; set
+`AgentRuntimeOptions.narrowRequestedTools` to `true` to apply the ceiling there.
+Named agents inherit no legacy authority. Builtins require explicit registration and
+mode selection. Named-agent duplicates are refused; use
 tools.forAgent('support').replace(replacement, 'app.support', 'app.support.v2')
 for an intentional replacement.
+
+Legacy registries retain duplicate overwrite and existing cross-kind precedence.
+Use `new ToolRegistry({ refuseDuplicates: true })` and
+`new ModeRegistry({ refuseDuplicates: true })` to refuse legacy duplicates.
+Named session addresses are immutable and validated; legacy participant/scope
+values retain their existing mutable behavior.
 
 AgentRuntime's agents map accepts provider/model, max_steps_ceiling,
 max_output_tokens_per_call and lock_ttl/lock_wait overrides. Unset scalars fall
@@ -386,10 +394,15 @@ badly.
   filesystems on one host only; SMB/NFS are unsupported.
 
   On Windows, the first file-lock operation makes one fixed, read-only metadata
-  query using the system Windows PowerShell and CIM module, with a five-second
-  timeout. The process caches the result, including unavailable identity. A
-  failed query keeps locks held; restore system metadata access and restart the
-  process before retrying. No runtime compilation or extra dependency is used.
+  query using the system Windows PowerShell and CIM module, with a fifteen-second
+  timeout. Established identities and detected container conditions are cached
+  for the process lifetime. Transient query failures are cached for sixty seconds,
+  then permit a new sample. With unknown identity a worker can acquire a free
+  lock and release its own owner record, but unknown owners and unknown probers
+  never authorize PID probes or recovery. A crashed unknown owner's lock stays
+  held for explicit operator inspection. `FileSessionStore.identityStatus()` is
+  an in-memory snapshot and performs no query or filesystem work. No runtime
+  compilation or extra dependency is used.
 
   **BREAKING CHANGE: Stop all old workers before upgrading the file-lock
   protocol.** Inspect and archive stale legacy timestamp lockfiles explicitly.

@@ -64,7 +64,7 @@ it('runs only the absolute first-party binary with a fixed script and constructe
   expect(options.env).toEqual({
     SystemRoot: 'C:\\Windows', windir: 'C:\\Windows', TEMP: 'C:\\owned-temp', TMP: 'C:\\owned-temp',
   });
-  expect(options).toMatchObject({ timeout: 5000, windowsHide: true, shell: false, maxBuffer: 16384 });
+  expect(options).toMatchObject({ timeout: 15000, windowsHide: true, shell: false, maxBuffer: 16384 });
 });
 it('keeps a positively detected container realm unknown', () => {
   invoke.mockReturnValue({ status: 0, stderr: '', stdout: 'boot=638000000000000000\ncontainer=present\n' });
