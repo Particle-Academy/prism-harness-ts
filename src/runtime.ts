@@ -343,7 +343,7 @@ export class AgentRuntime {
 
     try {
       let offered: HarnessTool[];
-      if (session.agent === null) {
+      if (session.agent === null && !this.#narrowRequestedTools) {
         const resolved = await this.#tools.resolve(toolNames ?? mode.tools, session);
         offered = this.#authorizer ? await this.#authorizer.allowed(session, resolved) : [...resolved.values()];
       } else offered = (await this.#offer(session, mode, toolNames)).tools;
