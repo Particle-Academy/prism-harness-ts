@@ -27,13 +27,19 @@ export class RunBudget {
     readonly maxSteps: number,
     readonly maxCostUsd: number | null = null,
     readonly maxSeconds: number | null = null,
-  ) {}
+    readonly maxOutputTokensPerCall: number | null = null,
+  ) {
+    if (maxOutputTokensPerCall !== null && (!Number.isSafeInteger(maxOutputTokensPerCall) || maxOutputTokensPerCall < 1)) throw new TypeError('Output ceilings must be positive integers or null.');
+  }
 
   static fromConfig(config: Record<string, unknown>, defaultSteps = 8): RunBudget {
+    const output = config.max_output_tokens_per_call;
+    if (output !== undefined && output !== null && (typeof output !== 'number' || !Number.isSafeInteger(output) || output < 1)) throw new TypeError('Output ceilings must be positive integers or null.');
     return new RunBudget(
       numberOr(config.max_steps, defaultSteps),
       numberOrNull(config.max_cost_usd),
       numberOrNull(config.max_seconds),
+      output ?? null,
     );
   }
 
@@ -72,6 +78,7 @@ export class RunBudget {
         parent.maxSeconds,
         this.maxSeconds === null ? null : Math.trunc(ledger.elapsedSeconds()) + this.maxSeconds,
       ),
+      lesser(parent.maxOutputTokensPerCall, this.maxOutputTokensPerCall),
     );
   }
 }

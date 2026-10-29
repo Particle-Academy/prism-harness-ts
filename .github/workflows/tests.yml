@@ -43,6 +43,38 @@ jobs:
       - run: npm run build
       - run: npx vitest run
 
+
+  file-owner-native:
+    name: Production owner locks / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    needs: third-party
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+      - run: npx vitest run
+      - name: Production native ownership including Windows Job contexts
+        run: node tools/file-owner-native/gate.mjs ts
+      - name: Inspect the actual npm file manifest without lifecycle scripts
+        run: npm pack --dry-run --json --ignore-scripts > .file-owner-package.json
+      - name: Refuse native test tooling and runtime compilation in the package
+        run: node tools/file-owner-native/package.mjs .file-owner-package.json
+      - name: Package guard rejects embedded compilation and artifact substitution
+        run: node --test tools/file-owner-native/package-controls.mjs
+
+
   third-party:
     name: Third-party dependency allowlist
     runs-on: ubuntu-latest

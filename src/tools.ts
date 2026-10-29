@@ -1,6 +1,8 @@
 import type { JsonObject } from './json.js';
 import { HarnessError } from './errors.js';
 import type { Session } from './session.js';
+import { validateAgent } from './address.js';
+import { RegistrationCollision, registrationOwner } from './registration.js';
 
 /**
  * The shape this package needs from a tool.
@@ -27,35 +29,87 @@ export type ToolProvider = (session: Session) => Iterable<HarnessTool> | Promise
  * (`registerFactory`), and a set discovered at resolve time — an MCP server's
  * catalogue, say (`registerProvider`).
  */
+export interface ResolvedTool {
+  tool: HarnessTool;
+  owner: string;
+  source: 'static' | 'factory' | 'provider';
+}
+
 export class ToolRegistry {
   readonly #tools = new Map<string, HarnessTool>();
-
   readonly #factories = new Map<string, ToolFactory>();
+  readonly #metadata = new Map<string, Omit<ResolvedTool, 'tool'>>();
+  readonly #providers = new Map<string, { provider: ToolProvider; owner: string }>();
+  readonly #agents = new Map<string, ToolRegistry>();
 
-  readonly #providers: ToolProvider[] = [];
+  constructor(private readonly namespace: string | null = null, private readonly root?: ToolRegistry) {
+    validateAgent(namespace);
+    for (const key of ['namespace', 'root']) Object.defineProperty(this, key, { writable: false, configurable: false });
+  }
 
-  register(tool: HarnessTool): this {
+  /** Immutable namespace views share registrations, never a current-agent flag. */
+  forAgent(agent: string | null): ToolRegistry {
+    validateAgent(agent);
+    const root = this.root ?? this;
+    if (agent === null) return root;
+    let view = root.#agents.get(agent);
+    if (!view) { view = new ToolRegistry(agent, root); root.#agents.set(agent, view); }
+    return view;
+  }
+
+  register(tool: HarnessTool, owner?: string): this {
+    this.#claim(tool.name, owner, 'static');
     this.#tools.set(tool.name, tool);
-
     return this;
   }
 
-  registerMany(tools: Iterable<HarnessTool>): this {
-    for (const tool of tools) this.register(tool);
-
+  registerMany(tools: Iterable<HarnessTool>, owner?: string): this {
+    for (const tool of tools) this.register(tool, owner);
     return this;
   }
 
-  registerFactory(name: string, factory: ToolFactory): this {
+  registerFactory(name: string, factory: ToolFactory, owner?: string): this {
+    this.#claim(name, owner, 'factory');
     this.#factories.set(name, factory);
-
     return this;
   }
 
-  registerProvider(provider: ToolProvider): this {
-    this.#providers.push(provider);
-
+  registerProvider(provider: ToolProvider, owner?: string, name?: string): this {
+    const label = registrationOwner(owner, this.namespace);
+    const id = name ?? (this.namespace === null ? `provider:${this.#providers.size}` : undefined);
+    if (!id) throw new TypeError('A named provider requires a registration name.');
+    const previous = this.#providers.get(id);
+    if (previous) throw new RegistrationCollision(this.namespace, id, previous.owner, label);
+    this.#providers.set(id, { provider, owner: label });
     return this;
+  }
+
+  replace(tool: HarnessTool, predecessorOwner: string, owner?: string): this {
+    this.#claim(tool.name, owner, 'static', predecessorOwner);
+    this.#tools.set(tool.name, tool);
+    return this;
+  }
+
+  replaceFactory(name: string, factory: ToolFactory, predecessorOwner: string, owner?: string): this {
+    this.#claim(name, owner, 'factory', predecessorOwner);
+    this.#factories.set(name, factory);
+    return this;
+  }
+
+  replaceProvider(name: string, provider: ToolProvider, predecessorOwner: string, owner?: string): this {
+    const label = registrationOwner(owner, this.namespace), previous = this.#providers.get(name);
+    if (!previous || previous.owner !== predecessorOwner) throw new Error('Replacement must name the registered predecessor owner.');
+    this.#providers.set(name, { provider, owner: label });
+    return this;
+  }
+
+  #claim(name: string, owner: string | undefined, source: 'static' | 'factory', predecessor?: string): void {
+    const label = registrationOwner(owner, this.namespace), previous = this.#metadata.get(name);
+    if (predecessor !== undefined) {
+      if (!previous || previous.owner !== predecessor) throw new Error('Replacement must name the registered predecessor owner.');
+    } else if (previous) throw new RegistrationCollision(this.namespace, name, previous.owner, label);
+    this.#tools.delete(name); this.#factories.delete(name);
+    this.#metadata.set(name, { owner: label, source });
   }
 
   /** Every name this registry can produce without a session. */
@@ -72,11 +126,25 @@ export class ToolRegistry {
    * run wondering why the model never called it.
    */
   async resolve(names: readonly string[], session?: Session): Promise<Map<string, HarnessTool>> {
-    const provided = new Map<string, HarnessTool>();
+    const detailed = await this.resolveDetailed(names, session);
+    return new Map([...detailed].map(([name, entry]) => [name, entry.tool]));
+  }
+
+  /** The offer path and inspection path consume the same ownership result. */
+  async resolveDetailed(names: readonly string[], session?: Session): Promise<Map<string, ResolvedTool>> {
+    if (session && session.agent !== this.namespace) {
+      if (this.namespace !== null) throw new Error('Harness registry/session agent mismatch.');
+      return this.forAgent(session.agent).resolveDetailed(names, session);
+    }
+    const provided = new Map<string, HarnessTool>(), metadata = new Map(this.#metadata);
 
     if (session !== undefined) {
-      for (const provider of this.#providers) {
-        for (const tool of await provider(session)) provided.set(tool.name, tool);
+      for (const { provider, owner } of this.#providers.values()) {
+        for (const tool of await provider(session)) {
+          const previous = metadata.get(tool.name);
+          if (previous) throw new RegistrationCollision(this.namespace, tool.name, previous.owner, owner);
+          provided.set(tool.name, tool); metadata.set(tool.name, { owner, source: 'provider' });
+        }
       }
     }
 
@@ -85,13 +153,13 @@ export class ToolRegistry {
     ];
     const selected = names.includes('*') ? available : names;
 
-    const resolved = new Map<string, HarnessTool>();
+    const resolved = new Map<string, ResolvedTool>();
 
     for (const name of selected) {
       const tool = this.#tools.get(name) ?? provided.get(name);
 
       if (tool !== undefined) {
-        resolved.set(name, tool);
+        resolved.set(name, { tool, ...metadata.get(name)! });
         continue;
       }
 
@@ -105,7 +173,14 @@ export class ToolRegistry {
         throw HarnessError.toolNotAvailable(`${name} (needs a session to build)`, available);
       }
 
-      resolved.set(name, factory(session));
+      const built = factory(session);
+      if (this.namespace !== null && built.name !== name) throw new Error(`Session-bound tool factory [${name}] returned [${built.name}].`);
+      if (built.name !== name) {
+        const previous = metadata.get(built.name);
+        if (previous) throw new RegistrationCollision(this.namespace, built.name, previous.owner, metadata.get(name)!.owner);
+        metadata.set(built.name, metadata.get(name)!);
+      }
+      resolved.set(name, { tool: built, ...metadata.get(name)! });
     }
 
     return resolved;
@@ -123,6 +198,7 @@ export type CallPolicy = (
 ) => boolean | Promise<boolean>;
 
 export interface ToolAuthorizerOptions {
+  agents?: Record<string, ToolAuthorizerOptions>;
   enabled?: boolean;
   offer?: OfferPolicy;
   call?: CallPolicy;
@@ -147,19 +223,48 @@ export class ToolAuthorizer {
   readonly #offer?: OfferPolicy;
 
   readonly #call?: CallPolicy;
+  readonly #agents: Record<string, ToolAuthorizerOptions>;
+  readonly #scoped = new Map<string, ToolAuthorizer>();
 
-  constructor(options: ToolAuthorizerOptions = {}) {
+  constructor(options: ToolAuthorizerOptions = {}, private readonly namespace: string | null = null, private readonly root?: ToolAuthorizer) {
+    validateAgent(namespace);
     this.enabled = options.enabled ?? false;
     this.#offer = options.offer;
     this.#call = options.call;
+    this.#agents = Object.fromEntries(Object.entries(options.agents ?? {}).map(([agent, config]) => {
+      validateAgent(agent);
+      return [agent, { ...config }];
+    }));
 
     if (!this.enabled && (options.offer !== undefined || options.call !== undefined)) {
       throw HarnessError.policyDefinedButDisabled();
     }
+    for (const key of ['enabled', 'namespace', 'root']) Object.defineProperty(this, key, { writable: false, configurable: false });
   }
+
+  forAgent(agent: string | null): ToolAuthorizer {
+    validateAgent(agent);
+    const root = this.root ?? this;
+    if (agent === null) return root;
+    let scoped = root.#scoped.get(agent);
+    if (!scoped) {
+      const overrides = root.#agents[agent] ?? {};
+      const options = { enabled: root.enabled, offer: root.#offer, call: root.#call, ...overrides, agents: {} };
+      if (typeof options.enabled !== 'boolean' || (options.offer !== undefined && typeof options.offer !== 'function') || (options.call !== undefined && typeof options.call !== 'function')) throw new TypeError('Malformed agent tool authorization options.');
+      scoped = new ToolAuthorizer(options, agent, root);
+      root.#scoped.set(agent, scoped);
+    }
+    return scoped;
+  }
+
+  hasCallPolicy(): boolean { return this.#call !== undefined; }
 
   /** The tools a run may be offered, each wrapped so the call policy is asked again. */
   async allowed(session: Session, tools: Map<string, HarnessTool>): Promise<HarnessTool[]> {
+    if (session.agent !== this.namespace) {
+      if (this.namespace !== null) throw new Error('Harness authorizer/session agent mismatch.');
+      return this.forAgent(session.agent).allowed(session, tools);
+    }
     if (!this.enabled) {
       return [...tools.values()];
     }
@@ -186,6 +291,10 @@ export class ToolAuthorizer {
    * be mistaken for enforcement.
    */
   async allowsCall(session: Session, tool: HarnessTool, args: JsonObject): Promise<boolean> {
+    if (session.agent !== this.namespace) {
+      if (this.namespace !== null) throw new Error('Harness authorizer/session agent mismatch.');
+      return this.forAgent(session.agent).allowsCall(session, tool, args);
+    }
     if (!this.enabled || this.#call === undefined) {
       return true;
     }

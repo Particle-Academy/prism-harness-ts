@@ -4,10 +4,11 @@ export type { HarnessErrorCode, HarnessErrorOptions } from './errors.js';
 export type { JsonObject, JsonValue } from './json.js';
 export { isJsonObject } from './json.js';
 
-export type { AppendLogStore, Durability, SessionStore } from './stores/session-store.js';
+export type { AppendLogStore, Durability, LockScope, SessionStore } from './stores/session-store.js';
 export { isDurable, supportsAppendLog } from './stores/session-store.js';
 export { MemorySessionStore } from './stores/memory-session-store.js';
 export { FileSessionStore } from './stores/file-session-store.js';
+export type { PendingFileLockRelease } from './stores/file-owner-lock.js';
 export { SessionStoreManager, SLOT_DURABLE, SLOT_EPHEMERAL } from './stores/store-manager.js';
 export type { StoreFactory, StoreManagerOptions } from './stores/store-manager.js';
 
@@ -17,8 +18,11 @@ export type { Participant, RunState, SessionOptions } from './session.js';
 export { Thread } from './thread.js';
 export type { ThreadMessage } from './thread.js';
 
-export { PendingSession, PrismHarness } from './harness.js';
-export type { HarnessOptions } from './harness.js';
+export { AgentHarness, PendingSession, PrismHarness } from './harness.js';
+export { ParticipantAdapters, ParticipantRef, SessionAddress } from './address.js';
+export { AddressLimitExceeded, IndexLockScopeUnsupported, IndexRecoveryRequired, StoreAddressIndex } from './address-index.js';
+export type { AddressIndexPage } from './address-index.js';
+export type { AgentHarnessConfig, HarnessOptions } from './harness.js';
 
 export { AgentMode, ModeRegistry } from './modes.js';
 export type { ModeConfig, ModeRegistryConfig } from './modes.js';
@@ -55,6 +59,8 @@ export type {
 export type {
   AgentResponse,
   AgentRuntimeOptions,
+  EffectiveTool,
+  RuntimeConfig,
   LlmClient,
   LlmRequest,
   LlmResponse,
@@ -99,4 +105,5 @@ export { SubagentRunner } from './subagent-runner.js';
 export type { SubagentOutcome, SubagentResult } from './subagent-runner.js';
 
 export { admitAttachments } from './attachments.js';
+export { RegistrationCollision } from './registration.js';
 export type { Attachment, MediaLike } from './attachments.js';

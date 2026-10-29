@@ -1,4 +1,5 @@
-import { createHash } from 'node:crypto';
+import { ParticipantRef, SessionAddress } from './address.js';
+import { indexedStore, storeLockRank, StoreAddressIndex } from './address-index.js';
 import type { JsonObject, JsonValue } from './json.js';
 import { isJsonObject } from './json.js';
 import type { SessionStore } from './stores/session-store.js';
@@ -34,6 +35,10 @@ export interface SessionOptions {
   durable: SessionStore;
   /** How long ephemeral state lives. Null keeps it until forgotten. */
   ttlSeconds?: number | null;
+  agent?: string | null;
+  actor?: object;
+  addressIndex?: StoreAddressIndex;
+  maxAddressesPerParticipant?: number | null;
 }
 
 /**
@@ -52,6 +57,12 @@ export interface SessionOptions {
  *  - the thread and stored capabilities are DURABLE.
  */
 export class Session {
+  readonly address: SessionAddress;
+  readonly actor: object;
+  readonly #addressIndex: StoreAddressIndex | undefined;
+  readonly #rawDurable: SessionStore;
+  readonly #rawEphemeral: SessionStore;
+  readonly #lockStore: SessionStore;
   readonly scope: string;
 
   readonly participant: Participant;
@@ -63,13 +74,25 @@ export class Session {
   readonly #ttlSeconds: number | null;
 
   #cachedState: JsonObject | null = null;
+  #resolutionOnly = false;
+  #resolvedMode: string | null = null;
 
   constructor(options: SessionOptions) {
-    this.participant = options.participant;
+    if (options.participant instanceof ParticipantRef && options.actor === undefined) throw new Error('Typed participants require an explicit authorization actor.');
+    this.participant = options.participant instanceof ParticipantRef ? options.participant : Object.freeze({ ...options.participant });
+    this.address = new SessionAddress(this.participant, options.scope, options.agent ?? null);
+    this.actor = options.actor ?? this.participant;
+    const index = options.addressIndex ?? (this.address.agent !== null || options.participant instanceof ParticipantRef
+      ? new StoreAddressIndex(options.durable, options.maxAddressesPerParticipant ?? null) : undefined);
+    this.#addressIndex = index;
+    this.#rawDurable = options.durable;
+    this.#rawEphemeral = options.ephemeral;
     this.scope = options.scope;
-    this.#ephemeral = options.ephemeral;
-    this.#durable = options.durable;
+    this.#ephemeral = index ? indexedStore(options.ephemeral, index, this.address, 'ephemeral') : options.ephemeral;
+    this.#durable = index ? indexedStore(options.durable, index, this.address, 'durable') : options.durable;
+    this.#lockStore = index && storeLockRank(options.durable) > storeLockRank(options.ephemeral) ? this.#durable : this.#ephemeral;
     this.#ttlSeconds = options.ttlSeconds ?? null;
+    for (const key of ['address', 'actor', 'participant', 'scope']) Object.defineProperty(this, key, { writable: false, configurable: false });
   }
 
   /**
@@ -86,14 +109,15 @@ export class Session {
    * ONE store and resolve the same session.
    */
   key(): string {
-    const digest = createHash('sha1').update(this.participant.type).digest('hex').slice(0, 12);
-
-    return `session:${digest}:${String(this.participant.id)}:${this.scope}`;
+    return this.address.sessionKey();
   }
+
+  get agent(): string | null { return this.address.agent; }
 
   // -- ephemeral half --------------------------------------------------------
 
   async mode(): Promise<string | null> {
+    if (this.#resolvedMode !== null) return this.#resolvedMode;
     return this.#readString('mode');
   }
 
@@ -120,11 +144,12 @@ export class Session {
   async state(): Promise<JsonObject> {
     this.#cachedState ??= (await this.#ephemeral.get(this.#ephemeralKey())) ?? {};
 
-    return this.#cachedState;
+    return this.#resolutionOnly ? structuredClone(this.#cachedState) : this.#cachedState;
   }
 
   /** Drop the ephemeral half. THE CONVERSATION IS UNTOUCHED. */
   async forget(): Promise<this> {
+    this.#assertWritable();
     await this.#ephemeral.forget(this.#ephemeralKey());
     this.#cachedState = null;
 
@@ -135,7 +160,14 @@ export class Session {
 
   /** The stored conversation this session is bound to. */
   thread(): Thread {
-    return new Thread(this.#durable, `${this.key()}:thread`);
+    this.#assertWritable();
+    const store = this.#addressIndex ? indexedStore(this.#rawDurable, this.#addressIndex, this.address, 'durable', 'thread') : this.#durable;
+    return new Thread(store, `${this.key()}:thread`);
+  }
+
+  async findThread(): Promise<Thread | null> {
+    const thread = this.thread();
+    return await thread.exists() ? thread : null;
   }
 
   /**
@@ -149,7 +181,9 @@ export class Session {
    * against a store as safe as one reached through here.
    */
   tasks(options: StoreTaskSourceOptions = {}): StoreTaskSource {
-    return new StoreTaskSource(this.#durable, `${this.key()}:tasks`, options);
+    this.#assertWritable();
+    const store = this.#addressIndex ? indexedStore(this.#rawDurable, this.#addressIndex, this.address, 'durable', 'tasks') : this.#durable;
+    return new StoreTaskSource(store, `${this.key()}:tasks`, options);
   }
 
   async capability(name: string): Promise<JsonObject | null> {
@@ -157,7 +191,7 @@ export class Session {
     const capabilities = isJsonObject(stored.capabilities) ? stored.capabilities : {};
     const capability = capabilities[name];
 
-    return isJsonObject(capability) ? capability : null;
+    return isJsonObject(capability) ? (this.#resolutionOnly ? structuredClone(capability) : capability) : null;
   }
 
   async usingCapability(name: string, state: JsonObject): Promise<this> {
@@ -216,7 +250,8 @@ export class Session {
    * run inside this, not outside it.
    */
   async lock<T>(callback: (session: this) => T | Promise<T>, ttlSeconds = 10, waitSeconds = 5): Promise<T> {
-    return this.#ephemeral.withLock(
+    this.#assertWritable();
+    return this.#lockStore.withLock(
       this.key(),
       async () => {
         // Re-read inside the lock. State written by whoever held it before us
@@ -241,6 +276,19 @@ export class Session {
     return `${this.key()}:durable`;
   }
 
+  /** Refuse explicit logical mutations; ordinary get() retains expired-entry cleanup. */
+  async resolveReadOnly<T>(mode: string, resolve: (session: Session) => T | Promise<T>): Promise<T> {
+    const view = new Session({ participant: this.participant, scope: this.scope, agent: this.agent, actor: this.actor,
+      ephemeral: this.#rawEphemeral, durable: this.#rawDurable, addressIndex: this.#addressIndex, ttlSeconds: this.#ttlSeconds });
+    view.#resolutionOnly = true; view.#resolvedMode = mode;
+    try { return await resolve(view); }
+    finally { view.#resolutionOnly = false; view.#cachedState = null; }
+  }
+
+  #assertWritable(): void {
+    if (this.#resolutionOnly) throw new Error('Harness tool resolution is read-only.');
+  }
+
   async #readString(key: string): Promise<string | null> {
     const value = (await this.state())[key];
 
@@ -248,6 +296,7 @@ export class Session {
   }
 
   async #write(key: string, value: JsonValue): Promise<this> {
+    this.#assertWritable();
     const state = { ...(await this.state()), [key]: value };
     await this.#ephemeral.put(this.#ephemeralKey(), state, this.#ttlSeconds);
     this.#cachedState = state;
@@ -258,6 +307,7 @@ export class Session {
   async #writeCapabilities(
     mutate: (capabilities: JsonObject) => JsonObject,
   ): Promise<this> {
+    this.#assertWritable();
     const stored = (await this.#durable.get(this.#durableKey())) ?? {};
     const capabilities = isJsonObject(stored.capabilities) ? stored.capabilities : {};
     await this.#durable.put(this.#durableKey(), { ...stored, capabilities: mutate(capabilities) });

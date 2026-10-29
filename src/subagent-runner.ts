@@ -4,6 +4,7 @@ import type { AgentRuntime } from './runtime.js';
 import type { Session } from './session.js';
 import { MAX_DEPTH, RunContext, type Subagent } from './subagents.js';
 import type { HarnessTool } from './tools.js';
+import { HarnessError } from './errors.js';
 
 export type SubagentOutcome =
   /** It ran and returned. */
@@ -51,6 +52,9 @@ export class SubagentRunner {
       name: subagent.name,
       description: subagent.description,
       handle: async (args: JsonObject): Promise<string> => {
+        if (parent.agent !== null && Object.keys(args).some(key => key !== 'task')) {
+          throw HarnessError.runNotPermitted('Named subagent input may contain only task. Identity changes require an explicit host-owned delegation binding.');
+        }
         const task = typeof args.task === 'string' ? args.task : '';
 
         return (await this.run(subagent, parent, context, parentRunId, task)).toToolResult();
@@ -99,13 +103,14 @@ export class SubagentRunner {
     }
 
     const child = this.harness
-      .for(parent.participant)
+      .pending(parent.participant, parent.agent, parent.actor)
       .session(subagent.scopeUnder(parent.scope));
 
     // The child's authority comes from ITS mode, not the parent's.
     await child.usingMode(subagent.mode);
-    await child.usingProvider((await parent.provider()) ?? 'unknown');
-    await child.usingModel((await parent.model()) ?? 'unknown');
+    const provider = await parent.provider(), model = await parent.model();
+    if (parent.agent === null || provider !== null) await child.usingProvider(provider ?? 'unknown');
+    if (parent.agent === null || model !== null) await child.usingModel(model ?? 'unknown');
 
     try {
       const response = await this.runtime.send(child, task, undefined, childContext);

@@ -30,6 +30,8 @@ export function isDurable(durability: Durability): boolean {
   return durability === 'durable';
 }
 
+export type LockScope = 'process' | 'host' | 'distributed' | 'unsupported';
+
 /**
  * Where session state lives between turns.
  *
@@ -43,6 +45,9 @@ export function isDurable(durability: Durability): boolean {
  * lost agent action.
  */
 export interface SessionStore {
+  /** Required to opt into indexed namespaces; absent declarations are refused there. */
+  lockScope?(): LockScope;
+  sharingScope?(): LockScope;
   /** Null when nothing is stored. */
   get(key: string): Promise<JsonObject | null>;
 

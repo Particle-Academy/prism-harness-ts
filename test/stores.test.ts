@@ -1,4 +1,8 @@
-import { mkdtemp, readFile, utimes, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, utimes, writeFile } from 'node:fs/promises';
+import { spawnSync } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
+import { nativeLockIdentity } from '../src/stores/file-lock-identity.js';
+import { parseFileLockOwner } from '../src/stores/file-owner-lock.js';
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -15,21 +19,13 @@ async function fileStore(): Promise<FileSessionStore> {
   return new FileSessionStore(await mkdtemp(join(tmpdir(), 'prism-harness-store-')));
 }
 
-/**
- * A FINISHED lock stamp: the expiry, then the terminator the reader requires.
- *
- * Every test below that plants a lockfile by hand goes through here, so none of
- * them can accidentally plant a half-written one and then assert the reader's
- * behaviour on the wrong input. The format is shared with the PHP and Python
- * ports; `writes a stamp in the SHARED format` asserts the real writer emits
- * exactly this, which is the only thing keeping this helper honest.
- */
-function lockStamp(expiresAt: number): string {
-  // The newline as a code point rather than an escape: this file is edited by
-  // tooling that has mangled `\` sequences here before, and a terminator that
-  // silently became something else would make every test below assert the
-  // opposite of what it claims.
-  return `${String(Math.trunc(expiresAt))}${String.fromCharCode(10)}`;
+async function plantOwner(path:string,pid:number,released:boolean):Promise<void> {
+  const identity=nativeLockIdentity(); expect(identity?.pid_namespace).toBeTypeOf('string');
+  const nonce=randomBytes(16).toString('hex');
+  await mkdir(path);
+  await writeFile(join(path,'owner-'+nonce+'.json'),JSON.stringify({
+    version:2,pid,identity,nonce,released,expires_at:Math.floor(Date.now()/1000)+60,
+  })+'\n');
 }
 
 /**
@@ -126,18 +122,32 @@ describe.each<[string, () => Promise<SessionStore>]>([
   });
 
   it('does not serialise DIFFERENT keys against each other', async () => {
-    const store = await make();
-    let released = false;
-
-    const held = store.withLock('a', async () => {
-      await new Promise((resolve) => setTimeout(resolve, 50));
-      released = true;
-    });
-
-    await store.withLock('b', () => undefined);
-    expect(released).toBe(false);
-
-    await held;
+    // Keep A inside an explicit barrier. Filesystem scheduling is not a clock
+    // guarantee; B must enter while A remains held, regardless of elapsed time.
+    for (const forceGlobalKey of [false, true]) {
+      const store = await make();
+      let entered!: () => void, release!: () => void, released = false, callbacks = 0;
+      const ready = new Promise<void>(done => { entered = done; });
+      const barrier = new Promise<void>(done => { release = done; });
+      const held = store.withLock('a', async () => {
+        entered(); await barrier; released = true;
+      });
+      try {
+        await Promise.race([ready, held]);
+        const second = store.withLock(forceGlobalKey ? 'a' : 'b', () => {
+          callbacks++; expect(released).toBe(false);
+        }, 10, 0.1);
+        if (forceGlobalKey) {
+          // Deliberately collapse both logical keys onto one actual lock: the
+          // same apparatus must observe refusal and zero B callbacks.
+          await expect(second).rejects.toMatchObject({ code: 'session_locked' });
+          expect(callbacks).toBe(0);
+        } else {
+          await second; expect(callbacks).toBe(1);
+        }
+        expect(released).toBe(false);
+      } finally { release(); await held; }
+    }
   });
 
   it('throws session_locked rather than running the callback anyway', async () => {
@@ -201,176 +211,41 @@ describe('memory store lock ordering', () => {
   });
 });
 
-/**
- * The window between creating the lockfile and stamping it.
- *
- * Taking the lock is `open(…, 'wx')` and THEN writing the expiry — two
- * operations, with a moment where the file exists and is empty. A waiter
- * reading it in that moment used to compute `Number('') === 0`, conclude the
- * lock had expired in 1970, delete it, and take a lock somebody was actively
- * holding. That is the same key handed to two callers, which is the one thing
- * this lock exists to prevent.
- *
- * It was not theoretical and it was not rare: it failed the suite above about
- * one run in eight, as a timing flake, which is how it survived.
- *
- * These tests recreate the window directly rather than racing for it, because a
- * test that has to win a race to fail is a test that passes for the wrong
- * reason most of the time.
- */
-describe('file store: a lockfile that exists but is not yet stamped', () => {
-  async function lockedDirectory(): Promise<{ store: FileSessionStore; lockPath: string }> {
-    const directory = await mkdtemp(join(tmpdir(), 'prism-harness-lockwindow-'));
-    const digest = createHash('sha256').update('k').digest('hex').slice(0, 32);
-
-    return { store: new FileSessionStore(directory), lockPath: join(directory, `${digest}.json.lock`) };
-  }
-
-  it('is treated as HELD, not as expired in 1970', async () => {
-    const { store, lockPath } = await lockedDirectory();
-    let ranWhileHeld = false;
-
-    await writeFile(lockPath, '', 'utf8');
-
-    await expect(
-      store.withLock(
-        'k',
-        () => {
-          ranWhileHeld = true;
-        },
-        10,
-        0.05,
-      ),
-    ).rejects.toMatchObject({ code: 'session_locked' });
-
-    expect(ranWhileHeld).toBe(false);
+/** The old timestamp protocol never grants v2 recovery authority, at any age. */
+describe('file store: legacy timestamp files require explicit maintenance', () => {
+  it.each(['', '123', '1735689', '1\n', '0\n', String(Date.now()+60_000)+'\n'])('refuses legacy bytes %j even with an old mtime', async stamp => {
+    const directory = await mkdtemp(join(tmpdir(), 'prism-harness-legacy-'));
+    const store = new FileSessionStore(directory), path = await lockPath(directory, store);
+    await writeFile(path, stamp, 'utf8');
+    const longAgo = new Date(0); await utimes(path, longAgo, longAgo);
+    let callbacks = 0;
+    await expect(store.withLock('k', () => {callbacks++;},10,0)).rejects.toMatchObject({
+      code:'session_locked',message:expect.stringContaining('legacy_lock_requires_maintenance'),
+    });
+    expect(callbacks).toBe(0);
+    expect(await readFile(path,'utf8')).toBe(stamp);
   });
 
-  it('is still reclaimed once it is older than the ttl', async () => {
-    // The other half of the fix. Treating an empty lockfile as held FOREVER
-    // would let a process that died inside that window wedge the key, which is
-    // a worse failure than the one being fixed. The file's own age is the
-    // bound, so nothing new has to be written to make it recoverable.
-    const { store, lockPath } = await lockedDirectory();
-
-    await writeFile(lockPath, '', 'utf8');
-
-    const longAgo = new Date(Date.now() - 60_000);
-    await utimes(lockPath, longAgo, longAgo);
-
-    expect(await store.withLock('k', () => 'taken', 10, 0.5)).toBe('taken');
-  });
-
-  it('is treated as HELD when the stamp is TRUNCATED, not expired in 1970', async () => {
-    // The empty case reached through a different door, and the more dangerous
-    // one because it does not look broken. A torn write leaves a PREFIX of the
-    // timestamp — `17356899` where `1735689900000` was meant — and every prefix
-    // of a number is a smaller number. So it parses, it is finite, and it is
-    // decades in the past: the reader concludes the holder is long dead and
-    // deletes a lock somebody is holding right now.
-    //
-    // Refusing anything that is not terminated is what tells "torn" apart from
-    // "small". Unreadable has to mean WAIT.
-    const { store, lockPath } = await lockedDirectory();
-    let ranWhileHeld = false;
-
-    await writeFile(lockPath, String(Date.now() + 10_000).slice(0, 8), 'utf8');
-
-    await expect(
-      store.withLock(
-        'k',
-        () => {
-          ranWhileHeld = true;
-        },
-        10,
-        0.05,
-      ),
-    ).rejects.toMatchObject({ code: 'session_locked' });
-
-    expect(ranWhileHeld).toBe(false);
-  });
-
-  it('is still reclaimed once a TRUNCATED stamp is older than the ttl', async () => {
-    // Same bound as the empty case, and for the same reason: a torn write from
-    // a process that then died must not wedge the key forever.
-    const { store, lockPath } = await lockedDirectory();
-
-    await writeFile(lockPath, String(Date.now() + 10_000).slice(0, 8), 'utf8');
-
-    const longAgo = new Date(Date.now() - 60_000);
-    await utimes(lockPath, longAgo, longAgo);
-
-    expect(await store.withLock('k', () => 'taken', 10, 0.5)).toBe('taken');
-  });
-
-  it('writes a stamp its OWN reader accepts', async () => {
-    // A ROUND TRIP through the real writer and the real reader. Every other
-    // test in this block plants a lockfile by hand, so all of them would stay
-    // green if the writer stopped emitting the terminator the reader now
-    // demands — Python's mutation run found exactly that hole in its own
-    // suite. This is the test that closes it.
-    //
-    // The outer lock is taken with a ttl of zero, so its stamp is already in
-    // the past by the time anything reads it. The inner caller therefore has to
-    // PARSE what the writer wrote in order to reclaim: a stamp the reader
-    // cannot read falls through to the mtime bound, which has not elapsed, and
-    // the inner call would time out instead.
-    const { store } = await lockedDirectory();
-
-    const reclaimed = await store.withLock(
-      'k',
-      async () => store.withLock('k', () => 'reclaimed', 10, 1),
-      0,
-      5,
-    );
-
-    expect(reclaimed).toBe('reclaimed');
-  });
-
-  it('writes a stamp in the SHARED format: an integer and a terminator', async () => {
-    // The lockfile format is cross-language surface. A PHP, TypeScript or
-    // Python worker pointed at one store directory has to agree on it, and
-    // Python already requires the trailing newline: without it every lock this
-    // port takes reads as unterminated there, so a Python worker waits our
-    // locks out rather than reclaiming a dead one. Safe direction, real
-    // divergence. Asserted on the bytes, from inside a held lock.
-    const { store, lockPath } = await lockedDirectory();
-
-    const raw = await store.withLock('k', async () => readFile(lockPath, 'utf8'), 10, 5);
-
-    expect(raw.endsWith('\n')).toBe(true);
-    expect(raw.slice(0, -1)).toMatch(/^\d+$/);
-    expect(Number.isInteger(Number(raw.slice(0, -1)))).toBe(true);
-  });
-
-  it('still reclaims a stamped lock whose expiry has passed', async () => {
-    // The pre-existing behaviour, asserted so the fix above cannot quietly take
-    // it away: a lock left by a dead holder must not wedge the key.
-    const { store, lockPath } = await lockedDirectory();
-
-    await writeFile(lockPath, lockStamp(Date.now() - 1_000), 'utf8');
-
-    expect(await store.withLock('k', () => 'taken', 10, 0.5)).toBe('taken');
-  });
-
-  it('does not reclaim a stamped lock whose expiry is in the future', async () => {
-    const { store, lockPath } = await lockedDirectory();
-    let ran = false;
-
-    await writeFile(lockPath, lockStamp(Date.now() + 60_000), 'utf8');
-
-    await expect(
-      store.withLock(
-        'k',
-        () => {
-          ran = true;
-        },
-        10,
-        0.05,
-      ),
-    ).rejects.toMatchObject({ code: 'session_locked' });
-
-    expect(ran).toBe(false);
+  it('reads the complete real writer record before any callback and refuses to steal its expired hint', async () => {
+    const directory=await mkdtemp(join(tmpdir(),'prism-harness-roundtrip-'));
+    const store=new FileSessionStore(directory), path=await lockPath(directory,store);
+    let bytes=Buffer.alloc(0), filename='';
+    await store.withLock('k',async()=>{
+      [filename]=(await readdir(path));
+      bytes=await readFile(join(path,filename));
+      const record=parseFileLockOwner(bytes,filename);
+      expect(record).not.toBeNull(); expect(record!.released).toBe(false);
+      expect(bytes.at(-1)).toBe(10);
+      // Same key is still held even though the real writer emitted an old TTL.
+      await expect(store.withLock('k',()=>{throw Error('stolen');},10,0)).rejects.toMatchObject({code:'session_locked'});
+    },-1000);
+    // Writer/reader roundtrip after the callback: unreleased live record holds;
+    // the same record explicitly released is recoverable, irrespective of TTL.
+    await mkdir(path); await writeFile(join(path,filename),bytes);
+    await expect(store.withLock('k',()=>1,10,0)).rejects.toMatchObject({code:'session_locked'});
+    const released={...JSON.parse(bytes.toString('utf8')),released:true};
+    await writeFile(join(path,filename),JSON.stringify(released)+'\n');
+    expect(await store.withLock('k',()=>7,10,0.5)).toBe(7);
   });
 });
 
@@ -395,24 +270,13 @@ describe('FileSessionStore', () => {
     expect(await new FileSessionStore(directory).get('k')).toEqual({ approval: 'pending' });
   });
 
-  it('reclaims a lock whose holder died', async () => {
-    // Left alone, a stale lockfile wedges the key forever — worse than the
-    // small race in reclaiming it.
-    const directory = await mkdtemp(join(tmpdir(), 'prism-harness-store-'));
-    const store = new FileSessionStore(directory);
-    await store.put('k', {});
-
-    const files = await readFile(join(directory, (await lockName(directory, store))), 'utf8').catch(
-      () => null,
-    );
-    expect(files).toBeNull(); // no lock is held yet
-
-    // Plant an already-expired lock, as a killed process would leave behind —
-    // in the REAL format, terminator and all. Without the newline this is a
-    // torn write rather than an old one, and the reader is right to wait.
-    await writeFile(await lockPath(directory, store), lockStamp(Date.now() - 1000), 'utf8');
-
-    expect(await store.withLock('k', () => 'recovered')).toBe('recovered');
+  it('reclaims a proven-dead same-identity holder without using expiry as proof', async () => {
+    const directory=await mkdtemp(join(tmpdir(),'prism-harness-dead-'));
+    const store=new FileSessionStore(directory);
+    const child=spawnSync(process.execPath,['-e',''],{windowsHide:true,timeout:5000});
+    expect(child.status).toBe(0); expect(child.error).toBeUndefined();
+    await plantOwner(await lockPath(directory,store),child.pid,false);
+    expect(await store.withLock('k',()=> 'recovered')).toBe('recovered');
   });
 
   it('survives many contending callers', async () => {
@@ -450,25 +314,13 @@ describe('FileSessionStore', () => {
     });
   });
 
-  it('reclaims a lock marked dead, WITHOUT waiting out the ttl', async () => {
-    // The contract `#release`'s fallback depends on: when it cannot delete the
-    // lockfile it rewrites it with an already-past expiry rather than leaving
-    // it held, and a waiter must then reclaim it on the next attempt instead of
-    // blocking for the full wait. `prism-harness-py` hit that leak on its first
-    // concurrent test; this port had the same defect.
-    const directory = await mkdtemp(join(tmpdir(), 'prism-harness-store-'));
-    const store = new FileSessionStore(directory);
-    await store.put('k', {});
-    // `#release` writes a TERMINATED zero, so this plants what it plants.
-    await writeFile(await lockPath(directory, store), lockStamp(0), 'utf8');
-
-    const started = Date.now();
-    // A wait far shorter than the 10s lock ttl: reclaiming has to come from the
-    // expiry marker, not from the lock timing out.
-    const result = await store.withLock('k', () => 'reclaimed', 10, 0.5);
-
-    expect(result).toBe('reclaimed');
-    expect(Date.now() - started).toBeLessThan(400);
+  it('reclaims an explicitly released same-identity owner without waiting for TTL', async () => {
+    const directory=await mkdtemp(join(tmpdir(),'prism-harness-released-'));
+    const store=new FileSessionStore(directory);
+    await plantOwner(await lockPath(directory,store),process.pid,true);
+    const started=performance.now();
+    expect(await store.withLock('k',()=> 'reclaimed',10,0.5)).toBe('reclaimed');
+    expect(performance.now()-started).toBeLessThan(400);
   });
 
   it('refuses a stored payload that is not valid JSON, by code', async () => {

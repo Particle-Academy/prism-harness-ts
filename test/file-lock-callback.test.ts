@@ -61,11 +61,10 @@ it('a separate waiter completes its bounded refusal without a host keepalive', a
       child.on('close', (code, signal) => { done({ code, signal, stdout, stderr }); });
     });
     // The holder is still inside its callback throughout the child's entire wait.
-    expect((await lstat(lock)).isFile()).toBe(true);
+    expect((await lstat(lock)).isDirectory()).toBe(true);
   });
   expect(outcome).toBeDefined();
   expect(outcome!.code, outcome!.stderr).toBe(0);
   expect(outcome!.signal).toBeNull();
   expect(JSON.parse(outcome!.stdout)).toMatchObject({ callbacks: 0, code: 'session_locked' });
 }, 10_000);
-

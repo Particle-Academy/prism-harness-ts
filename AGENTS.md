@@ -53,9 +53,11 @@ register in the envelope for what the PHP reference has that this does not.
 
 ## Five things that are load-bearing
 
-1. **`Session.key()` must stay byte-identical to PHP's.** sha1 of the
-   participant type, truncated to 12. It is what lets all three languages share
-   one store. Changing it silently splits a conversation in two.
+1. **`Session.key()` must stay byte-identical to PHP's.** The null namespace
+   retains sha1 of the participant type, truncated to 12. Named SessionAddress
+   uses the domain-separated compact UTF-8 JSON digest including agent, owner
+   and scope. Shared vectors bind both forms. Never implicitly migrate a legacy
+   address or derive an agent id from a persona name.
 
 2. **A volatile store is refused for the durable slot**, at resolve time. That
    check is the reason the package exists. Do not add a "just this once" escape.
@@ -82,6 +84,12 @@ register in the envelope for what the PHP reference has that this does not.
    queue, an HTTP body or a JSON config.
 
 ## Traps already hit here
+
+Decision0022 binds FileSessionStore's owner directory protocol. TTL never proves
+death; compare established native boot/PID realm before a read-only PID probe.
+Only the observed nonce can be unlinked, and nonrecursive rmdir requires that
+unlink to have succeeded. Preserve the legacy maintenance diagnostic and the
+mandatory old-worker hard stop. See prism-parity/docs/decisions/0022-local-file-lock-ownership.md.
 
 - **The in-memory lock claimed its slot AFTER an `await`**, so two callers in
   the same tick both found it empty and both ran. Claim synchronously. Same

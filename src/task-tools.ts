@@ -145,7 +145,11 @@ export function agentCompletionTool(options: CompletionToolOptions): ToolFactory
     },
   };
 
-  return (session) => authorizedTool(tool, session, authorizer);
+  return (session) => {
+    const scoped = session.agent === null ? authorizer : authorizer.forAgent(session.agent);
+    if (session.agent !== null && (!scoped.enabled || !scoped.hasCallPolicy())) throw HarnessError.completionToolWithoutAuthorizer(name);
+    return authorizedTool(tool, session, scoped);
+  };
 }
 
 /**
