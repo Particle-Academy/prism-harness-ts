@@ -3,6 +3,8 @@ import type { JsonObject } from './json.js';
 import { isJsonObject } from './json.js';
 import type { Subagent } from './subagents.js';
 import { subagentFromConfig } from './subagents.js';
+import { validateAgent } from './address.js';
+import { RegistrationCollision, registrationOwner } from './registration.js';
 
 export interface ModeConfig {
   system_prompt?: string;
@@ -16,6 +18,8 @@ export interface ModeConfig {
 }
 
 export interface ModeRegistryConfig {
+  owner?: string;
+  agents?: Record<string, ModeRegistryConfig>;
   default?: string;
   modes?: Record<string, ModeConfig>;
 }
@@ -56,7 +60,53 @@ export class AgentMode {
 }
 
 export class ModeRegistry {
-  constructor(private readonly config: ModeRegistryConfig = {}) {}
+  readonly #agents = new Map<string, ModeRegistry>();
+  readonly #owners = new Map<string, string>();
+
+  constructor(private readonly config: ModeRegistryConfig = {}, private readonly agent: string | null = null, private readonly root?: ModeRegistry) {
+    validateAgent(agent);
+    for (const name of Object.keys(config.modes ?? {})) this.#owners.set(name, registrationOwner(config.owner, agent));
+    for (const key of ['config', 'agent', 'root']) Object.defineProperty(this, key, { writable: false, configurable: false });
+  }
+
+  forAgent(agent: string | null): ModeRegistry {
+    validateAgent(agent);
+    const root = this.root ?? this;
+    if (agent === null) return root;
+    let view = root.#agents.get(agent);
+    if (!view) {
+      const configured = root.config.agents?.[agent] ?? {};
+      view = new ModeRegistry({ ...structuredClone(configured), default: configured.default ?? root.default() }, agent, root);
+      root.#agents.set(agent, view);
+    }
+    return view;
+  }
+
+  register(name: string, mode: ModeConfig, owner?: string): this {
+    const label = registrationOwner(owner, this.agent), previous = this.#owners.get(name);
+    if (previous !== undefined) throw new RegistrationCollision(this.agent, name, previous, label);
+    this.#set(name, mode, label);
+    return this;
+  }
+
+  replace(name: string, mode: ModeConfig, predecessorOwner: string, owner?: string): this {
+    const label = registrationOwner(owner, this.agent);
+    if (this.#owners.get(name) !== predecessorOwner) throw new Error('Replacement must name the registered predecessor owner.');
+    this.#set(name, mode, label);
+    return this;
+  }
+
+  #set(name: string, mode: ModeConfig, owner: string): void {
+    this.config.modes ??= {};
+    this.config.modes[name] = structuredClone(mode);
+    this.#owners.set(name, owner);
+  }
+
+  setDefault(name: string): this {
+    this.resolve(name);
+    this.config.default = name;
+    return this;
+  }
 
   default(): string {
     const configured = this.config.default;

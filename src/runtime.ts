@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { validateAgent } from './address.js';
 import type { JsonObject, JsonValue } from './json.js';
 import {
   assistantRow,
@@ -32,6 +33,8 @@ import type { HarnessTool, ToolAuthorizer, ToolRegistry } from './tools.js';
  * The reference couples these because Prism is already a dependency there.
  */
 export interface LlmRequest {
+  /** Optional ceiling the model client must pass to its provider request. */
+  maxOutputTokens?: number;
   systemPrompt: string;
   /** The conversation so far, serialized — oldest first. */
   messages: readonly JsonObject[];
@@ -131,11 +134,28 @@ export interface PendingApproval {
 }
 
 export interface AgentRuntimeOptions {
+  config?: RuntimeConfig;
+  agents?: Record<string, RuntimeConfig>;
   client: LlmClient;
   modes: ModeRegistry;
   tools: ToolRegistry;
   authorizer?: ToolAuthorizer;
   events?: HarnessEvents;
+}
+
+export interface RuntimeConfig {
+  provider?: string | null;
+  model?: string | null;
+  max_steps_ceiling?: number | null;
+  max_output_tokens_per_call?: number | null;
+  lock_ttl?: number;
+  lock_wait?: number;
+}
+
+export interface EffectiveTool {
+  name: string;
+  owner: string;
+  source: string;
 }
 
 /**
@@ -172,6 +192,8 @@ export class AgentRuntime {
   readonly #authorizer?: ToolAuthorizer;
 
   readonly #events?: HarnessEvents;
+  readonly #config: RuntimeConfig;
+  readonly #agents: Record<string, RuntimeConfig>;
 
   constructor(options: AgentRuntimeOptions) {
     this.#client = options.client;
@@ -179,6 +201,47 @@ export class AgentRuntime {
     this.#tools = options.tools;
     this.#authorizer = options.authorizer;
     this.#events = options.events;
+    this.#config = { ...options.config };
+    this.#agents = Object.fromEntries(Object.entries(options.agents ?? {}).map(([agent, config]) => {
+      validateAgent(agent); validateRuntimeConfig(config); return [agent, { ...config }];
+    }));
+    validateRuntimeConfig(this.#config);
+  }
+
+  #setting<K extends keyof RuntimeConfig>(session: Session, key: K): RuntimeConfig[K] {
+    const options = session.agent === null ? undefined : this.#agents[session.agent];
+    return options && Object.hasOwn(options, key) ? options[key] : this.#config[key];
+  }
+
+  #boundedRun(session: Session, run: RunContext): RunContext {
+    const steps = this.#setting(session, 'max_steps_ceiling'), output = this.#setting(session, 'max_output_tokens_per_call'), budget = run.budget;
+    if (steps == null && output == null) return run;
+    return new RunContext(run.ledger, new RunBudget(
+      steps == null ? budget.maxSteps : Math.min(budget.maxSteps, run.ledger.steps + steps),
+      budget.maxCostUsd, budget.maxSeconds,
+      output == null ? budget.maxOutputTokensPerCall : Math.min(budget.maxOutputTokensPerCall ?? output, output),
+    ), run.parentRunId, run.depth);
+  }
+
+  /** Inspect the offer without a run/handler or logical mutation; reads may purge expired entries. */
+  async effectiveTools(session: Session, modeName?: string): Promise<EffectiveTool[]> {
+    const mode = this.#modes.forAgent(session.agent).resolve(modeName ?? await session.mode());
+    return (await this.#offer(session, mode)).descriptors;
+  }
+
+  async #offer(session: Session, mode: AgentMode, requested?: readonly string[]): Promise<{ tools: HarnessTool[]; descriptors: EffectiveTool[] }> {
+    return session.resolveReadOnly(mode.name, async view => {
+      const detailed = await this.#tools.resolveDetailed(narrowedTools(mode.tools, requested), view);
+      const tools = new Map([...detailed].map(([name, entry]) => [name, entry.tool]));
+      if (view.agent !== null && tools.has('complete_task')) {
+        const authorizer = this.#authorizer?.forAgent(view.agent);
+        if (!authorizer?.enabled || !authorizer.hasCallPolicy()) throw new HarnessError('unsafe_authorization_configuration', 'Named task completion requires enabled authorization and an explicit call policy.');
+      }
+      const offered = this.#authorizer ? await this.#authorizer.allowed(view, tools) : [...tools.values()];
+      const ownership = new Map([...detailed.values()].map(entry => [entry.tool.name, entry]));
+      const descriptors = offered.map(tool => ({ name: tool.name, owner: ownership.get(tool.name)!.owner, source: ownership.get(tool.name)!.source }));
+      return { tools: offered, descriptors };
+    });
   }
 
   /**
@@ -245,11 +308,11 @@ export class AgentRuntime {
     // Refused before a run exists: a bad attachment is a mistake in the call,
     // and it should not cost a run, events or budget.
     const attachments = admitAttachments(prompt, additionalContent);
-    const mode = this.#modes.resolve(await session.mode());
-    const provider = (await session.provider()) ?? 'unknown';
-    const model = (await session.model()) ?? 'unknown';
+    const mode = this.#modes.forAgent(session.agent).resolve(await session.mode());
+    const provider = (await session.provider()) ?? this.#setting(session, 'provider') ?? 'unknown';
+    const model = (await session.model()) ?? this.#setting(session, 'model') ?? 'unknown';
     const runId = randomUUID();
-    const run = context ?? RunContext.root(runId, new RunBudget(mode.maxSteps));
+    const run = this.#boundedRun(session, context ?? RunContext.root(runId, new RunBudget(mode.maxSteps)));
     const thread = session.thread();
 
     if (run.tooDeep()) {
@@ -273,8 +336,11 @@ export class AgentRuntime {
     });
 
     try {
-      const resolved = await this.#tools.resolve(toolNames ?? mode.tools, session);
-      const offered = this.#authorizer ? await this.#authorizer.allowed(session, resolved) : [...resolved.values()];
+      let offered: HarnessTool[];
+      if (session.agent === null) {
+        const resolved = await this.#tools.resolve(toolNames ?? mode.tools, session);
+        offered = this.#authorizer ? await this.#authorizer.allowed(session, resolved) : [...resolved.values()];
+      } else offered = (await this.#offer(session, mode, toolNames)).tools;
       const called: string[] = [];
 
       // Decisions recorded since the run stopped are acted on FIRST, before a
@@ -355,6 +421,7 @@ export class AgentRuntime {
         provider,
         model,
         providerOptions: mode.providerOptions,
+        ...(run.budget.maxOutputTokensPerCall === null ? {} : { maxOutputTokens: run.budget.maxOutputTokensPerCall }),
         ...(schema === undefined ? {} : { schema }),
       });
 
@@ -498,8 +565,8 @@ export class AgentRuntime {
 
         await live.thread().record([toolResultRow([...work.results.values(), ...resolved], [...work.decisions.values()])], runId);
       },
-      RESOLUTION_LOCK_SECONDS,
-      RESOLUTION_WAIT_SECONDS,
+      this.#setting(session, 'lock_ttl') ?? RESOLUTION_LOCK_SECONDS,
+      this.#setting(session, 'lock_wait') ?? RESOLUTION_WAIT_SECONDS,
     );
   }
 
@@ -653,6 +720,29 @@ export class AgentRuntime {
  *
  * `approvalId` is `PendingApproval.id`, not the tool call id.
  */
+function validateRuntimeConfig(config: RuntimeConfig): void {
+  for (const key of ['provider', 'model'] as const) {
+    const value = config[key];
+    if (value !== undefined && value !== null && (typeof value !== 'string' || value === '')) throw new TypeError('Agent provider/model defaults must be nonempty strings or null.');
+  }
+  for (const key of ['max_steps_ceiling', 'max_output_tokens_per_call'] as const) {
+    const value = config[key];
+    if (value !== undefined && value !== null && (!Number.isSafeInteger(value) || value < 1)) throw new TypeError('Agent step/output ceilings must be positive integers or null.');
+  }
+  for (const key of ['lock_ttl', 'lock_wait'] as const) {
+    const value = config[key];
+    if (value !== undefined && (!Number.isSafeInteger(value) || value < (key === 'lock_ttl' ? 1 : 0))) throw new TypeError('Agent lock settings must be whole seconds with positive TTL and nonnegative wait.');
+  }
+}
+
+function narrowedTools(ceiling: readonly string[], requested?: readonly string[]): readonly string[] {
+  if (requested === undefined || requested.includes('*')) return ceiling;
+  if (ceiling.includes('*')) return requested;
+  const refused = requested.find(name => !ceiling.includes(name));
+  if (refused !== undefined) throw HarnessError.toolNotAvailable(refused, ceiling);
+  return requested;
+}
+
 export async function recordApproval(
   session: Session,
   approvalId: string,

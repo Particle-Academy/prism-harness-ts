@@ -30,6 +30,9 @@ export class MemorySessionStore implements SessionStore {
     return 'volatile';
   }
 
+  sharingScope(): 'process' { return 'process'; }
+  lockScope(): 'process' | 'host' | 'distributed' | 'unsupported' { return 'process'; }
+
   async get(key: string): Promise<JsonObject | null> {
     const entry = this.#entries.get(key);
 

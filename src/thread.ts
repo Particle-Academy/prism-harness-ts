@@ -35,6 +35,12 @@ export class Thread {
     private readonly key: string,
   ) {}
 
+  /** Existence probe only: never starts a log, migrates data or acquires a lock. */
+  async exists(): Promise<boolean> {
+    if (supportsAppendLog(this.store) && await this.store.logLength(this.key) !== null) return true;
+    return await this.store.get(this.key) !== null;
+  }
+
   async messages(): Promise<ThreadMessage[]> {
     if (supportsAppendLog(this.store)) {
       const log = await this.store.readLog(this.key);
