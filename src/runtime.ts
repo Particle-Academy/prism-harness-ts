@@ -134,6 +134,8 @@ export interface PendingApproval {
 }
 
 export interface AgentRuntimeOptions {
+  /** Legacy compatibility default. Named agents always enforce their mode ceiling. */
+  narrowRequestedTools?: boolean;
   config?: RuntimeConfig;
   agents?: Record<string, RuntimeConfig>;
   client: LlmClient;
@@ -194,8 +196,11 @@ export class AgentRuntime {
   readonly #events?: HarnessEvents;
   readonly #config: RuntimeConfig;
   readonly #agents: Record<string, RuntimeConfig>;
+  readonly #narrowRequestedTools: boolean;
 
   constructor(options: AgentRuntimeOptions) {
+    if (options.narrowRequestedTools !== undefined && typeof options.narrowRequestedTools !== 'boolean') throw new TypeError('narrowRequestedTools must be a boolean');
+    this.#narrowRequestedTools = options.narrowRequestedTools ?? false;
     this.#client = options.client;
     this.#modes = options.modes;
     this.#tools = options.tools;
@@ -231,7 +236,8 @@ export class AgentRuntime {
 
   async #offer(session: Session, mode: AgentMode, requested?: readonly string[]): Promise<{ tools: HarnessTool[]; descriptors: EffectiveTool[] }> {
     return session.resolveReadOnly(mode.name, async view => {
-      const detailed = await this.#tools.resolveDetailed(narrowedTools(mode.tools, requested), view);
+      const names = session.agent !== null || this.#narrowRequestedTools ? narrowedTools(mode.tools, requested) : (requested ?? mode.tools);
+      const detailed = await this.#tools.resolveDetailed(names, view);
       const tools = new Map([...detailed].map(([name, entry]) => [name, entry.tool]));
       if (view.agent !== null && tools.has('complete_task')) {
         const authorizer = this.#authorizer?.forAgent(view.agent);

@@ -95,7 +95,7 @@ export async function cleanFileLockOwner(lockPath: string, owner: FileLockOwner,
   }
 }
 
-async function inspect(lockPath: string, local: LockIdentity): Promise<'legacy' | 'held' | 'retry'> {
+async function inspect(lockPath: string, local: LockIdentity | null): Promise<'legacy' | 'held' | 'retry'> {
   let owner: FileLockOwner | null, temporary: boolean;
   try {
     const info = await lstat(lockPath);
@@ -114,7 +114,7 @@ async function inspect(lockPath: string, local: LockIdentity): Promise<'legacy' 
     }
     owner = parseFileLockOwner(await readFile(join(lockPath, name)), name);
     // Entire established identity must match BEFORE the first liveness probe.
-    if (!owner || !sameLockIdentity(owner.identity, local)) return 'held';
+    if (!owner || !local || !sameLockIdentity(owner.identity, local)) return 'held';
     if (!owner.released && !lockPidIsDead(owner.pid)) return 'held';
   } catch (error) {
     if (code(error) === 'ENOENT') return 'retry';
@@ -170,8 +170,10 @@ export async function withFileOwnerLock<T>(path: string, key: string, callback: 
     if ((await lstat(lockPath)).isFile()) throw new HarnessError('session_locked', 'legacy_lock_requires_maintenance: ' + lockPath + '; stop_old_workers_then_inspect_and_archive');
   } catch (error) { if (code(error) !== 'ENOENT') throw error; }
   const identity = nativeLockIdentity();
-  if (!identity) throw new HarnessError('session_locked', 'file_lock_identity_unavailable: ' + lockPath);
-  const owner: FileLockOwner = { version: 2, pid: process.pid, identity, nonce: randomBytes(16).toString('hex'), released: false, expires_at: Math.floor(Date.now()/1000 + ttl) };
+  const platform = process.platform;
+  if (!identity && platform !== 'win32' && platform !== 'linux' && platform !== 'darwin') throw new HarnessError('session_locked','Unsupported file-lock platform');
+  const owner: FileLockOwner = { version: 2, pid: process.pid, identity: identity ?? {platform:platform as LockIdentity['platform'],boot_id:'unknown',pid_namespace:null}, nonce: randomBytes(16).toString('hex'), released: false, expires_at: Math.floor(Date.now()/1000 + ttl) };
+  if (identity?.pid_namespace == null) process.emitWarning(JSON.stringify({key_digest:basename(lockPath,'.json.lock'),nonce:owner.nonce}),{code:'file_lock_identity_unavailable'});
   const candidate = lockPath + '.candidate-' + owner.nonce;
   if (dirname(candidate) !== dirname(lockPath) || basename(candidate) === basename(lockPath)) throw new Error('Lock publication must stay inside its parent');
   const deadline = performance.now() + wait * 1000;

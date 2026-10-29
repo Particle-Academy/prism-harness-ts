@@ -9,13 +9,34 @@ export interface LockIdentity {
 }
 let sampled = false;
 let established: LockIdentity | null = null;
+let retryAt = 0;
+let definitive = false;
+let durationMs = 0;
+export interface FileLockIdentityStatus {
+  readonly sampled: boolean;
+  readonly recovery_available: boolean;
+  readonly definitive: boolean;
+  readonly retry_after_ms: number | null;
+  readonly sample_duration_ms: number;
+  readonly code: 'file_lock_identity_unavailable' | null;
+}
+/** Process metadata snapshot only; never runs a query or performs I/O. */
+export function fileLockIdentityStatus(): FileLockIdentityStatus {
+  return Object.freeze({sampled,recovery_available:established?.pid_namespace != null,definitive,
+    retry_after_ms:!sampled||definitive?null:Math.max(0,retryAt-performance.now()),
+    sample_duration_ms:durationMs,code:sampled&&established?.pid_namespace==null?'file_lock_identity_unavailable':null});
+}
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-/** Sample boot/container state once per process, including unavailable proof. */
+/** Definitive metadata is permanent; transient failure is sampled at most once per minute. */
 export function nativeLockIdentity(): LockIdentity | null {
-  if (!sampled) {
+  if (!sampled || (!definitive && performance.now() >= retryAt)) {
+    const start = performance.now();
     const identity = readNativeLockIdentity();
+    durationMs = performance.now()-start;
     established = identity === null ? null : Object.freeze(identity);
+    definitive = identity !== null && (identity.pid_namespace !== null || identity.platform === 'win32');
+    retryAt = performance.now()+60000;
     sampled = true;
   }
   return established;

@@ -10,8 +10,8 @@ async function fixture() {
   return { directory, store, session: (agent: string) => harness.forAgent(agent).for({ type: 'User', id: 7 }).session('same') };
 }
 
-it('refuses same-owner static/factory collisions before a handler can run', () => {
-  const registry = new ToolRegistry();
+it('refuses same-owner static/factory collisions before a handler can run when opted in', () => {
+  const registry = new ToolRegistry({refuseDuplicates:true});
   let calls = 0;
   registry.register({ name: 'lookup', handle: () => { calls++; } });
   expect(() => registry.registerFactory('lookup', () => ({ name: 'lookup', handle: () => { calls++; } }))).toThrow('owners [legacy] and [legacy]');
@@ -239,6 +239,21 @@ it('keeps child runs in their named defaults and the parent ledger', async () =>
   const result = await new SubagentRunner(harness, runtime).run(new Subagent('worker', 'Worker', 'child', new RunBudget(2)), parent, context, 'parent-run', 'go');
   expect(result.outcome).toBe('completed'); expect(context.ledger.steps).toBe(1);
   expect(requests.map(row => [row.provider, row.model])).toEqual([['anthropic', 'support-model']]);
+});
+
+it('validates strict legacy registry options at runtime', () => {
+  for (const value of [true, 1, [], () => null]) expect(() => new ToolRegistry(value as never)).toThrow(TypeError);
+  for (const value of ['true', 1, null]) {
+    expect(() => new ToolRegistry({refuseDuplicates:value as never})).toThrow(TypeError);
+    expect(() => new ModeRegistry({refuseDuplicates:value as never})).toThrow(TypeError);
+  }
+});
+
+it('keeps legacy mode overwrite by default and refuses it only with the strict option', () => {
+  const legacy=new ModeRegistry().register('reply',{tools:['first']}).register('reply',{tools:['second']});
+  expect(legacy.resolve('reply').tools).toEqual(['second']);
+  const strict=new ModeRegistry({refuseDuplicates:true}).register('reply',{tools:['first']});
+  expect(()=>strict.register('reply',{tools:['second']})).toThrow('owners [legacy] and [legacy]');
 });
 
 it('refuses named child identity and scope arguments before work while retaining valid and legacy calls', async () => {

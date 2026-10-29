@@ -34,7 +34,7 @@ export function windowsLockIdentity(): LockIdentity | null {
   const binary = win32.join(env.SystemRoot!, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
   try {
     const result = spawnSync(binary, ['-NoProfile', '-NonInteractive', '-NoLogo', '-Command', COMMAND],
-      { env, encoding: 'utf8', timeout: 5000, maxBuffer: 16384, windowsHide: true, shell: false });
+      { env, encoding: 'utf8', timeout: 15000, maxBuffer: 16384, windowsHide: true, shell: false });
     if (result.error || result.status !== 0 || result.stderr !== '') return null;
     const match = /^boot=([1-9][0-9]{0,18})\r?\ncontainer=(present|absent)\r?\n$/.exec(result.stdout);
     if (!match || match[0] !== result.stdout || BigInt(match[1]!) > 3155378975999999999n) return null;

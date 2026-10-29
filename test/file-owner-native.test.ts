@@ -8,7 +8,9 @@ import {FileSessionStore} from '../src/index.js';
 import * as identities from '../src/stores/file-lock-identity.js';
 
 it('executes native independent live/dead and three foreign/unknown production rows',async()=>{
+ const before=identities.fileLockIdentityStatus(),started=performance.now();
  const local=identities.nativeLockIdentity();expect(local?.pid_namespace).toBeTypeOf('string');
+ console.info(JSON.stringify({native_identity_setup:true,platform:process.platform,elapsed_ms:performance.now()-started,before,status:identities.fileLockIdentityStatus()}));
  const root=await mkdtemp(join(tmpdir(),'prism-production-native-')),nonce=randomBytes(16).toString('hex');
  const spec=join(root,'spec.json');await writeFile(spec,JSON.stringify({root,nonce,package:resolve('.')}));
  const store=new FileSessionStore(join(root,'store')),canonical=join(root,'store',createHash('sha256').update('native-key').digest('hex').slice(0,32)+'.json.lock');

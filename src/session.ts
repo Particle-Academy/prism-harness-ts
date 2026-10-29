@@ -79,7 +79,8 @@ export class Session {
 
   constructor(options: SessionOptions) {
     if (options.participant instanceof ParticipantRef && options.actor === undefined) throw new Error('Typed participants require an explicit authorization actor.');
-    this.participant = options.participant instanceof ParticipantRef ? options.participant : Object.freeze({ ...options.participant });
+    const strictIdentity = options.agent != null || options.participant instanceof ParticipantRef;
+    this.participant = options.participant instanceof ParticipantRef ? options.participant : (strictIdentity ? Object.freeze({ ...options.participant }) : options.participant);
     this.address = new SessionAddress(this.participant, options.scope, options.agent ?? null);
     this.actor = options.actor ?? this.participant;
     const index = options.addressIndex ?? (this.address.agent !== null || options.participant instanceof ParticipantRef
@@ -92,7 +93,7 @@ export class Session {
     this.#durable = index ? indexedStore(options.durable, index, this.address, 'durable') : options.durable;
     this.#lockStore = index && storeLockRank(options.durable) > storeLockRank(options.ephemeral) ? this.#durable : this.#ephemeral;
     this.#ttlSeconds = options.ttlSeconds ?? null;
-    for (const key of ['address', 'actor', 'participant', 'scope']) Object.defineProperty(this, key, { writable: false, configurable: false });
+    for (const key of strictIdentity ? ['address', 'actor', 'participant', 'scope'] : ['address', 'actor']) Object.defineProperty(this, key, { writable: false, configurable: false });
   }
 
   /**
@@ -109,7 +110,8 @@ export class Session {
    * ONE store and resolve the same session.
    */
   key(): string {
-    return this.address.sessionKey();
+    return this.address.agent === null && !(this.participant instanceof ParticipantRef)
+      ? new SessionAddress(this.participant,this.scope).sessionKey() : this.address.sessionKey();
   }
 
   get agent(): string | null { return this.address.agent; }
