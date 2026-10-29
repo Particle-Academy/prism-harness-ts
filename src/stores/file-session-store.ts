@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { mkdir, open, readFile, rename, rm, stat, truncate, unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import type { JsonObject } from '../json.js';
 import { isJsonObject } from '../json.js';
 import { HarnessError } from '../errors.js';
@@ -64,6 +65,8 @@ export class FileSessionStore implements SessionStore, AppendLogStore {
     let raw: string;
 
     try {
+      // Node's whole-file helper closes its own handle on both outcomes before
+      // resolving; JSON decoding and expiry housekeeping happen after it closes.
       raw = await readFile(this.#pathFor(key), 'utf8');
     } catch (error) {
       if (isMissing(error)) return null;
@@ -110,7 +113,7 @@ export class FileSessionStore implements SessionStore, AppendLogStore {
     try {
       // Atomic on both POSIX and Windows. A reader either sees the whole old
       // payload or the whole new one, never half of either.
-      await rename(temporary, target);
+      await replaceStateFile(temporary, target);
     } catch (error) {
       await rm(temporary, { force: true });
       throw error;
@@ -298,4 +301,33 @@ function digestOf(key: string): string {
 
 function isMissing(error: unknown): boolean {
   return typeof error === 'object' && error !== null && (error as { code?: string }).code === 'ENOENT';
+}
+
+/** An open Windows target can block replacement even with delete sharing. */
+async function replaceStateFile(temporary: string, target: string): Promise<void> {
+  try {
+    await rename(temporary, target);
+    return;
+  } catch (original) {
+    if (process.platform !== 'win32' || !isReplacePermissionError(original)) throw original;
+    const deadline = performance.now() + 750;
+    while (true) {
+      const remaining = deadline - performance.now();
+      if (remaining <= 0) throw original;
+      // This timer stays referenced: an awaited write must keep the process alive.
+      await delay(Math.min(10, remaining));
+      if (performance.now() >= deadline) throw original;
+      try {
+        await rename(temporary, target);
+        return;
+      } catch (error) {
+        if (!isReplacePermissionError(error)) throw error;
+      }
+    }
+  }
+}
+
+function isReplacePermissionError(error: unknown): boolean {
+  const code = typeof error === 'object' && error !== null ? (error as { code?: string }).code : undefined;
+  return code === 'EPERM' || code === 'EACCES';
 }
