@@ -134,8 +134,10 @@ export interface PendingApproval {
 }
 
 export interface AgentRuntimeOptions {
-  /** Legacy compatibility default. Named agents always enforce their mode ceiling. */
+  /** Explicit true retains strict behavior. Explicit false now requires migration to the widening opt-out. */
   narrowRequestedTools?: boolean;
+  /** Permit caller names to replace a LEGACY session's mode list. Named agents remain strict; authorizers still apply. */
+  allowLegacyToolListWidening?: boolean;
   config?: RuntimeConfig;
   agents?: Record<string, RuntimeConfig>;
   client: LlmClient;
@@ -200,7 +202,10 @@ export class AgentRuntime {
 
   constructor(options: AgentRuntimeOptions) {
     if (options.narrowRequestedTools !== undefined && typeof options.narrowRequestedTools !== 'boolean') throw new TypeError('narrowRequestedTools must be a boolean');
-    this.#narrowRequestedTools = options.narrowRequestedTools ?? false;
+    if (options.allowLegacyToolListWidening !== undefined && typeof options.allowLegacyToolListWidening !== 'boolean') throw new TypeError('allowLegacyToolListWidening must be a boolean');
+    if (options.narrowRequestedTools === false) throw new TypeError('narrowRequestedTools: false is no longer supported. Remove it; use allowLegacyToolListWidening: true only to explicitly permit legacy tool-list widening.');
+    if (options.narrowRequestedTools === true && options.allowLegacyToolListWidening === true) throw new TypeError('narrowRequestedTools: true conflicts with allowLegacyToolListWidening: true.');
+    this.#narrowRequestedTools = options.allowLegacyToolListWidening !== true;
     this.#client = options.client;
     this.#modes = options.modes;
     this.#tools = options.tools;
