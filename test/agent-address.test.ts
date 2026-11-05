@@ -116,6 +116,9 @@ it('refuses resource data if its ownership index cannot be written', async () =>
   expect(await store.get(`${session.key()}:ephemeral`)).toBeNull();
 });
 
+// Publishes 101 real indexed sessions through native filesystem ownership.
+// Windows normally takes 2–3 seconds; hosted runners have exceeded the 5s default.
+// Give this I/O case bounded headroom while retaining its workload and assertions.
 it('crosses a fixed page boundary with no default quota and applies an explicit quota before state', async () => {
   const { harness, store } = await setup(), participant = { type: 'User', id: 7 };
   for (let i = 0; i < 101; i++) await harness.forAgent('support').for(participant).session(`scope:${i}`).usingMode('reply');
@@ -128,7 +131,7 @@ it('crosses a fixed page boundary with no default quota and applies an explicit 
   await expect(extra.usingMode('refused')).rejects.toMatchObject({ code: 'address_limit_exceeded' });
   expect(await extra.mode()).toBeNull();
   await limited.forAgent('support').for(participant).session('scope:0').usingMode('still usable');
-});
+}, 15_000);
 
 it('recovers every interrupted page publication before any resource data write', async () => {
   for (const phase of ['before', 'after']) {
