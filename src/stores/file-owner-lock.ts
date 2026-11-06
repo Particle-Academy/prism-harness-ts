@@ -116,12 +116,14 @@ async function inspect(lockPath: string, local: LockIdentity | null): Promise<'l
     // Entire established identity must match BEFORE the first liveness probe.
     if (!owner || !local || !sameLockIdentity(owner.identity, local)) return 'held';
     if (!owner.released && !lockPidIsDead(owner.pid)) return 'held';
+    // A proven stale owner's temporary file may still be open on Windows.
+    // Cleanup errors use inspection's held handling and the existing wait budget.
+    await cleanFileLockOwner(lockPath, owner, temporary);
   } catch (error) {
     if (code(error) === 'ENOENT') return 'retry';
     if (HELD.has(code(error) ?? '')) return 'held';
     throw error;
   }
-  await cleanFileLockOwner(lockPath, owner, temporary);
   return 'retry';
 }
 
