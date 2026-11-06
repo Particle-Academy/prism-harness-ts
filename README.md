@@ -58,9 +58,17 @@ creates no session, thread or index entry and makes no model/provider request
 or logical state change. Reads may physically purge expired entries, exactly as
 an ordinary store read does. Explicit state writes during resolution refuse.
 
-For named agents, the mode list is the ceiling even when a caller supplies tool
-names. Legacy sessions retain caller-list selection by default; set
-`AgentRuntimeOptions.narrowRequestedTools` to `true` to apply the ceiling there.
+The mode list is the ceiling for named and legacy sessions. Caller-supplied
+names narrow it; omitting names uses the mode's full list, and an empty list
+offers no tools. A requested `*` selects the mode's ceiling. Other names outside
+the ceiling fail before the model is called.
+
+Legacy callers that intentionally need the previous replacement behavior can
+set `AgentRuntimeOptions.allowLegacyToolListWidening` to `true`. This permits
+widening only in the legacy namespace; the configured authorizer still filters
+the offer and tool calls. Named agents always retain their ceiling. Remove an
+old explicit `narrowRequestedTools: false`: it now raises a migration error.
+Explicit `true` remains supported, and conflicts with the widening opt-out.
 Named agents inherit no legacy authority. Builtins require explicit registration and
 mode selection. Named-agent duplicates are refused; use
 tools.forAgent('support').replace(replacement, 'app.support', 'app.support.v2')

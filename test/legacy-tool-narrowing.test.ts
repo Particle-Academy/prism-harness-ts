@@ -8,8 +8,8 @@ const cases = [
   {name:'strict legacy refuses widening',narrow:true,named:false,names:['outside'],expected:null},
   {name:'strict legacy wildcard retains the mode ceiling',narrow:true,named:false,names:['*'],expected:['inside']},
   {name:'strict legacy empty list offers nothing',narrow:true,named:false,names:[],expected:[]},
-  {name:'default legacy retains caller widening',narrow:false,named:false,names:['outside'],expected:['outside']},
-  {name:'default legacy retains native empty-list behavior',narrow:false,named:false,names:[],expected:[]},
+  {name:'explicit legacy opt-out restores caller widening',narrow:false,named:false,names:['outside'],expected:['outside']},
+  {name:'explicit legacy opt-out retains native empty-list behavior',narrow:false,named:false,names:[],expected:[]},
   {name:'named sessions refuse widening without the option',narrow:false,named:true,names:['outside'],expected:null},
   {name:'named wildcard retains the mode ceiling',narrow:false,named:true,names:['*'],expected:['inside']},
 ];
@@ -23,7 +23,7 @@ for(const structured of [false,true])it.each(cases)('$name (structured='+structu
   const modes=new ModeRegistry({default:'chat',modes:{chat:{tools:['inside']}}});
   modes.forAgent('support').register('chat',{tools:['inside']},'support').setDefault('chat');
   const requests:string[][]=[];
-  const runtime=new AgentRuntime({tools,modes,narrowRequestedTools:test.narrow,client:async request=>{
+  const runtime=new AgentRuntime({tools,modes,...(test.narrow?{narrowRequestedTools:true}:test.named?{}:{allowLegacyToolListWidening:true}),client:async request=>{
     requests.push(request.tools.map(tool=>tool.name));return{text:'done',finishReason:'stop',structured:{answer:'done'},costUsd:0};
   }});
   const turn=structured?runtime.sendStructured(session,'probe',{type:'object'},test.names):runtime.send(session,'probe',test.names);
