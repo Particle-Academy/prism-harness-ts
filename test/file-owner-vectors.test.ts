@@ -80,9 +80,15 @@ it.each(['boot','realm','platform','foreign-released','unknown'])('holds %s iden
 it('holds a live owner after its old TTL and reclaims an explicitly released owner', async () => {
   const {store,lock} = await fixture(), value=owner(); await plant(lock,value);
   await expect(store.withLock('k',()=>1,10,0)).rejects.toMatchObject({code:'session_locked'});
-  value.released=true; await writeFile(join(lock,name(value)),JSON.stringify(value)+'\n');
-  expect(await store.withLock('k',()=>7,10,0.1)).toBe(7);
-  await expect(lstat(lock)).rejects.toMatchObject({code:'ENOENT'});
+  // Reclaim semantics must not depend on native filesystem work fitting in a
+  // 100ms elapsed admission window on a busy runner. Keep the positive wait
+  // and freeze only its monotonic clock; the live-owner refusal above is real.
+  const clock=vi.spyOn(performance,'now').mockReturnValue(0);
+  try {
+    value.released=true; await writeFile(join(lock,name(value)),JSON.stringify(value)+'\n');
+    expect(await store.withLock('k',()=>7,10,0.1)).toBe(7);
+    await expect(lstat(lock)).rejects.toMatchObject({code:'ENOENT'});
+  } finally {clock.mockRestore();}
 });
 
 it('unknown liveness holds a matching owner and keeps bytes intact', async () => {
