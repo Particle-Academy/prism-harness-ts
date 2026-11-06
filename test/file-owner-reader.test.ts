@@ -5,16 +5,11 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { expect, it } from 'vitest';
 import { FileSessionStore } from '../src/index.js';
+import { protectedWindowsReader } from './support/protected-reader.js';
 
 async function blockingReader(path:string):Promise<()=>Promise<void>>{
  if(process.platform!=='win32'){const handle=await open(path,'r');return async()=>{await handle.close();};}
- const command="$ErrorActionPreference='Stop'; $data=[Console]::In.ReadLine() | ConvertFrom-Json; $stream=[IO.File]::Open($data.path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite); try { [Console]::Out.WriteLine('ready'); [Console]::Out.Flush(); if ([Console]::In.ReadLine() -ne 'close') { throw 'Missing close barrier' } } finally { $stream.Dispose() }";
- const child=spawn('powershell.exe',['-NoLogo','-NoProfile','-NonInteractive','-Command',command],{windowsHide:true,stdio:['pipe','pipe','pipe'],timeout:10000});
- let stderr='',stdout='';child.stderr.on('data',data=>{stderr+=data;});
- const exited=new Promise<void>((done,reject)=>{child.once('error',reject);child.once('close',code=>{code===0?done():reject(Error('Owned reader failed: '+code+' '+stderr));});});
- const ready=new Promise<void>((done,reject)=>{child.stdout.on('data',data=>{stdout+=data;if(stdout.includes('ready'))done();});exited.then(()=>{if(!stdout.includes('ready'))reject(Error('Reader exited before barrier'));},reject);});
- child.stdin.write(JSON.stringify({path})+'\n');await ready;
- return async()=>{child.stdin.end('close\n');await exited;};
+ return protectedWindowsReader(path);
 }
 it('finishes a pending release after a real reader closes while the owner stays alive',async()=>{
  const directory=await mkdtemp(join(tmpdir(),'prism-reader-release-')),store=new FileSessionStore(directory);
@@ -36,4 +31,5 @@ it('finishes a pending release after a real reader closes while the owner stays 
  expect(code,stderr).toBe(0);
  const result=JSON.parse(stdout);expect(result).toMatchObject({callbacks:1,code:null});
  expect(result.pid).not.toBe(ownerPid);expect(process.pid).toBe(ownerPid);
-},20000);
+// 20s startup + existing 10s hold + existing 10s recovery child + 5s overhead.
+},45000);
