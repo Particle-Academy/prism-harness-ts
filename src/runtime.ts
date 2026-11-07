@@ -3,6 +3,7 @@ import { validateAgent } from './address.js';
 import type { JsonObject, JsonValue } from './json.js';
 import {
   assistantRow,
+  approvalToolScope,
   threadView,
   toolResultEntry,
   toolResultRow,
@@ -352,12 +353,18 @@ export class AgentRuntime {
         const resolved = await this.#tools.resolve(toolNames ?? mode.tools, session);
         offered = this.#authorizer ? await this.#authorizer.allowed(session, resolved) : [...resolved.values()];
       } else offered = (await this.#offer(session, mode, toolNames)).tools;
+      const scope = approvalToolScope((await thread.messages()).map(entry => entry.message));
+      if (scope !== null) {
+        if (scope.legacy) console.warn('Pending approval has no valid stored tool scope; offering approved requests only.');
+        offered = offered.filter(tool => scope.names.includes(tool.name)
+          && (mode.tools.includes('*') || mode.tools.includes(tool.name)));
+      }
       const called: string[] = [];
 
       // Decisions recorded since the run stopped are acted on FIRST, before a
       // new prompt is recorded, so the results land after the calls they answer
       // rather than after the new turn.
-      await this.#resolveApprovals(session, mode, offered, runId, called);
+      offered = await this.#resolveApprovals(session, mode, offered, runId, called, scope?.legacy === true);
 
       if (prompt !== '') {
         // With attachments, the shape prism-ts's UserMessage.toObject() writes:
@@ -457,7 +464,9 @@ export class AgentRuntime {
         ? { ...(response.additionalContent ?? {}), structured: response.structured ?? null }
         : (response.additionalContent as JsonObject | undefined);
 
-      await thread.record([assistantRow(response.text, toolCalls, metadata, requests)], runId);
+      const row: JsonObject = assistantRow(response.text, toolCalls, metadata, requests);
+      if (requests.length > 0) row.harness_tool_names = offered.map(tool => tool.name);
+      await thread.record([row], runId);
 
       if (failedFinish !== null) {
         // Complete the transcript with refusals, never approval requests, so a
@@ -538,24 +547,30 @@ export class AgentRuntime {
   async #resolveApprovals(
     session: Session,
     mode: AgentMode,
-    offered: readonly HarnessTool[],
+    offered: HarnessTool[],
     runId: string,
     called: string[],
-  ): Promise<void> {
+    legacyDiagnosticEmitted: boolean,
+  ): Promise<HarnessTool[]> {
     // A read without the lock first: nearly every send() has nothing to resolve
     // and should not wait on the session lock to find that out.
-    if ((await this.#unresolved(session, mode)) === null) return;
+    if ((await this.#unresolved(session, mode)) === null) return offered;
 
     // Then under the session lock, reading again inside it. Two workers resuming
     // the same session at once would otherwise both find the approved call with
     // no result, and both run it. The second now waits, finds the result the
     // first recorded, and runs nothing. If it cannot get the lock it throws
     // SessionLocked, and nothing runs.
-    await session.lock(
+    return await session.lock(
       async (live) => {
         const work = await this.#unresolved(live, mode);
 
-        if (work === null) return;
+        if (work === null) return offered;
+
+        // Work can change while waiting. Its calls, decisions AND scope must
+        // come from the same locked snapshot, and bound the continuation too.
+        if (work.scope?.legacy && !legacyDiagnosticEmitted) console.warn('Pending approval has no valid stored tool scope; offering approved requests only.');
+        const bounded = offered.filter(tool => work.scope?.names.includes(tool.name) === true);
 
         const resolved: ToolResultEntry[] = [];
 
@@ -566,7 +581,7 @@ export class AgentRuntime {
 
           if (decision?.approved === true) {
             called.push(call.name);
-            resolved.push(await this.#runApproved(offered, input));
+            resolved.push(await this.#runApproved(bounded, input));
           } else {
             resolved.push(
               toolResultEntry(input, decision === undefined ? 'No approval response provided' : (decision.reason ?? 'User denied tool execution')),
@@ -575,6 +590,7 @@ export class AgentRuntime {
         }
 
         await live.thread().record([toolResultRow([...work.results.values(), ...resolved], [...work.decisions.values()])], runId);
+        return bounded;
       },
       this.#setting(session, 'lock_ttl') ?? RESOLUTION_LOCK_SECONDS,
       this.#setting(session, 'lock_wait') ?? RESOLUTION_WAIT_SECONDS,
@@ -590,8 +606,10 @@ export class AgentRuntime {
     results: Map<string, ToolResultEntry>;
     decisions: Map<string, ApprovalDecisionEntry>;
     approvalIds: Map<string, string>;
+    scope: ReturnType<typeof approvalToolScope>;
   } | null> {
-    const view = threadView((await session.thread().messages()).map((entry) => entry.message));
+    const rows = (await session.thread().messages()).map((entry) => entry.message);
+    const view = threadView(rows);
     let index = view.length - 1;
 
     while (index >= 0 && !(view[index]!.type === 'assistant' && (view[index] as AssistantRow).tool_calls.length > 0)) {
@@ -612,7 +630,7 @@ export class AgentRuntime {
       (call) => !results.has(call.id) && (approvalIds.has(call.id) || mode.needsApproval(call.name)),
     );
 
-    return calls.length === 0 ? null : { calls, results, decisions, approvalIds };
+    return calls.length === 0 ? null : { calls, results, decisions, approvalIds, scope: approvalToolScope(rows) };
   }
 
   /**

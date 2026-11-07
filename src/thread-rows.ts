@@ -141,6 +141,37 @@ export function threadView(rows: readonly JsonObject[]): JsonObject[] {
   return view;
 }
 
+/** Stored approval authority, kept separate from the provider replay view. */
+export function approvalToolScope(rows: readonly JsonObject[]): { names: string[]; legacy: boolean } | null {
+  const decisions = new Map<string, boolean>();
+  for (const row of threadView(rows).reverse()) {
+    if (row.type === 'tool_result') {
+      for (const response of list(row.tool_approval_responses)) {
+        if (typeof response.approval_id === 'string' && !decisions.has(response.approval_id)) decisions.set(response.approval_id, response.approved === true);
+      }
+      continue;
+    }
+    if (row.type === 'user') return null;
+    if (row.type !== 'assistant') continue;
+    const requests = list(row.tool_approval_requests);
+    if (requests.length === 0) return null;
+    const ids = new Set(requests.map(request => request.approval_id));
+    const stored = [...rows].reverse().find(candidate => candidate.type === 'assistant'
+      && list(candidate.tool_approval_requests).length === requests.length
+      && list(candidate.tool_approval_requests).every(request => ids.has(request.approval_id)));
+    const scope = stored?.harness_tool_names;
+    if (Array.isArray(scope) && scope.every((name): name is string => typeof name === 'string' && name !== '' && name !== '*')) {
+      return {names: [...new Set(scope)], legacy: false};
+    }
+    const approvedCalls = new Set(requests.filter(request => typeof request.approval_id === 'string' && decisions.get(request.approval_id) === true)
+      .map(request => request.tool_call_id));
+    const names = list(row.tool_calls).filter(call => approvedCalls.has(call.id) && typeof call.name === 'string' && call.name !== '' && call.name !== '*')
+      .map(call => call.name as string);
+    return {names: [...new Set(names)], legacy: true};
+  }
+  return null;
+}
+
 function normalise(row: JsonObject, view: JsonObject[]): JsonObject | null {
   switch (row.type) {
     case 'assistant':
