@@ -419,6 +419,14 @@ badly.
   an in-memory snapshot and performs no query or filesystem work. No runtime
   compilation or extra dependency is used.
 
+  Windows CIM and macOS boot-identity queries run asynchronously. Locks await a
+  shared pending sample; successful identity stays cached, and a transient
+  failure waits sixty seconds before another async sample. Hosts can optionally
+  call `await warmLockIdentity()` at startup. The exported
+  `fileLockIdentityStatus()` and the store's `identityStatus()` only observe the
+  current cache and never start a query. Unknown identity still cannot authorize
+  recovery, and the ownership/nonce/death checks are unchanged.
+
   **BREAKING CHANGE: Stop all old workers before upgrading the file-lock
   protocol.** Inspect and archive stale legacy timestamp lockfiles explicitly.
   The library refuses them with `session_locked` and

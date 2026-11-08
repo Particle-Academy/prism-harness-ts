@@ -1,4 +1,4 @@
-import { spawnSync } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import { win32 } from 'node:path';
 import type { LockIdentity } from './file-lock-identity.js';
 
@@ -26,16 +26,19 @@ try {
 } catch { exit 1 }
 `;
 
-export function windowsLockIdentity(): LockIdentity | null {
+export async function windowsLockIdentity(): Promise<LockIdentity | null> {
   const root = process.env.SystemRoot;
   if (!root || !/^[a-z]:[\\/]/i.test(root) || !win32.isAbsolute(root)) return null;
   const env: NodeJS.ProcessEnv = { SystemRoot: root, windir: root };
   for (const key of ['TEMP', 'TMP'] as const) if (process.env[key]) env[key] = process.env[key];
   const binary = win32.join(env.SystemRoot!, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
   try {
-    const result = spawnSync(binary, ['-NoProfile', '-NonInteractive', '-NoLogo', '-Command', COMMAND],
-      { env, encoding: 'utf8', timeout: 15000, maxBuffer: 16384, windowsHide: true, shell: false });
-    if (result.error || result.status !== 0 || result.stderr !== '') return null;
+    const result = await new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+      execFile(binary, ['-NoProfile', '-NonInteractive', '-NoLogo', '-Command', COMMAND],
+        { env, encoding: 'utf8', timeout: 15000, maxBuffer: 16384, windowsHide: true, shell: false },
+        (error, stdout, stderr) => { if (error !== null) reject(error); else resolve({ stdout, stderr }); });
+    });
+    if (result.stderr !== '') return null;
     const match = /^boot=([1-9][0-9]{0,18})\r?\ncontainer=(present|absent)\r?\n$/.exec(result.stdout);
     if (!match || match[0] !== result.stdout || BigInt(match[1]!) > 3155378975999999999n) return null;
     return { platform: 'win32', boot_id: 'cim-utc-ticks:' + match[1],

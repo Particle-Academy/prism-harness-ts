@@ -1,5 +1,9 @@
 import { pathToFileURL } from 'node:url';
-const { FileSessionStore, Session } = await import(pathToFileURL(process.argv[2]).href);
+const { FileSessionStore, Session, warmLockIdentity } = await import(pathToFileURL(process.argv[2]).href);
+// Cold native metadata has its existing 15s bound. Publish completion before
+// measuring lock refusal, without adding a timer or IPC keepalive to this child.
+await warmLockIdentity();
+console.log(JSON.stringify({ phase: 'identity_sampled' }));
 const store = new FileSessionStore(process.argv[3]);
 const session = new Session({ participant: { type: 'test', id: 'lock-regression' },
   scope: 'lock-regression', ephemeral: store, durable: store });

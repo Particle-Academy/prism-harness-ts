@@ -1,5 +1,5 @@
 import { readFileSync, readlinkSync } from 'node:fs';
-import { spawnSync } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import { windowsLockIdentity } from './file-lock-windows-identity.js';
 
 export interface LockIdentity {
@@ -12,6 +12,7 @@ let established: LockIdentity | null = null;
 let retryAt = 0;
 let definitive = false;
 let durationMs = 0;
+let inFlight: Promise<LockIdentity | null> | null = null;
 export interface FileLockIdentityStatus {
   readonly sampled: boolean;
   readonly recovery_available: boolean;
@@ -29,23 +30,35 @@ export function fileLockIdentityStatus(): FileLockIdentityStatus {
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /** Definitive metadata is permanent; transient failure is sampled at most once per minute. */
-export function nativeLockIdentity(): LockIdentity | null {
+export function nativeLockIdentity(): Promise<LockIdentity | null> {
+  if (inFlight !== null) return inFlight;
   if (!sampled || (!definitive && performance.now() >= retryAt)) {
-    const start = performance.now();
-    const identity = readNativeLockIdentity();
-    durationMs = performance.now()-start;
-    established = identity === null ? null : Object.freeze(identity);
-    definitive = identity !== null && (identity.pid_namespace !== null || identity.platform === 'win32');
-    retryAt = performance.now()+60000;
-    sampled = true;
+    inFlight = sampleIdentity().finally(() => { inFlight = null; });
+    return inFlight;
   }
+  return Promise.resolve(established);
+}
+
+/** Optional host startup warmup. A failed read stays unknown and follows the normal retry policy. */
+export async function warmLockIdentity(): Promise<void> {
+  await nativeLockIdentity();
+}
+
+async function sampleIdentity(): Promise<LockIdentity | null> {
+  const start = performance.now();
+  const identity = await readNativeLockIdentity();
+  durationMs = performance.now()-start;
+  established = identity === null ? null : Object.freeze(identity);
+  definitive = identity !== null && (identity.pid_namespace !== null || identity.platform === 'win32');
+  retryAt = performance.now()+60000;
+  sampled = true;
   return established;
 }
 
-function readNativeLockIdentity(): LockIdentity | null {
+async function readNativeLockIdentity(): Promise<LockIdentity | null> {
   let identity: LockIdentity | null = null;
   try {
-    if (process.platform === 'win32') identity = windowsLockIdentity();
+    if (process.platform === 'win32') identity = await windowsLockIdentity();
     else if (process.platform === 'linux') {
       const boot = readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
       if (!UUID.test(boot)) return null;
@@ -53,10 +66,13 @@ function readNativeLockIdentity(): LockIdentity | null {
       try { const value = readlinkSync('/proc/self/ns/pid'); if (/^pid:\[[0-9]+\]$/.test(value)) realm = value; } catch { /* unknown */ }
       identity = { platform: 'linux', boot_id: boot.toLowerCase(), pid_namespace: realm };
     } else if (process.platform === 'darwin') {
-      const result = spawnSync('/usr/sbin/sysctl', ['-n', 'kern.bootsessionuuid'],
-        { encoding: 'utf8', timeout: 15000, maxBuffer: 65536 });
+      const result = await new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+        execFile('/usr/sbin/sysctl', ['-n', 'kern.bootsessionuuid'],
+          { encoding: 'utf8', timeout: 15000, maxBuffer: 65536 },
+          (error, stdout, stderr) => { if (error !== null) reject(error); else resolve({ stdout, stderr }); });
+      });
       const boot = result.stdout?.trim();
-      if (result.error || result.status !== 0 || !boot || !UUID.test(boot)) return null;
+      if (!boot || !UUID.test(boot)) return null;
       identity = { platform: 'darwin', boot_id: boot.toLowerCase(), pid_namespace: 'darwin:kernel' };
     }
   } catch { return null; }

@@ -51,20 +51,33 @@ it('a separate waiter completes its bounded refusal without a host keepalive', a
     const child = spawn(process.execPath, [
       resolve('test/fixtures/file-lock-waiter.mjs'),
       join(packageRoot ?? resolve('.'), 'dist/index.js'), directory,
-    ], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, timeout: 5000 });
+    ], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, timeout: 20000 });
     let stdout = '', stderr = '';
+    let sampled = false;
+    let refusalDeadline: ReturnType<typeof setTimeout> | undefined;
     child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
-    child.stdout.on('data', (data: string) => { stdout += data; });
+    child.stdout.on('data', (data: string) => {
+      stdout += data;
+      const newline = stdout.indexOf('\n');
+      if (!sampled && newline !== -1) {
+        const first = stdout.slice(0, newline).trim();
+        if (first === '{"phase":"identity_sampled"}') {
+          sampled = true; stdout = stdout.slice(newline + 1);
+          refusalDeadline = setTimeout(() => child.kill(), 5000);
+        }
+      }
+    });
     child.stderr.on('data', (data: string) => { stderr += data; });
     outcome = await new Promise((done, reject) => {
       child.on('error', reject);
-      child.on('close', (code, signal) => { done({ code, signal, stdout, stderr }); });
+      child.on('close', (code, signal) => { clearTimeout(refusalDeadline); done({ code, signal, stdout, stderr }); });
     });
     // The holder is still inside its callback throughout the child's entire wait.
     expect((await lstat(lock)).isDirectory()).toBe(true);
+    expect(sampled).toBe(true);
   });
   expect(outcome).toBeDefined();
   expect(outcome!.code, outcome!.stderr).toBe(0);
   expect(outcome!.signal).toBeNull();
   expect(JSON.parse(outcome!.stdout)).toMatchObject({ callbacks: 0, code: 'session_locked' });
-}, 10_000);
+}, 30_000);

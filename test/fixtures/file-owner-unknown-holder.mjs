@@ -14,6 +14,7 @@ registerHooks({load(url,context,nextLoad){
  injected++;
  return {format:'module',shortCircuit:true,source:`
  export function nativeLockIdentity(){return null;}
+ export async function warmLockIdentity(){await nativeLockIdentity();}
  export function sameLockIdentity(){return false;}
  export function lockPidIsDead(){throw Error('Unknown identity must not probe a PID');}
  export function fileLockIdentityStatus(){return {sampled:true,recovery_available:false,definitive:false,retry_after_ms:60000,sample_duration_ms:0,code:'file_lock_identity_unavailable'};}

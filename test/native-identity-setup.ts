@@ -5,9 +5,9 @@ import {beforeAll,expect} from 'vitest';
 beforeAll(async()=>{
  if(process.platform!=='win32')return;
  const path=expect.getState().testPath??'';
- if(/file-owner-identity-(cache|boundary)\.test\.ts$/.test(path))return;
+ if(/file-owner-identity-(cache|boundary|async)\.test\.ts$/.test(path))return;
  const {fileLockIdentityStatus,nativeLockIdentity}=await import('../src/stores/file-lock-identity.js');
- const start=performance.now();nativeLockIdentity();
+ const start=performance.now();await nativeLockIdentity();
  console.info(JSON.stringify({native_identity_setup:true,platform:process.platform,
    elapsed_ms:performance.now()-start,status:fileLockIdentityStatus()}));
 },20000);

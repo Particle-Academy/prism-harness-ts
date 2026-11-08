@@ -47,7 +47,7 @@ it('refuses an expired legacy lock with the stable maintenance diagnostic', asyn
 
 it('retains the legacy diagnostic when native identity is unavailable',async()=>{
  const{store,lock}=await fixture();await writeFile(lock,'1\n');
- const identity=vi.spyOn(identities,'nativeLockIdentity').mockReturnValue(null);
+ const identity=vi.spyOn(identities,'nativeLockIdentity').mockResolvedValue(null);
  try{
   await expect(store.withLock('k',()=>{throw Error('legacy callback');},10,0)).rejects.toMatchObject({code:'session_locked',message:expect.stringContaining('legacy_lock_requires_maintenance')});
   expect(identity).not.toHaveBeenCalled();

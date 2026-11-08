@@ -10,6 +10,7 @@ export { MemorySessionStore } from './stores/memory-session-store.js';
 export { FileSessionStore } from './stores/file-session-store.js';
 export type { PendingFileLockRelease } from './stores/file-owner-lock.js';
 export type { FileLockIdentityStatus } from './stores/file-lock-identity.js';
+export { warmLockIdentity, fileLockIdentityStatus } from './stores/file-lock-identity.js';
 export { SessionStoreManager, SLOT_DURABLE, SLOT_EPHEMERAL } from './stores/store-manager.js';
 export type { StoreFactory, StoreManagerOptions } from './stores/store-manager.js';
 

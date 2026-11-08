@@ -9,7 +9,7 @@ import * as identity from '../src/stores/file-lock-identity.js';
 
 afterEach(()=>vi.restoreAllMocks());
 it.each(['release','crash'] as const)('a real unknown worker excludes contenders and preserves %s behavior',async action=>{
- const known=identity.nativeLockIdentity();expect(known?.pid_namespace).toBeTypeOf('string');
+ const known=await identity.nativeLockIdentity();expect(known?.pid_namespace).toBeTypeOf('string');
  const root=await mkdtemp(join(tmpdir(),'prism-unknown-worker-')),nonce=randomBytes(16).toString('hex');
  const spec=join(root,'spec.json');await writeFile(spec,JSON.stringify({root,nonce,action,package:resolve('.')}));
  const child=spawn(process.execPath,[resolve('test/fixtures/file-owner-unknown-holder.mjs'),spec],{windowsHide:true,stdio:['ignore','pipe','pipe']});
@@ -52,7 +52,7 @@ async function fixture(){
 }
 it('acquires and releases a free lock with unknown identity while excluding another store',async()=>{
  const{root,store,lock}=await fixture();
- vi.spyOn(identity,'nativeLockIdentity').mockReturnValue(null);
+ vi.spyOn(identity,'nativeLockIdentity').mockResolvedValue(null);
  const probe=vi.spyOn(identity,'lockPidIsDead').mockImplementation(()=>{throw Error('Unknown identity cannot probe a PID');});
  const warning=vi.spyOn(process,'emitWarning').mockImplementation(()=>{});
  let calls=0;
@@ -79,12 +79,12 @@ it.each([false,true])('unknown owner stays held even with a released marker=%j',
 });
 
 it('an unknown prober never reclaims a known released owner',async()=>{
- const{store,lock}=await fixture(),known=identity.nativeLockIdentity();expect(known?.pid_namespace).toBeTypeOf('string');
+ const{store,lock}=await fixture(),known=await identity.nativeLockIdentity();expect(known?.pid_namespace).toBeTypeOf('string');
  const nonce=randomBytes(16).toString('hex'),name='owner-'+nonce+'.json';
  const owner={version:2,pid:process.pid,identity:known,nonce,released:true,expires_at:0};
  await mkdir(lock);await writeFile(join(lock,name),JSON.stringify(owner)+'\n');
  const before=await readFile(join(lock,name));
- vi.spyOn(identity,'nativeLockIdentity').mockReturnValue(null);
+ vi.spyOn(identity,'nativeLockIdentity').mockResolvedValue(null);
  const probe=vi.spyOn(identity,'lockPidIsDead').mockImplementation(()=>{throw Error('Unknown prober cannot consult a PID');});
  vi.spyOn(process,'emitWarning').mockImplementation(()=>{});
  await expect(store.withLock('k',()=>{throw Error('Unknown prober reclaimed');},10,0)).rejects.toMatchObject({code:'session_locked'});

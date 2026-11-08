@@ -4,7 +4,14 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { windowsLockIdentity } from '../src/stores/file-lock-windows-identity.js';
 
 const invoke = vi.hoisted(() => vi.fn());
-vi.mock('node:child_process', () => ({ spawnSync: invoke }));
+vi.mock('node:child_process', () => ({
+  spawnSync: invoke,
+  execFile: (binary: string, args: string[], options: unknown, done: (error: Error | null, stdout: string, stderr: string) => void) => {
+    const result = invoke(binary, args, options);
+    queueMicrotask(() => done(result.error ?? (result.status === 0 ? null : new Error('owned query failure')), result.stdout, result.stderr));
+    return {};
+  },
+}));
 
 function guard(source: string): void {
   source = source.replace(/^\s*\/\/.*$/gm, '');
@@ -50,9 +57,9 @@ beforeEach(() => {
 });
 afterEach(() => vi.unstubAllEnvs());
 
-it('runs only the absolute first-party binary with a fixed script and constructed environment', () => {
+it('runs only the absolute first-party binary with a fixed script and constructed environment', async () => {
   invoke.mockReturnValue({ status: 0, stderr: '', stdout: 'boot=638000000000000000\r\ncontainer=absent\r\n' });
-  expect(windowsLockIdentity()).toEqual({
+  expect(await windowsLockIdentity()).toEqual({
     platform: 'win32', boot_id: 'cim-utc-ticks:638000000000000000', pid_namespace: 'win32:kernel',
   });
   expect(invoke).toHaveBeenCalledTimes(1);
@@ -66,9 +73,9 @@ it('runs only the absolute first-party binary with a fixed script and constructe
   });
   expect(options).toMatchObject({ timeout: 15000, windowsHide: true, shell: false, maxBuffer: 16384 });
 });
-it('keeps a positively detected container realm unknown', () => {
+it('keeps a positively detected container realm unknown', async () => {
   invoke.mockReturnValue({ status: 0, stderr: '', stdout: 'boot=638000000000000000\ncontainer=present\n' });
-  expect(windowsLockIdentity()?.pid_namespace).toBeNull();
+  expect((await windowsLockIdentity())?.pid_namespace).toBeNull();
 });
 it.each([
   'boot=0\ncontainer=absent\n',
@@ -78,22 +85,22 @@ it.each([
   'boot=638000000000000000\ncontainer=absent\nextra\n',
   'boot=638000000000000000\ncontainer=absent\n\n',
   '\nboot=638000000000000000\ncontainer=absent\n',
-])('refuses anything outside the strict two-line metadata format: %j', stdout => {
+])('refuses anything outside the strict two-line metadata format: %j', async stdout => {
   invoke.mockReturnValue({ status: 0, stderr: '', stdout });
-  expect(windowsLockIdentity()).toBeNull();
+  expect(await windowsLockIdentity()).toBeNull();
 });
 it.each([
   { status: 1, stderr: '', stdout: 'boot=638000000000000000\ncontainer=absent\n' },
   { status: 0, stderr: 'owned warning', stdout: 'boot=638000000000000000\ncontainer=absent\n' },
   { status: null, error: { code: 'ETIMEDOUT' }, stderr: '', stdout: '' },
-])('refuses errors, timeout and stderr', result => {
+])('refuses errors, timeout and stderr', async result => {
   invoke.mockReturnValue(result);
-  expect(windowsLockIdentity()).toBeNull();
+  expect(await windowsLockIdentity()).toBeNull();
 });
-it('never searches PATH when SystemRoot is unavailable or relative', () => {
+it('never searches PATH when SystemRoot is unavailable or relative', async () => {
   for (const root of ['', 'Windows', '\\Windows', 'C:Windows', '\\\\host\\Windows']) {
     vi.stubEnv('SystemRoot', root);
-    expect(windowsLockIdentity()).toBeNull();
+    expect(await windowsLockIdentity()).toBeNull();
   }
   expect(invoke).not.toHaveBeenCalled();
 });

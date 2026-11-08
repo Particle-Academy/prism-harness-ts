@@ -171,7 +171,7 @@ export async function withFileOwnerLock<T>(path: string, key: string, callback: 
   try {
     if ((await lstat(lockPath)).isFile()) throw new HarnessError('session_locked', 'legacy_lock_requires_maintenance: ' + lockPath + '; stop_old_workers_then_inspect_and_archive');
   } catch (error) { if (code(error) !== 'ENOENT') throw error; }
-  const identity = nativeLockIdentity();
+  const identity = await nativeLockIdentity();
   const platform = process.platform;
   if (!identity && platform !== 'win32' && platform !== 'linux' && platform !== 'darwin') throw new HarnessError('session_locked','Unsupported file-lock platform');
   const owner: FileLockOwner = { version: 2, pid: process.pid, identity: identity ?? {platform:platform as LockIdentity['platform'],boot_id:'unknown',pid_namespace:null}, nonce: randomBytes(16).toString('hex'), released: false, expires_at: Math.floor(Date.now()/1000 + ttl) };
