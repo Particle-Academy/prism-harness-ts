@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.10.2
+
+### Fixed
+
+- Stream file-session log records instead of decoding the entire file as one
+  string, so logs larger than the JavaScript string limit can reopen.
+- Count completed log lines without loading message history. A disposable small
+  sidecar avoids repeated scans after a new store instance; changed file metadata
+  or an invalid index causes a streaming rebuild.
+- Preserve incomplete-tail recovery, corrupt-record errors, cross-process locks
+  and the existing sync on each durable append.
+
+No breaking changes.
+
 ## 0.10.0
 
 ### Fixed

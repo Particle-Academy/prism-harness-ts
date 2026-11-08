@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
-import { mkdir, open, readFile, rename, rm, stat, truncate, unlink, writeFile } from 'node:fs/promises';
+import { mkdir, open, readFile, rename, rm, stat, truncate, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import type { JsonObject } from '../json.js';
@@ -11,6 +11,8 @@ import { fileLockIdentityStatus } from './file-lock-identity.js';
 import type { FileLockIdentityStatus } from './file-lock-identity.js';
 import type { PendingFileLockRelease } from './file-owner-lock.js';
 import type { AppendLogStore, Durability, SessionStore } from './session-store.js';
+import { matchesLog, readLogIndex, saveLogIndex, scanLog } from './file-session-log.js';
+import type { LogIndex } from './file-session-log.js';
 
 /**
  * State on disk, as one JSON file per key. DURABLE, and it says so.
@@ -37,13 +39,10 @@ export class FileSessionStore implements SessionStore, AppendLogStore {
   readonly #directory: string;
 
   /**
-   * What this instance last saw of each log: its size on disk and how many
-   * complete entries that size holds. Lets `logLength()` answer without reading
-   * the log, and stays honest across processes because it is only trusted while
-   * the file is still exactly that size. Another writer changes the size, and
-   * the next call recounts.
+   * Disposable counts bound to the actual file's size, times and identity.
+   * A new instance can reuse the small sidecar; a mismatch streams a recount.
    */
-  readonly #logs = new Map<string, { size: number; count: number }>();
+  readonly #logs = new Map<string, LogIndex>();
 
   constructor(directory: string) {
     this.#directory = directory;
@@ -123,6 +122,7 @@ export class FileSessionStore implements SessionStore, AppendLogStore {
   async forget(key: string): Promise<void> {
     await rm(this.#pathFor(key), { force: true });
     await rm(this.#logPathFor(key), { force: true });
+    await rm(this.#logPathFor(key) + '.index.json', { force: true }).catch(() => undefined);
     this.#logs.delete(key);
   }
 
@@ -137,6 +137,10 @@ export class FileSessionStore implements SessionStore, AppendLogStore {
     const path = this.#logPathFor(key);
     await mkdir(this.#directory, { recursive: true });
     const before = await this.#repairTail(path);
+    const beforeStat = await stat(path).catch((error: unknown) => {
+      if (isMissing(error)) return null;
+      throw error;
+    });
     const data = entries.map((entry) => `${JSON.stringify(entry)}\n`).join('');
     const handle = await open(path, 'a');
 
@@ -148,70 +152,83 @@ export class FileSessionStore implements SessionStore, AppendLogStore {
     }
 
     const known = this.#logs.get(key);
-    if (known !== undefined && known.size === before) {
-      this.#logs.set(key, { size: before + Buffer.byteLength(data), count: known.count + entries.length });
+    const previousCount = before === 0 ? 0
+      : known !== undefined && beforeStat !== null && matchesLog(known, beforeStat) ? known.count : null;
+    if (previousCount !== null) {
+      const after = await stat(path);
+      if (after.size === before + Buffer.byteLength(data)) {
+        await this.#rememberLog(key, { size: after.size, mtimeMs: after.mtimeMs, ctimeMs: after.ctimeMs,
+          ino: after.ino, dev: after.dev, count: previousCount + entries.length });
+      } else this.#logs.delete(key);
     } else {
       this.#logs.delete(key);
     }
   }
 
   async readLog(key: string): Promise<JsonObject[] | null> {
-    let raw: string;
-
+    const entries: JsonObject[] = [];
+    let index: LogIndex;
     try {
-      raw = await readFile(this.#logPathFor(key), 'utf8');
+      index = await scanLog(this.#logPathFor(key), (line, number) => {
+        let entry: unknown;
+        try {
+          entry = JSON.parse(line);
+        } catch (error) {
+          throw HarnessError.unmappableContent(`line ${number} of the thread log for [${key}] is not valid JSON`, { cause: error });
+        }
+        if (!isJsonObject(entry)) {
+          throw HarnessError.unmappableContent(`line ${number} of the thread log for [${key}] is not an object`);
+        }
+        entries.push(entry);
+      });
     } catch (error) {
       if (isMissing(error)) return null;
       throw error;
     }
 
-    const lines = raw.split('\n');
-    // Everything after the last newline is a line that never finished. Empty
-    // when the file ends cleanly, a fragment when a crash cut a write short.
-    lines.pop();
-    const entries = lines.map((line, index) => {
-      let entry: unknown;
-
-      try {
-        entry = JSON.parse(line);
-      } catch (error) {
-        throw HarnessError.unmappableContent(`line ${index + 1} of the thread log for [${key}] is not valid JSON`, {
-          cause: error,
-        });
-      }
-
-      if (!isJsonObject(entry)) {
-        throw HarnessError.unmappableContent(`line ${index + 1} of the thread log for [${key}] is not an object`);
-      }
-
-      return entry;
-    });
-
-    this.#logs.set(key, { size: Buffer.byteLength(raw), count: entries.length });
-
+    await this.#rememberLog(key, index);
     return entries;
   }
 
   async logLength(key: string): Promise<number | null> {
-    let size: number;
+    let current;
 
     try {
-      size = (await stat(this.#logPathFor(key))).size;
+      current = await stat(this.#logPathFor(key));
     } catch (error) {
       if (isMissing(error)) return null;
       throw error;
     }
 
     const known = this.#logs.get(key);
-    if (known !== undefined && known.size === size) return known.count;
-
-    return (await this.readLog(key))?.length ?? null;
+    if (known !== undefined && matchesLog(known, current)) return known.count;
+    const disk = await readLogIndex(this.#logPathFor(key), current);
+    if (disk !== null) {
+      this.#logs.set(key, disk);
+      return disk.count;
+    }
+    try {
+      const index = await scanLog(this.#logPathFor(key));
+      await this.#rememberLog(key, index);
+      return index.count;
+    } catch (error) {
+      if (isMissing(error)) return null;
+      throw error;
+    }
   }
 
   async clearLog(key: string): Promise<void> {
     await mkdir(this.#directory, { recursive: true });
     await writeFile(this.#logPathFor(key), '', 'utf8');
-    this.#logs.set(key, { size: 0, count: 0 });
+    const current = await stat(this.#logPathFor(key));
+    await this.#rememberLog(key, { size: current.size, mtimeMs: current.mtimeMs,
+      ctimeMs: current.ctimeMs, ino: current.ino, dev: current.dev, count: 0 });
+  }
+
+  async #rememberLog(key: string, index: LogIndex): Promise<void> {
+    if (index.size < 0) { this.#logs.delete(key); return; }
+    this.#logs.set(key, index);
+    await saveLogIndex(this.#logPathFor(key), index);
   }
 
   /** Cut a torn tail back to the last newline. Returns the file's size afterwards. */

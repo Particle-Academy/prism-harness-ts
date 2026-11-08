@@ -444,6 +444,18 @@ badly.
   starts after the last complete line. A damaged line anywhere else is refused
   with `unmappable_content` rather than silently skipped.
 
+  Reading decodes one completed line at a time, avoiding the whole-file
+  JavaScript string limit. `readLog()` still returns the complete array, so
+  memory for the decoded messages and the largest single record is required.
+  `logLength()` counts newline boundaries without parsing message JSON; record
+  validation happens when history is read. Its disposable `<digest>.jsonl.index.json`
+  sidecar contains only a count and file metadata, never message content. The
+  count is reused only while size, modification/change times and file identity
+  match; invalid or missing indexes are rebuilt by streaming the log. The
+  checksum detects damaged cache metadata; it is not an authentication boundary.
+  Removing a sidecar is safe and does not remove history. Log writes retain
+  their existing per-append `fsync`; the advisory sidecar adds no durability claim.
+
   The thread log is **not yet shared with the PHP and Python ports**: a Python
   worker pointed at the same directory does not read it.
 
