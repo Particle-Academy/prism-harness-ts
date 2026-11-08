@@ -5,7 +5,7 @@ import {createInterface} from 'node:readline';
 const spec=JSON.parse(fs.readFileSync(process.argv[2],'utf8'));
 const {FileSessionStore}=await import(pathToFileURL(spec.package+'/dist/index.js'));
 const {nativeLockIdentity}=await import(pathToFileURL(spec.package+'/dist/stores/file-lock-identity.js'));
-const identity=nativeLockIdentity();
+const identity=await nativeLockIdentity();
 if(!identity?.pid_namespace)throw Error('Native holder identity unavailable');
 const store=new FileSessionStore(join(spec.root,'store'));
 await store.withLock('native-key',async()=>{

@@ -10,7 +10,7 @@ import * as identities from '../src/stores/file-lock-identity.js';
 
 it.each([false,true])('executes native independent live/dead and three foreign/unknown production rows (blocked controls: %s)',async(blockedControls)=>{
  const before=identities.fileLockIdentityStatus(),started=performance.now();
- const local=identities.nativeLockIdentity();expect(local?.pid_namespace).toBeTypeOf('string');
+ const local=await identities.nativeLockIdentity();expect(local?.pid_namespace).toBeTypeOf('string');
  console.info(JSON.stringify({native_identity_setup:true,platform:process.platform,elapsed_ms:performance.now()-started,before,status:identities.fileLockIdentityStatus()}));
  const root=await mkdtemp(join(tmpdir(),'prism-production-native-')),nonce=randomBytes(16).toString('hex');
  const spec=join(root,'spec.json');await writeFile(spec,JSON.stringify({root,nonce,package:resolve('.')}));
@@ -60,7 +60,7 @@ it.each([false,true])('executes native independent live/dead and three foreign/u
    const fixtureNonce=randomBytes(16).toString('hex'),name='owner-'+fixtureNonce+'.json';
    await mkdir(canonical);const bytes=Buffer.from(JSON.stringify({version:2,pid:process.pid,identity:ownerIdentity,nonce:fixtureNonce,released:id!=='foreign-realm',expires_at:0})+'\n');
    await writeFile(join(canonical,name),bytes);probes=0;
-   const identityFixture=id==='both-unknown'?vi.spyOn(identities,'nativeLockIdentity').mockReturnValue({...local!,pid_namespace:null}):undefined;
+   const identityFixture=id==='both-unknown'?vi.spyOn(identities,'nativeLockIdentity').mockResolvedValue({...local!,pid_namespace:null}):undefined;
    try{await expect(store.withLock('native-key',()=>{throw Error('foreign callback');},10,0)).rejects.toMatchObject({code:'session_locked'});}
    finally{identityFixture?.mockRestore();}
    expect(probes).toBe(0);expect(await readFile(join(canonical,name))).toEqual(bytes);
@@ -91,7 +91,7 @@ it.each(['valid','eof','malformed','foreign','wrong-action'])('refuses invalid n
  const wires:Record<string,string>={valid:JSON.stringify({nonce,action:'crash'})+'\n',eof:'',malformed:'{}\n',foreign:JSON.stringify({nonce:'wrong',action:'crash'})+'\n','wrong-action':JSON.stringify({nonce,action:'release'})+'\n'};
  child.stdin.end(wires[command]);const code=await exited;
  if(command==='valid')expect(code,stderr).toBe(0);else expect(code,'Invalid input must not execute the requested crash').not.toBe(0);
- const ready=JSON.parse(stdout);expect(ready.nonce).toBe(nonce);expect(ready.pid).toBe(child.pid);expect(ready.identity).toEqual(identities.nativeLockIdentity());
+ const ready=JSON.parse(stdout);expect(ready.nonce).toBe(nonce);expect(ready.pid).toBe(child.pid);expect(ready.identity).toEqual(await identities.nativeLockIdentity());
  const canonical=join(root,'store',createHash('sha256').update('native-key').digest('hex').slice(0,32)+'.json.lock');
  if(command==='valid'){const[name]=await readdir(canonical),owner=JSON.parse(await readFile(join(canonical,name!),'utf8'));expect(owner.pid).toBe(ready.pid);expect(owner.released).toBe(false);}
  else{expect(stderr).toMatch(/Wrong crash barrier|SyntaxError|command ended/);await expect(lstat(canonical)).rejects.toMatchObject({code:'ENOENT'});}

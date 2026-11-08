@@ -10,8 +10,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 
+const localIdentity = await nativeLockIdentity();
 function owner(): FileLockOwner {
-  const identity = nativeLockIdentity();
+  const identity = localIdentity;
   expect(identity?.pid_namespace).toBeTypeOf('string');
   return { version: 2, pid: process.pid, identity: identity!, nonce: randomBytes(16).toString('hex'), released: false, expires_at: 0 };
 }

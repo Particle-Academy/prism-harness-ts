@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.10.3
+
+### Fixed
+
+- Read Windows and macOS lock identity with asynchronous native queries, so a
+  first lock or retry keeps the host event loop responsive.
+- Share one pending sample across concurrent locks while preserving successful
+  identity caching, the sixty-second retry and all metadata validation.
+- Export optional `warmLockIdentity()` and the read-only
+  `fileLockIdentityStatus()` helper for host startup and diagnostics.
+
+No breaking changes.
+
 ## 0.10.2
 
 ### Fixed

@@ -30,7 +30,7 @@ async function fixture() {
   const directory = await mkdtemp(join(tmpdir(), 'prism-cleanup-held-g242-'));
   const store = new FileSessionStore(directory);
   const lock = join(directory, createHash('sha256').update('k').digest('hex').slice(0, 32) + '.json.lock');
-  const identity = nativeLockIdentity();
+  const identity = await nativeLockIdentity();
   expect(identity?.pid_namespace).toBeTypeOf('string');
   const owner: FileLockOwner = {
     version: 2, pid: process.pid, identity: identity!, nonce: randomBytes(16).toString('hex'),

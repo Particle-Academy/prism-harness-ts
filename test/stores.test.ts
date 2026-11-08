@@ -2,6 +2,7 @@ import { mkdir, mkdtemp, readdir, readFile, utimes, writeFile } from 'node:fs/pr
 import { spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { nativeLockIdentity } from '../src/stores/file-lock-identity.js';
+const localIdentity = await nativeLockIdentity();
 import { parseFileLockOwner } from '../src/stores/file-owner-lock.js';
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
@@ -20,7 +21,7 @@ async function fileStore(): Promise<FileSessionStore> {
 }
 
 async function plantOwner(path:string,pid:number,released:boolean):Promise<void> {
-  const identity=nativeLockIdentity(); expect(identity?.pid_namespace).toBeTypeOf('string');
+  const identity=localIdentity; expect(identity?.pid_namespace).toBeTypeOf('string');
   const nonce=randomBytes(16).toString('hex');
   await mkdir(path);
   await writeFile(join(path,'owner-'+nonce+'.json'),JSON.stringify({
