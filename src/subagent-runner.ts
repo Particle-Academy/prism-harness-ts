@@ -5,6 +5,7 @@ import type { Session } from './session.js';
 import { MAX_DEPTH, RunContext, type Subagent } from './subagents.js';
 import type { HarnessTool } from './tools.js';
 import { HarnessError } from './errors.js';
+import { markRefused } from './refusals.js';
 
 export type SubagentOutcome =
   /** It ran and returned. */
@@ -57,7 +58,13 @@ export class SubagentRunner {
         }
         const task = typeof args.task === 'string' ? args.task : '';
 
-        return (await this.run(subagent, parent, context, parentRunId, task)).toToolResult();
+        const result = await this.run(subagent, parent, context, parentRunId, task);
+
+        // The tree refusing to let a child run is a gate, not the child's
+        // failure: said here, so a run step reports it as one.
+        if (result.outcome === 'exhausted' || result.outcome === 'cancelled' || result.outcome === 'denied') markRefused();
+
+        return result.toToolResult();
       },
     };
   }

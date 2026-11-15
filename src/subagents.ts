@@ -286,16 +286,81 @@ export function subagentFromConfig(name: string, config: Record<string, unknown>
  * A run with NO context is a root: that is the ordinary case and stays free of
  * all of this.
  */
+export interface RunMetadata {
+  /**
+   * The ACP turn this run serves, when it serves one. Carried onto every run
+   * step as `turnId`; Harness never invents one.
+   */
+  turnId?: string | null;
+  /**
+   * Who is acting, as the APPLICATION identifies them. Carried onto a
+   * `decision_recorded` step as `actor`. Set by the app that authorized the
+   * decision, never read from the model or the request body, which is the
+   * whole reason it lives here.
+   */
+  actor?: string | null;
+  /**
+   * True for a context built by `RunContext.metadata()`: it carries a turnId
+   * and/or actor and states NO run tree, so the runtime executes the run
+   * exactly as it would with no context at all.
+   */
+  metadataOnly?: boolean;
+}
+
 export class RunContext {
+  readonly turnId: string | null;
+  readonly actor: string | null;
+  readonly metadataOnly: boolean;
+
   constructor(
     readonly ledger: RunLedger,
     readonly budget: RunBudget,
     readonly parentRunId: string | null = null,
     readonly depth: number = 0,
-  ) {}
+    metadata: RunMetadata = {},
+  ) {
+    // Runtime guards: these arrive from an app's request handling, and an
+    // annotation stops nothing that came out of a JSON body.
+    for (const key of ['turnId', 'actor'] as const) {
+      const value = metadata[key];
+      if (value !== undefined && value !== null && (typeof value !== 'string' || value === '')) {
+        throw new TypeError(`RunContext ${key} must be a nonempty string or null.`);
+      }
+    }
+    if (metadata.metadataOnly !== undefined && typeof metadata.metadataOnly !== 'boolean') {
+      throw new TypeError('RunContext metadataOnly must be a boolean.');
+    }
+    this.turnId = metadata.turnId ?? null;
+    this.actor = metadata.actor ?? null;
+    this.metadataOnly = metadata.metadataOnly ?? false;
+  }
 
   static root(runId: string, budget: RunBudget): RunContext {
     return new RunContext(RunLedger.start(runId), budget);
+  }
+
+  /**
+   * Only metadata — a turn and/or an actor — with no say in how the run
+   * executes. The run takes the path and budget it would take with no
+   * context; use `root()` to state a run tree.
+   */
+  static metadata(turnId: string | null = null, actor: string | null = null): RunContext {
+    return new RunContext(RunLedger.start('metadata'), new RunBudget(0), null, 0, { turnId, actor, metadataOnly: true });
+  }
+
+  /** The same run, serving an ACP turn. */
+  withTurn(turnId: string | null): RunContext {
+    return new RunContext(this.ledger, this.budget, this.parentRunId, this.depth, { turnId, actor: this.actor, metadataOnly: this.metadataOnly });
+  }
+
+  /** The same run, acting for an actor the application has authorized. */
+  withActor(actor: string | null): RunContext {
+    return new RunContext(this.ledger, this.budget, this.parentRunId, this.depth, { turnId: this.turnId, actor, metadataOnly: this.metadataOnly });
+  }
+
+  /** The same run tree under a different budget, keeping its metadata. */
+  withBudget(budget: RunBudget): RunContext {
+    return new RunContext(this.ledger, budget, this.parentRunId, this.depth, { turnId: this.turnId, actor: this.actor, metadataOnly: this.metadataOnly });
   }
 
   get rootRunId(): string {
@@ -319,6 +384,7 @@ export class RunContext {
       subagent.budget.nestedWithin(this.budget, this.ledger),
       parentRunId,
       this.depth + 1,
+      { turnId: this.turnId, actor: this.actor },
     );
   }
 

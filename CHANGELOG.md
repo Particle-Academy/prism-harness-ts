@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.11.0
+
+### Added
+
+- `AgentRuntime.streamSteps()` yields tagged run steps (contract `g282.1`,
+  byte-compatible with prism-harness PHP 0.25.0) and returns the run's response.
+- `AgentRuntime.streamDecision()` records approval decisions under the session
+  lock, then streams the resumed run under the parked run's id, continuing its
+  `seq` and emitting `run.resumed`.
+- `recordDecisions()`, `RunContext.metadata()`, `withTurn()` and `withActor()`.
+- Opt-in `run.stepped` events with `stepEvents: true`.
+
+`send()`, `sendStructured()` and `recordApproval()` behave as before.
+
 ## 0.10.3
 
 ### Fixed

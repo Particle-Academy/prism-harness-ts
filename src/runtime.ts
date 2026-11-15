@@ -21,6 +21,8 @@ import type { Session } from './session.js';
 import { schemaName, schemaProblems } from './structured.js';
 import { RunBudget, RunContext } from './subagents.js';
 import type { HarnessTool, ToolAuthorizer, ToolRegistry } from './tools.js';
+import { settleWithRefusalScope } from './refusals.js';
+import { RunStepTagger, StepChannel, type RunStep, type ToolCallOutcome } from './steps.js';
 
 /**
  * What the runtime needs from a model, and NOTHING MORE.
@@ -146,7 +148,40 @@ export interface AgentRuntimeOptions {
   tools: ToolRegistry;
   authorizer?: ToolAuthorizer;
   events?: HarnessEvents;
+  /**
+   * Emit every run step as a `run.stepped` event. OFF BY DEFAULT: a step
+   * carries tool arguments, tool results and model text, and an app that
+   * records or forwards every event would otherwise capture them the moment it
+   * upgraded. `streamSteps()` and `streamDecision()` yield steps either way.
+   */
+  stepEvents?: boolean;
 }
+
+/** One human decision on a pending approval. `approvalId` is `PendingApproval.id`. */
+export interface ApprovalDecision {
+  approvalId: string;
+  approved: boolean;
+  reason?: string | null;
+}
+
+/** What the step paths thread through a turn. */
+interface Stepping {
+  tagger: RunStepTagger;
+  /** The id to run under, when the step path has already claimed one. */
+  runId?: string;
+  /** True when that id is a parked run's own, continued. */
+  resuming?: boolean;
+  /** True when the caller already holds the session lock for the whole turn. */
+  locked?: boolean;
+}
+
+/** A tool call's result as recorded, and how it ended. */
+interface Invoked {
+  entry: ToolResultEntry;
+  outcome: ToolCallOutcome;
+}
+
+const REFUSED_CALL: ToolCallOutcome = { ok: false, code: 'tool_call_refused', refused: true };
 
 export interface RuntimeConfig {
   provider?: string | null;
@@ -200,8 +235,11 @@ export class AgentRuntime {
   readonly #config: RuntimeConfig;
   readonly #agents: Record<string, RuntimeConfig>;
   readonly #narrowRequestedTools: boolean;
+  readonly #stepEvents: boolean;
 
   constructor(options: AgentRuntimeOptions) {
+    if (options.stepEvents !== undefined && typeof options.stepEvents !== 'boolean') throw new TypeError('stepEvents must be a boolean');
+    this.#stepEvents = options.stepEvents === true;
     if (options.narrowRequestedTools !== undefined && typeof options.narrowRequestedTools !== 'boolean') throw new TypeError('narrowRequestedTools must be a boolean');
     if (options.allowLegacyToolListWidening !== undefined && typeof options.allowLegacyToolListWidening !== 'boolean') throw new TypeError('allowLegacyToolListWidening must be a boolean');
     if (options.narrowRequestedTools === false) throw new TypeError('narrowRequestedTools: false is no longer supported. Remove it; use allowLegacyToolListWidening: true only to explicitly permit legacy tool-list widening.');
@@ -227,11 +265,11 @@ export class AgentRuntime {
   #boundedRun(session: Session, run: RunContext): RunContext {
     const steps = this.#setting(session, 'max_steps_ceiling'), output = this.#setting(session, 'max_output_tokens_per_call'), budget = run.budget;
     if (steps == null && output == null) return run;
-    return new RunContext(run.ledger, new RunBudget(
+    return run.withBudget(new RunBudget(
       steps == null ? budget.maxSteps : Math.min(budget.maxSteps, run.ledger.steps + steps),
       budget.maxCostUsd, budget.maxSeconds,
       output == null ? budget.maxOutputTokensPerCall : Math.min(budget.maxOutputTokensPerCall ?? output, output),
-    ), run.parentRunId, run.depth);
+    ));
   }
 
   /** Inspect the offer without a run/handler or logical mutation; reads may purge expired entries. */
@@ -271,7 +309,164 @@ export class AgentRuntime {
     context?: RunContext,
     additionalContent: readonly unknown[] = [],
   ): Promise<AgentResponse> {
-    return await this.#turn(session, prompt, toolNames, context, additionalContent);
+    return await this.#turn(session, prompt, toolNames, context, additionalContent, undefined, this.#observerStepping(context));
+  }
+
+  /**
+   * The same run as `send()`, delivered as tagged run steps (G-282 A).
+   *
+   * Same arguments, same run: the same mode, tools, budget, approvals, thread
+   * rows and run events. What the caller receives is the run's steps as they
+   * happen — `step_start`, `thinking`, `text`, `tool_call`, `tool_result`,
+   * `approval_request`, `error`, `step_finish` — each tagged with the run it
+   * belongs to and numbered from 1 with no gaps. The generator's RETURN value
+   * is the run's `AgentResponse`, for a caller that wants `pendingApprovals`.
+   *
+   * Lazy: nothing runs until the first step is read. Once started, the run
+   * goes to its end whether or not anyone keeps reading — abandoning the loop
+   * does not cancel it (that is G-285), and it still closes the run and
+   * releases its lock. A run that throws rethrows here after every step it
+   * produced has been yielded.
+   *
+   * HOLDS THE SESSION LOCK FOR THE WHOLE TURN, taken before anything else —
+   * before a run exists and before any provider call — and released when the
+   * turn ends on every path. A stream started while another holder has the
+   * lock waits `lock_wait` seconds and then fails with `session_locked`,
+   * having called nothing and recorded nothing.
+   */
+  async *streamSteps(
+    session: Session,
+    prompt: string,
+    toolNames?: readonly string[],
+    context?: RunContext,
+    additionalContent: readonly unknown[] = [],
+  ): AsyncGenerator<RunStep, AgentResponse, undefined> {
+    const channel = new StepChannel();
+    const tagger = this.#tagger(context, channel, 0);
+
+    return yield* channel.drain(() => this.#holdingTurnLock(session, (live) =>
+      this.#turn(live, prompt, toolNames, context, additionalContent, undefined, { tagger, locked: true })));
+  }
+
+  /**
+   * Answer pending approvals and continue the run AS IT HAPPENS (G-284).
+   *
+   * The list is checked when this is called, so a malformed one is refused
+   * before anything is recorded. Everything else happens when the stream
+   * starts, UNDER THE SESSION LOCK held for the whole turn: the decisions are
+   * written to the thread by the same code as `recordApproval()`, before any
+   * tool runs or any provider is called; one `decision_recorded` step is
+   * yielded per decision; then the run continues as `streamSteps()` does. A
+   * stream dropped after it started has still recorded every decision, and
+   * resuming again executes nothing twice. A stream that cannot take the lock
+   * fails with `session_locked` and records nothing.
+   *
+   * When the session still knows the run that parked, the continuation runs
+   * under that run's id, its `seq` continues where that run's stream ended,
+   * and it emits `run.resumed` rather than a second `run.started`. The `actor`
+   * on a decision step is the RunContext's — the application's own statement
+   * of who decided — never anything from the model or the request.
+   *
+   * Authorize before calling: who may answer an approval is the application's
+   * decision, as for `recordApproval()`.
+   */
+  streamDecision(
+    session: Session,
+    decisions: readonly ApprovalDecision[],
+    context?: RunContext,
+  ): AsyncGenerator<RunStep, AgentResponse, undefined> {
+    return this.#continueSteps(session, assertDecisions(decisions), context);
+  }
+
+  async *#continueSteps(
+    session: Session,
+    decisions: readonly ApprovalDecision[],
+    context: RunContext | undefined,
+  ): AsyncGenerator<RunStep, AgentResponse, undefined> {
+    const channel = new StepChannel();
+
+    return yield* channel.drain(() => this.#holdingTurnLock(session, async (live) => {
+      // Read inside the lock, so the run it names cannot change underneath.
+      const parked = await this.#parkedRun(live);
+
+      // DURABLE FIRST, through the one writer every decision path uses, and
+      // before any tool or provider call.
+      await writeDecisions(live, decisions);
+
+      const tagger = this.#tagger(context, channel, parked?.lastSeq ?? 0);
+      const execution = executionContext(context);
+      const runId = parked?.id ?? randomUUID();
+      tagger.bind(live.key(), runId, execution?.parentRunId ?? null, execution?.rootRunId ?? runId);
+
+      for (const decision of decisions) {
+        // From the APP's run context, never from the model or the request.
+        tagger.decision(decision.approvalId, decision.approved, decision.reason ?? null, context?.actor ?? null);
+      }
+
+      // An EMPTY prompt: the thread already holds the request, the decisions
+      // and everything before them, and the turn resolves approvals from it
+      // before any model call.
+      return await this.#turn(live, '', undefined, context, [], undefined, { tagger, runId, resuming: parked !== null, locked: true });
+    }));
+  }
+
+  /**
+   * One streamed turn under the session lock, released in `finally` by the
+   * store on every path — including a turn that throws, and a stream whose
+   * reader stopped early (the turn still runs to its end, then releases).
+   */
+  async #holdingTurnLock<T>(session: Session, turn: (live: Session) => Promise<T>): Promise<T> {
+    return await session.lock(
+      turn,
+      this.#setting(session, 'lock_ttl') ?? RESOLUTION_LOCK_SECONDS,
+      this.#setting(session, 'lock_wait') ?? RESOLUTION_WAIT_SECONDS,
+    );
+  }
+
+  /**
+   * The run that parked on the pending approvals, when the session still knows
+   * it: the current run, if it recorded the last tool-calling turn and that
+   * turn is waiting on approvals. A parked run in this port stays `running`
+   * (send() returns `awaiting_approval` without closing it), so status alone
+   * cannot say; the thread row's own run id can.
+   */
+  async #parkedRun(session: Session): Promise<{ id: string; lastSeq: number } | null> {
+    const run = await session.run();
+
+    if (run === null || run.status === 'failed') return null;
+
+    const entries = await session.thread().messages();
+
+    for (let index = entries.length - 1; index >= 0; index -= 1) {
+      const entry = entries[index]!;
+      const message = entry.message;
+
+      if (message.type !== 'assistant' || !Array.isArray(message.tool_calls) || message.tool_calls.length === 0) continue;
+
+      const requests = Array.isArray(message.tool_approval_requests) ? message.tool_approval_requests : [];
+
+      if (requests.length === 0 || entry.runId !== run.id) return null;
+
+      const seq = run.last_seq;
+
+      return { id: run.id, lastSeq: typeof seq === 'number' && Number.isSafeInteger(seq) && seq >= 0 ? seq : 0 };
+    }
+
+    return null;
+  }
+
+  #tagger(context: RunContext | undefined, channel: StepChannel | null, seq: number): RunStepTagger {
+    return new RunStepTagger(
+      context?.turnId ?? null,
+      channel === null ? null : (step) => channel.push(step),
+      this.#stepEvents ? (this.#events ?? null) : null,
+      seq,
+    );
+  }
+
+  /** send()'s steps exist only to be emitted, so only when that was opted into. */
+  #observerStepping(context: RunContext | undefined): Stepping | undefined {
+    return this.#stepEvents && this.#events !== undefined ? { tagger: this.#tagger(context, null, 0) } : undefined;
   }
 
   /**
@@ -303,7 +498,7 @@ export class AgentRuntime {
     context?: RunContext,
     additionalContent: readonly unknown[] = [],
   ): Promise<StructuredAgentResponse> {
-    const response = await this.#turn(session, prompt, toolNames, context, additionalContent, schema);
+    const response = await this.#turn(session, prompt, toolNames, context, additionalContent, schema, this.#observerStepping(context));
 
     // Narrowed by #turn: with a schema it always returns the structured shape.
     return response as StructuredAgentResponse;
@@ -316,6 +511,7 @@ export class AgentRuntime {
     context?: RunContext,
     additionalContent: readonly unknown[] = [],
     schema?: Readonly<JsonObject>,
+    stepping?: Stepping,
   ): Promise<AgentResponse> {
     // Refused before a run exists: a bad attachment is a mistake in the call,
     // and it should not cost a run, events or budget.
@@ -323,9 +519,13 @@ export class AgentRuntime {
     const mode = this.#modes.forAgent(session.agent).resolve(await session.mode());
     const provider = (await session.provider()) ?? this.#setting(session, 'provider') ?? 'unknown';
     const model = (await session.model()) ?? this.#setting(session, 'model') ?? 'unknown';
-    const runId = randomUUID();
-    const run = this.#boundedRun(session, context ?? RunContext.root(runId, new RunBudget(mode.maxSteps)));
+    const runId = stepping?.runId ?? randomUUID();
+    // A turnId/actor-only context is METADATA: the run takes exactly the path
+    // and budget it would take with no context at all.
+    const execution = executionContext(context);
+    const run = this.#boundedRun(session, execution ?? RunContext.root(runId, new RunBudget(mode.maxSteps)));
     const thread = session.thread();
+    const steps = stepping?.tagger;
 
     if (run.tooDeep()) {
       throw HarnessError.runNotPermitted(
@@ -334,9 +534,12 @@ export class AgentRuntime {
       );
     }
 
+    steps?.bind(session.key(), runId, run.parentRunId, run.rootRunId);
     await session.beginRun(runId, mode.name, provider, model);
     this.#events?.emit({
-      type: 'run.started',
+      // A parked run continued under its own id has already STARTED once; a
+      // second run.started for it would read as a new run.
+      type: stepping?.resuming === true ? 'run.resumed' : 'run.started',
       runId,
       sessionKey: session.key(),
       mode: mode.name,
@@ -364,7 +567,7 @@ export class AgentRuntime {
       // Decisions recorded since the run stopped are acted on FIRST, before a
       // new prompt is recorded, so the results land after the calls they answer
       // rather than after the new turn.
-      offered = await this.#resolveApprovals(session, mode, offered, runId, called, scope?.legacy === true);
+      offered = await this.#resolveApprovals(session, mode, offered, runId, called, scope?.legacy === true, steps, stepping?.locked === true);
 
       if (prompt !== '') {
         // With attachments, the shape prism-ts's UserMessage.toObject() writes:
@@ -378,7 +581,7 @@ export class AgentRuntime {
         await thread.record([turn], runId);
       }
 
-      return await this.#loop(session, mode, run, runId, provider, model, offered, called, schema);
+      return await this.#loop(session, mode, run, runId, provider, model, offered, called, schema, steps);
     } catch (error) {
       // THE MODEL'S OWN WORDS DO NOT BELONG IN A RUN ROW OR AN EVENT. A schema
       // violation names the values that missed, so its message carries pieces
@@ -405,6 +608,8 @@ export class AgentRuntime {
       });
 
       throw error;
+    } finally {
+      if (steps !== undefined) await rememberSeq(session, runId, steps);
     }
   }
 
@@ -418,6 +623,7 @@ export class AgentRuntime {
     offered: readonly HarnessTool[],
     called: string[],
     schema?: Readonly<JsonObject>,
+    steps?: RunStepTagger,
   ): Promise<AgentResponse> {
     const thread = session.thread();
     let text = '';
@@ -432,6 +638,7 @@ export class AgentRuntime {
         return await this.#finish(session, runId, called, 'budget_exhausted', text, run, exhausted);
       }
 
+      steps?.stepStart();
       const response = await this.#client({
         systemPrompt: mode.systemPrompt,
         messages: threadView((await thread.messages()).map((entry) => entry.message)),
@@ -449,6 +656,13 @@ export class AgentRuntime {
       finishReason = response.finishReason;
 
       const toolCalls = response.toolCalls ?? [];
+      if (steps !== undefined) {
+        // Provider state names reasoning `thinking` (Anthropic, as prism-ts
+        // records it); the client returns a whole response, so each is one delta.
+        const thinking = response.additionalContent?.thinking;
+        if (typeof thinking === 'string' && thinking !== '') steps.thinking(thinking);
+        if (response.text !== '') steps.text(response.text);
+      }
       const failedFinish = finishReason === 'error' || finishReason === 'unknown' ? finishReason : null;
       const gated = failedFinish === null ? toolCalls.filter((call) => mode.needsApproval(call.name)) : [];
       const requests: ApprovalRequestEntry[] = gated.map((call) => ({
@@ -469,6 +683,8 @@ export class AgentRuntime {
       await thread.record([row], runId);
 
       if (failedFinish !== null) {
+        // The code travels; nothing the provider said does.
+        steps?.error('model_step_failed');
         // Complete the transcript with refusals, never approval requests, so a
         // later resume cannot dispatch calls from this failed response.
         if (toolCalls.length > 0) {
@@ -479,6 +695,7 @@ export class AgentRuntime {
       }
 
       if (toolCalls.length === 0) {
+        steps?.stepFinish(response.text);
         if (schema !== undefined) {
           // Recorded first, then checked: the exchange happened either way, and
           // a failure here fails the run through the caller's catch.
@@ -498,14 +715,23 @@ export class AgentRuntime {
       // results are recorded even when the step then stops for a person.
       const results: ToolResultEntry[] = [];
 
+      for (const call of toolCalls) steps?.toolCall(call.id, call.name, call.arguments);
+
       for (const call of toolCalls.filter((candidate) => !gated.includes(candidate))) {
         called.push(call.name);
-        results.push(await this.#invoke(offered, call));
+        const invoked = await this.#invoke(offered, call);
+        steps?.toolResult(call.id, invoked.entry.result, invoked.outcome);
+        results.push(invoked.entry);
       }
 
       if (results.length > 0) {
         await thread.record([toolResultRow(results)], runId);
       }
+
+      // After the results, as core yields them: the calls that ran, then the
+      // ones waiting on a person.
+      for (const request of requests) steps?.approvalRequest(request.approval_id, request.tool_call_id);
+      steps?.stepFinish(response.text);
 
       if (requests.length > 0) {
         // FAILS CLOSED. The gated calls have not run, and the requests are in
@@ -551,6 +777,8 @@ export class AgentRuntime {
     runId: string,
     called: string[],
     legacyDiagnosticEmitted: boolean,
+    steps?: RunStepTagger,
+    alreadyLocked = false,
   ): Promise<HarnessTool[]> {
     // A read without the lock first: nearly every send() has nothing to resolve
     // and should not wait on the session lock to find that out.
@@ -560,38 +788,46 @@ export class AgentRuntime {
     // the same session at once would otherwise both find the approved call with
     // no result, and both run it. The second now waits, finds the result the
     // first recorded, and runs nothing. If it cannot get the lock it throws
-    // SessionLocked, and nothing runs.
-    return await session.lock(
-      async (live) => {
-        const work = await this.#unresolved(live, mode);
+    // SessionLocked, and nothing runs. A streamed turn already holds that lock
+    // for the whole turn, and the lock is not reentrant, so it resolves in place.
+    const resolve = async (live: Session): Promise<HarnessTool[]> => {
+      const work = await this.#unresolved(live, mode);
 
-        if (work === null) return offered;
+      if (work === null) return offered;
 
-        // Work can change while waiting. Its calls, decisions AND scope must
-        // come from the same locked snapshot, and bound the continuation too.
-        if (work.scope?.legacy && !legacyDiagnosticEmitted) console.warn('Pending approval has no valid stored tool scope; offering approved requests only.');
-        const bounded = offered.filter(tool => work.scope?.names.includes(tool.name) === true);
+      // Work can change while waiting. Its calls, decisions AND scope must
+      // come from the same locked snapshot, and bound the continuation too.
+      if (work.scope?.legacy && !legacyDiagnosticEmitted) console.warn('Pending approval has no valid stored tool scope; offering approved requests only.');
+      const bounded = offered.filter(tool => work.scope?.names.includes(tool.name) === true);
 
-        const resolved: ToolResultEntry[] = [];
+      const resolved: ToolResultEntry[] = [];
 
-        for (const call of work.calls) {
-          const input = { id: call.id, name: call.name, arguments: call.arguments, resultId: call.result_id };
-          const approvalId = work.approvalIds.get(call.id);
-          const decision = approvalId === undefined ? undefined : work.decisions.get(approvalId);
+      for (const call of work.calls) {
+        const input = { id: call.id, name: call.name, arguments: call.arguments, resultId: call.result_id };
+        const approvalId = work.approvalIds.get(call.id);
+        const decision = approvalId === undefined ? undefined : work.decisions.get(approvalId);
 
-          if (decision?.approved === true) {
-            called.push(call.name);
-            resolved.push(await this.#runApproved(bounded, input));
-          } else {
-            resolved.push(
-              toolResultEntry(input, decision === undefined ? 'No approval response provided' : (decision.reason ?? 'User denied tool execution')),
-            );
-          }
+        if (decision?.approved === true) {
+          called.push(call.name);
+          const invoked = await this.#runApproved(bounded, input);
+          steps?.toolResult(call.id, invoked.entry.result, invoked.outcome);
+          resolved.push(invoked.entry);
+        } else {
+          // Denied, or never answered: either way not approved, and refused.
+          const entry = toolResultEntry(input, decision === undefined ? 'No approval response provided' : (decision.reason ?? 'User denied tool execution'));
+          steps?.toolResult(call.id, entry.result, { ok: false, code: 'approval_denied', refused: true });
+          resolved.push(entry);
         }
+      }
 
-        await live.thread().record([toolResultRow([...work.results.values(), ...resolved], [...work.decisions.values()])], runId);
-        return bounded;
-      },
+      await live.thread().record([toolResultRow([...work.results.values(), ...resolved], [...work.decisions.values()])], runId);
+      return bounded;
+    };
+
+    if (alreadyLocked) return await resolve(session);
+
+    return await session.lock(
+      resolve,
       this.#setting(session, 'lock_ttl') ?? RESOLUTION_LOCK_SECONDS,
       this.#setting(session, 'lock_wait') ?? RESOLUTION_WAIT_SECONDS,
     );
@@ -642,23 +878,26 @@ export class AgentRuntime {
    * send(), and the session could never move on. The approval stands, but the
    * call does not run.
    */
-  async #runApproved(offered: readonly HarnessTool[], call: LlmToolCall): Promise<ToolResultEntry> {
+  async #runApproved(offered: readonly HarnessTool[], call: LlmToolCall): Promise<Invoked> {
     if (!offered.some((tool) => tool.name === call.name)) {
-      return toolResultEntry(call, `Not run: ${call.name} is not available to this run.`);
+      return {
+        entry: toolResultEntry(call, `Not run: ${call.name} is not available to this run.`),
+        outcome: { ok: false, code: 'tool_not_available', refused: true },
+      };
     }
 
     try {
       return await this.#invoke(offered, call);
     } catch (error) {
       if (error instanceof HarnessError && error.code === 'call_not_authorized') {
-        return toolResultEntry(call, `Not run: this call to ${call.name} is not authorized.`);
+        return { entry: toolResultEntry(call, `Not run: this call to ${call.name} is not authorized.`), outcome: REFUSED_CALL };
       }
 
       throw error;
     }
   }
 
-  async #invoke(offered: readonly HarnessTool[], call: LlmToolCall): Promise<ToolResultEntry> {
+  async #invoke(offered: readonly HarnessTool[], call: LlmToolCall): Promise<Invoked> {
     const tool = offered.find((candidate) => candidate.name === call.name);
 
     if (tool === undefined) {
@@ -668,18 +907,31 @@ export class AgentRuntime {
       );
     }
 
-    try {
-      const result = await tool.handle(call.arguments);
+    // Each call gets its own refusal cell: a gate inside the tool (a subagent
+    // the tree would not run, a refused task completion) says so there, and
+    // nothing another call, run or session does can reach it.
+    const settled = await settleWithRefusalScope(async () => await tool.handle(call.arguments));
 
-      return toolResultEntry(call, typeof result === 'string' ? result : JSON.stringify(result ?? null));
-    } catch (error) {
-      // A failed tool is a RESULT, not a crashed run: the model can often
-      // recover, and losing the whole turn to one bad call is worse. A refused
-      // call is different and is left to propagate — see `authorizedTool`.
-      if (error instanceof HarnessError && error.code === 'call_not_authorized') throw error;
+    if (settled.ok) {
+      const result = settled.value;
 
-      return toolResultEntry(call, `The tool failed: ${error instanceof Error ? error.message : String(error)}`);
+      return {
+        entry: toolResultEntry(call, typeof result === 'string' ? result : JSON.stringify(result ?? null)),
+        outcome: settled.refused ? REFUSED_CALL : { ok: true },
+      };
     }
+
+    const error = settled.error;
+
+    // A failed tool is a RESULT, not a crashed run: the model can often
+    // recover, and losing the whole turn to one bad call is worse. A refused
+    // call is different and is left to propagate — see `authorizedTool`.
+    if (error instanceof HarnessError && error.code === 'call_not_authorized') throw error;
+
+    return {
+      entry: toolResultEntry(call, `The tool failed: ${error instanceof Error ? error.message : String(error)}`),
+      outcome: settled.refused ? REFUSED_CALL : { ok: false, code: 'tool_failed', refused: false },
+    };
   }
 
   /**
@@ -778,7 +1030,67 @@ export async function recordApproval(
   approved: boolean,
   reason: string | null = null,
 ): Promise<void> {
+  await writeDecisions(session, [{ approvalId, approved, reason }]);
+}
+
+/**
+ * Answer SEVERAL pending approvals durably, as one row, before resuming once.
+ *
+ * The same writer as `recordApproval()` and `streamDecision()`. A run that
+ * stopped on more than one call needs every answer before it resumes, because
+ * a call with no decision is refused when it does.
+ */
+export async function recordDecisions(session: Session, decisions: readonly ApprovalDecision[]): Promise<void> {
+  await writeDecisions(session, assertDecisions(decisions));
+}
+
+/** Where decisions are made durable, for every path that takes them. */
+async function writeDecisions(session: Session, decisions: readonly ApprovalDecision[]): Promise<void> {
   const run = await session.run();
 
-  await session.thread().record([toolResultRow([], [{ approval_id: approvalId, approved, reason }])], run?.id ?? null);
+  await session.thread().record([toolResultRow([], decisions.map((decision) => ({
+    approval_id: decision.approvalId,
+    approved: decision.approved,
+    reason: decision.reason ?? null,
+  })))], run?.id ?? null);
+}
+
+/** Runtime guards: a decision arrives from an app's request handling, not from a typed caller. */
+function assertDecisions(decisions: unknown): ApprovalDecision[] {
+  if (!Array.isArray(decisions) || decisions.length === 0) {
+    throw new TypeError('A decision list needs at least one decision.');
+  }
+
+  return decisions.map((decision: unknown) => {
+    const candidate = decision as Partial<ApprovalDecision> | null;
+    if (candidate === null || typeof candidate !== 'object'
+      || typeof candidate.approvalId !== 'string' || candidate.approvalId === ''
+      || typeof candidate.approved !== 'boolean'
+      || (candidate.reason !== undefined && candidate.reason !== null && typeof candidate.reason !== 'string')) {
+      throw new TypeError('A decision is { approvalId: nonempty string, approved: boolean, reason?: string | null }.');
+    }
+
+    return { approvalId: candidate.approvalId, approved: candidate.approved, reason: candidate.reason ?? null };
+  });
+}
+
+/** The context a run EXECUTES under: a metadata-only context states no run tree. */
+function executionContext(context: RunContext | undefined): RunContext | undefined {
+  return context?.metadataOnly === true ? undefined : context;
+}
+
+/**
+ * Where this run's step sequence ended, so a resumed run continues it.
+ *
+ * Last, and isolated: the run is already closed out, and failing to note a
+ * sequence number must not turn a finished run into a failed one.
+ */
+async function rememberSeq(session: Session, runId: string, steps: RunStepTagger): Promise<void> {
+  if (steps.seq === 0) return;
+
+  try {
+    await session.rememberStepSeq(runId, steps.seq);
+  } catch (error) {
+    process.emitWarning(`prism-harness could not record the step sequence of run [${runId}]: ${String(error)}`);
+  }
 }

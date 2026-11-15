@@ -1,5 +1,6 @@
 import type { JsonObject } from './json.js';
-import { HarnessError } from './errors.js';
+import { HarnessError, type HarnessErrorCode } from './errors.js';
+import { markRefused } from './refusals.js';
 import { authorizedTool } from './tools.js';
 import type { HarnessTool, ToolAuthorizer, ToolFactory } from './tools.js';
 import { isTerminalState } from './tasks.js';
@@ -62,6 +63,14 @@ export interface CompletionToolOptions {
  * alone can say "may complete tasks" and never "only this task, only once the
  * tests pass".
  */
+/** The refusals the completion tool applies before it touches the task. */
+const GATE_CODES: ReadonlySet<HarnessErrorCode> = new Set<HarnessErrorCode>([
+  'task_outcome_invalid',
+  'task_not_found',
+  'task_already_terminal',
+  'task_lease_not_held',
+]);
+
 export function agentCompletionTool(options: CompletionToolOptions): ToolFactory {
   const name = options.name ?? 'complete_task';
 
@@ -77,73 +86,86 @@ export function agentCompletionTool(options: CompletionToolOptions): ToolFactory
       `Record the outcome of the task [${task.id()}] as either "done" or "failed". Only call this ` +
       'when the work is actually finished; "failed" is a legitimate answer and is not a worse one.',
     async handle(args: JsonObject): Promise<unknown> {
-      const given = args.outcome;
-
-      // REQUIRED and VALIDATED. `outcome` is the one value the MODEL supplies
-      // and it decides a terminal state, so mapping anything else onto `done`
-      // -- `"complete"`, `"DONE"`, `null`, or nothing at all -- would let a
-      // malformed call produce the more privileged result: an agent declaring
-      // victory by typo.
-      //
-      // ABSENT is refused too, and that is a ruling rather than an obvious
-      // reading. The argument for allowing it is real: calling a tool named
-      // `complete_task` looks like the declaration by itself. The reference
-      // settled it the other way, and the same code covers both, so a model
-      // that omitted the argument is told to say which outcome it means rather
-      // than having one chosen for it.
-      if (given !== 'done' && given !== 'failed') {
-        throw HarnessError.taskOutcomeInvalid(name, given);
+      try {
+        return await complete(args);
+      } catch (error) {
+        // The four codes below are GATES — the task is not this worker's to
+        // close, or the outcome is malformed — not the work failing: said
+        // here, so a run step reports them as refused. Anything else a source
+        // throws stays an ordinary failure.
+        if (error instanceof HarnessError && GATE_CODES.has(error.code)) markRefused();
+        throw error;
       }
-
-      const outcome: TaskOutcome = given;
-
-      // CHECKED HERE TOO, and this is not belt-and-braces.
-      //
-      // `StoreTaskSource.release()` refuses a worker that is not the holder, so
-      // against that source this block changes nothing -- deleting it is
-      // invisible, and the mutation SURVIVES. That is precisely the argument
-      // for it: an interface cannot make an implementation check anything, and
-      // `release(task, worker, outcome)` reads to a third party like "find it
-      // and set the state", which is what they will write. This tool is the
-      // thing a MODEL can call, so it does not get to assume the source behind
-      // it is the careful one. A fixture source with no guard at all is in the
-      // suite for exactly this, because nothing else would notice.
-      const current = await source.find(task.id());
-
-      if (current === null) {
-        throw HarnessError.taskNotFound(task.id());
-      }
-
-      if (isTerminalState(current.state())) {
-        throw HarnessError.taskAlreadyTerminal(task.id(), current.state());
-      }
-
-      if (current.state() !== 'claimed') {
-        throw HarnessError.taskLeaseNotHeld(task.id(), worker, 'nothing is holding it');
-      }
-
-      // ONE comparison, and it must be `!==` against the worker rather than a
-      // hunt for a mismatch. The three ways this is not the worker's task --
-      // somebody else holds it, nobody holds it, or the holder CANNOT BE
-      // ESTABLISHED -- all have to land on refusal, and the third is the one
-      // that is easy to get wrong.
-      //
-      // `AgentTask` is `id`, `instruction`, `state` and nothing else, so a
-      // conforming source may legally return a task from which no holder can be
-      // read. The first version here treated that as "no mismatch, therefore
-      // allowed", which is READING SILENCE AS PERMISSION -- the same mistake as
-      // inferring `done` from an absent outcome, asked about a different field
-      // and one level down. An unknowable holder resolves to a sentinel that
-      // matches no worker, so it refuses.
-      if (holderOf(current) !== worker) {
-        throw HarnessError.taskLeaseNotHeld(task.id(), worker, 'it is not held by this worker');
-      }
-
-      await source.release(task, worker, outcome);
-
-      return { id: task.id(), state: outcome };
     },
   };
+
+  async function complete(args: JsonObject): Promise<unknown> {
+    const given = args.outcome;
+
+    // REQUIRED and VALIDATED. `outcome` is the one value the MODEL supplies
+    // and it decides a terminal state, so mapping anything else onto `done`
+    // -- `"complete"`, `"DONE"`, `null`, or nothing at all -- would let a
+    // malformed call produce the more privileged result: an agent declaring
+    // victory by typo.
+    //
+    // ABSENT is refused too, and that is a ruling rather than an obvious
+    // reading. The argument for allowing it is real: calling a tool named
+    // `complete_task` looks like the declaration by itself. The reference
+    // settled it the other way, and the same code covers both, so a model
+    // that omitted the argument is told to say which outcome it means rather
+    // than having one chosen for it.
+    if (given !== 'done' && given !== 'failed') {
+      throw HarnessError.taskOutcomeInvalid(name, given);
+    }
+
+    const outcome: TaskOutcome = given;
+
+    // CHECKED HERE TOO, and this is not belt-and-braces.
+    //
+    // `StoreTaskSource.release()` refuses a worker that is not the holder, so
+    // against that source this block changes nothing -- deleting it is
+    // invisible, and the mutation SURVIVES. That is precisely the argument
+    // for it: an interface cannot make an implementation check anything, and
+    // `release(task, worker, outcome)` reads to a third party like "find it
+    // and set the state", which is what they will write. This tool is the
+    // thing a MODEL can call, so it does not get to assume the source behind
+    // it is the careful one. A fixture source with no guard at all is in the
+    // suite for exactly this, because nothing else would notice.
+    const current = await source.find(task.id());
+
+    if (current === null) {
+      throw HarnessError.taskNotFound(task.id());
+    }
+
+    if (isTerminalState(current.state())) {
+      throw HarnessError.taskAlreadyTerminal(task.id(), current.state());
+    }
+
+    if (current.state() !== 'claimed') {
+      throw HarnessError.taskLeaseNotHeld(task.id(), worker, 'nothing is holding it');
+    }
+
+    // ONE comparison, and it must be `!==` against the worker rather than a
+    // hunt for a mismatch. The three ways this is not the worker's task --
+    // somebody else holds it, nobody holds it, or the holder CANNOT BE
+    // ESTABLISHED -- all have to land on refusal, and the third is the one
+    // that is easy to get wrong.
+    //
+    // `AgentTask` is `id`, `instruction`, `state` and nothing else, so a
+    // conforming source may legally return a task from which no holder can be
+    // read. The first version here treated that as "no mismatch, therefore
+    // allowed", which is READING SILENCE AS PERMISSION -- the same mistake as
+    // inferring `done` from an absent outcome, asked about a different field
+    // and one level down. An unknowable holder resolves to a sentinel that
+    // matches no worker, so it refuses.
+    if (holderOf(current) !== worker) {
+      throw HarnessError.taskLeaseNotHeld(task.id(), worker, 'it is not held by this worker');
+    }
+
+    await source.release(task, worker, outcome);
+
+    return { id: task.id(), state: outcome };
+  }
 
   return (session) => {
     const scoped = session.agent === null ? authorizer : authorizer.forAgent(session.agent);

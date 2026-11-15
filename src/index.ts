@@ -30,6 +30,7 @@ export { AgentMode, ModeRegistry } from './modes.js';
 export type { ModeConfig, ModeRegistryConfig } from './modes.js';
 
 export { MAX_DEPTH, RunBudget, RunContext, RunLedger, Subagent, subagentFromConfig } from './subagents.js';
+export type { RunMetadata } from './subagents.js';
 
 export { ToolAuthorizer, ToolRegistry, authorizedTool } from './tools.js';
 export type {
@@ -43,12 +44,30 @@ export type {
 } from './tools.js';
 
 export { HarnessEvents } from './events.js';
-export type { HarnessEvent, HarnessListener, RunFailed, RunFinished, RunStarted } from './events.js';
+export type { HarnessEvent, HarnessListener, RunFailed, RunFinished, RunResumed, RunStarted, RunStepped } from './events.js';
+
+export { RUN_STEP_CONTRACT_VERSION, RUN_STEP_ERROR_MESSAGE } from './steps.js';
+export type {
+  ApprovalRequestStep,
+  DecisionRecordedStep,
+  ErrorStep,
+  RunStep,
+  RunStepEnvelope,
+  RunStepType,
+  StepFinishStep,
+  StepStartStep,
+  TextStep,
+  ThinkingStep,
+  ToolCallStep,
+  ToolResultErrorCode,
+  ToolResultErrorStep,
+  ToolResultOkStep,
+} from './steps.js';
 
 export { diagnose } from './doctor.js';
 export type { DoctorFinding, DoctorReport, DoctorSubjects } from './doctor.js';
 
-export { AgentRuntime, recordApproval } from './runtime.js';
+export { AgentRuntime, recordApproval, recordDecisions } from './runtime.js';
 export { assistantRow, threadView, toolResultEntry, toolResultRow } from './thread-rows.js';
 export type {
   ApprovalDecisionEntry,
@@ -62,6 +81,7 @@ export type {
 export type {
   AgentResponse,
   AgentRuntimeOptions,
+  ApprovalDecision,
   EffectiveTool,
   RuntimeConfig,
   LlmClient,
