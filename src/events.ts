@@ -1,4 +1,5 @@
 import type { JsonObject } from './json.js';
+import type { RunStep } from './steps.js';
 
 /**
  * What happened during a run, for anything that wants to watch.
@@ -15,8 +16,11 @@ import type { JsonObject } from './json.js';
  * already carries those behind an opt-in capture gate with a length cap, and
  * emitting them here ungated would quietly undo that decision for anyone who
  * installed both.
+ *
+ * The one exception is `run.stepped`, which carries a run step whole and is
+ * therefore OFF unless the runtime is built with `stepEvents: true`.
  */
-export type HarnessEvent = RunStarted | RunFinished | RunFailed;
+export type HarnessEvent = RunStarted | RunResumed | RunFinished | RunFailed | RunStepped;
 
 export interface RunStarted {
   type: 'run.started';
@@ -29,6 +33,36 @@ export interface RunStarted {
   rootRunId: string;
   depth: number;
   at: string;
+}
+
+/**
+ * A run parked for approval continued under its own id (G-284).
+ *
+ * Emitted INSTEAD of a second `run.started`: the run started once, and an
+ * application counting starts would otherwise see two runs where there is one.
+ * The run still ends with exactly one `run.finished` or `run.failed`. The same
+ * fields as `run.started`.
+ */
+export interface RunResumed extends Omit<RunStarted, 'type'> {
+  type: 'run.resumed';
+}
+
+/**
+ * A run produced a step (G-282 A).
+ *
+ * OPT-IN: emitted only when the runtime was built with `stepEvents: true`. A
+ * step carries tool arguments, tool results and model text — exactly what the
+ * rest of these events leave out — so an app that forwards every event must
+ * ask for it. `streamSteps()` and `streamDecision()` yield steps either way.
+ * Observation only: a listener that throws is isolated, as for every event.
+ */
+export interface RunStepped {
+  type: 'run.stepped';
+  runId: string;
+  sessionKey: string;
+  parentRunId: string | null;
+  rootRunId: string;
+  step: RunStep;
 }
 
 export interface RunFinished {

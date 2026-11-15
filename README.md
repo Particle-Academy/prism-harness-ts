@@ -305,7 +305,61 @@ On resume the approved calls run once and denied calls return their reason, and
 then the model continues. The model is not asked to make the calls again. A
 pending call with no decision is refused with "No approval response provided".
 A call that has a result never runs again. Who may approve is your application's
-decision: authorize before calling `recordApproval()`.
+decision: authorize before calling `recordApproval()`. `recordDecisions(session,
+[{ approvalId, approved, reason }])` records several decisions as one row.
+
+## Run steps for a UI
+
+`streamSteps()` takes the same arguments as `send()` and yields run steps as the
+run happens: thinking, text, tool calls and results, approval requests, errors
+and step boundaries, each tagged for a client to render. The generator's return
+value is the run's `AgentResponse`.
+
+```ts
+const steps = runtime.streamSteps(session, 'Refactor the billing job', undefined, RunContext.metadata(turnId, userId));
+
+for await (const step of steps) {
+  JSON.stringify(step); // contractVersion "g282.1", runId, parentRunId, rootRunId, turnId, seq, at, type, ...
+}
+```
+
+- `seq` counts from 1 per run with no gaps; render in that order.
+- A tool call carries `startedAt`. Its result carries `ok`, `result` or
+  `error { code, message }`, `refused`, `durationMs` and `durationExact`.
+  - `refused` is true for an expected refusal: a denied approval, a tool no
+    longer offered, tool authorization, or a gate. A tool that threw is
+    `ok: false, refused: false`.
+  - `durationExact` is false when the step made several tool calls or the tool
+    ran while resuming an approval. The duration is then an upper bound.
+- An `error` step's message is a fixed generic text.
+- `RunContext.metadata(turnId, actor)` sets `turnId` and `actor` without
+  changing how the run executes.
+- The stream holds the session lock for the whole turn. If another holder has
+  it, the stream fails with `session_locked` after `lock_wait` seconds without
+  calling the model.
+- Once started, a run finishes even if you stop reading.
+
+`send()` is unchanged. To also receive every step as a `run.stepped` event,
+build the runtime with `stepEvents: true`. It is off by default because steps
+carry tool arguments, results and model text, and anything that records or
+forwards every event would otherwise capture them.
+
+### Streaming an approval
+
+`streamDecision(session, decisions, context)` checks the decisions when called,
+then, once the stream starts and under the session lock, records them in the
+thread exactly as `recordApproval()` does and resumes the run. The first step for
+each decision is `decision_recorded` (`approvalId`, `verdict`, `reason`,
+`actor`); the run's steps follow, continuing its `seq`. Decisions are saved
+before any tool runs, so resuming again runs nothing twice. The resumed run emits
+`run.resumed`, not a second `run.started`. `actor` comes from your `RunContext`,
+never from the model.
+
+```ts
+for await (const step of runtime.streamDecision(session, [{ approvalId, approved: true }], RunContext.metadata(turnId, userId))) {
+  render(step);
+}
+```
 
 ## Agent task lists
 

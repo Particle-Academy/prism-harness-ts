@@ -26,6 +26,8 @@ export interface RunState extends JsonObject {
   provider?: string;
   model?: string;
   started_at?: string;
+  /** The last run step `seq` this run emitted, so a resumed stream continues it. */
+  last_seq?: number;
 }
 
 export interface SessionOptions {
@@ -242,6 +244,21 @@ export class Session {
 
   async failRun(id: string, failure: string): Promise<this> {
     return this.#finishRun(id, 'failed', { failure });
+  }
+
+  /**
+   * The last run step `seq` this run emitted, so a resumed stream continues it.
+   * A run that is not the one in flight is left alone, as `completeRun()` does.
+   *
+   * @internal Written by the runtime after a stepped run closes.
+   */
+  async rememberStepSeq(id: string, seq: number): Promise<this> {
+    if (!Number.isSafeInteger(seq) || seq < 0) throw new TypeError('A step sequence must be a nonnegative integer.');
+    const current = await this.run();
+
+    if (current === null || current.id !== id) return this;
+
+    return this.#write('run', { ...current, last_seq: seq });
   }
 
   /**
