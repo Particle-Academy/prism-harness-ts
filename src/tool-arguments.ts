@@ -53,35 +53,31 @@ function decode(text: string): unknown {
   }
 }
 
-/** Walked with a stack, so deep input cannot overflow the call stack here. */
+/** Walked a level at a time, so deep input cannot overflow the call stack, holding only nested values. */
 function canBeSentBack(root: JsonObject): boolean {
-  const pending: [unknown, number][] = [[root, 1]];
+  let level: object[] = [root];
 
-  while (pending.length > 0) {
-    const [value, depth] = pending.pop() as [unknown, number];
+  for (let depth = 1; level.length > 0; depth++) {
+    const next: object[] = [];
 
-    if (typeof value === 'number') {
-      if (!Number.isFinite(value)) return false;
-      continue;
+    for (const value of level) {
+      if (Array.isArray(value)) {
+        for (const item of value) {
+          if (!admitsValue(item, depth, next)) return false;
+        }
+
+        continue;
+      }
+
+      const map = value as Record<string, unknown>;
+
+      for (const key of Object.keys(map)) {
+        if (key.startsWith('\u0000') || LONE_SURROGATE.test(key)) return false;
+        if (!admitsValue(map[key], depth, next)) return false;
+      }
     }
 
-    if (typeof value === 'string') {
-      if (LONE_SURROGATE.test(value)) return false;
-      continue;
-    }
-
-    if (typeof value !== 'object' || value === null) continue;
-    if (depth > MAX_ARGUMENT_DEPTH) return false;
-
-    if (Array.isArray(value)) {
-      for (const item of value) pending.push([item, depth + 1]);
-      continue;
-    }
-
-    for (const [key, item] of Object.entries(value)) {
-      if (key.startsWith('\u0000') || LONE_SURROGATE.test(key)) return false;
-      pending.push([item, depth + 1]);
-    }
+    level = next;
   }
 
   try {
@@ -89,6 +85,18 @@ function canBeSentBack(root: JsonObject): boolean {
   } catch {
     return false;
   }
+}
+
+/** Checks a scalar in place and holds only a nested value for the next level. */
+function admitsValue(item: unknown, depth: number, next: object[]): boolean {
+  if (typeof item === 'number') return Number.isFinite(item);
+  if (typeof item === 'string') return !LONE_SURROGATE.test(item);
+  if (typeof item !== 'object' || item === null) return true;
+  if (depth >= MAX_ARGUMENT_DEPTH) return false;
+
+  next.push(item);
+
+  return true;
 }
 
 /** A key PHP would store as an integer: canonical decimal, within 64 bits. */
