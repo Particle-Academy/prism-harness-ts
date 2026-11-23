@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.11.1
 
 ### Fixed
 
@@ -21,6 +21,15 @@
   An empty string, `0`, `null`, `[]` and `{}` all mean no arguments, and a
   tool taking none still runs with `{}`. JSON text naming values is read as
   those values.
+
+### Upgrading
+
+- Resolve or deny any approval that is pending when you upgrade if its tool
+  call had arguments that were not an object. 0.11.0 stored some of those
+  calls (a bare number or boolean) as `{}`, so an approved resume runs them
+  with no arguments.
+
+No breaking changes.
 
 ## 0.11.0
 
