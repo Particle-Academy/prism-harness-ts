@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { mkdtemp } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   AgentRuntime,
   FileSessionStore,
@@ -389,5 +389,33 @@ describe('a tool that reaches the agent through a provider is scoped by the regi
     const destructive = await build(allow({ server: 'files', tool: 'read' }), fromProvider('files', (ran) => tool('read', ran, { tier: 'destructive' })));
     expect((await destructive.runtime.send(destructive.session, 'go')).finishReason).toBe('awaiting_approval');
     expect(destructive.ran).toEqual([]);
+  });
+});
+
+describe('a failing approval decision never runs the call', () => {
+  it('stops the run when the policy check throws', async () => {
+    const w = await world([call('read')], allow({ tool: 'read' }));
+    const allows = vi.spyOn(ToolPolicy.prototype, 'allows').mockImplementation(() => { throw new Error('check failed'); });
+    try {
+      await expect(w.runtime.send(w.session, 'go')).rejects.toThrow('check failed');
+    } finally {
+      allows.mockRestore();
+    }
+
+    expect(w.ran).toEqual([]);
+  });
+
+  it('still pauses for a person when an event listener throws', async () => {
+    const w = await world([call('read')], undefined);
+    w.events.push = () => { throw new Error('listener failed'); };
+    const warning = vi.spyOn(process, 'emitWarning').mockImplementation(() => undefined);
+    try {
+      const response = await w.runtime.send(w.session, 'go');
+      expect(response.finishReason).toBe('awaiting_approval');
+    } finally {
+      warning.mockRestore();
+    }
+
+    expect(w.ran).toEqual([]);
   });
 });
