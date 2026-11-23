@@ -2,7 +2,7 @@ import { HarnessError } from './errors.js';
 import type { JsonObject } from './json.js';
 import { isJsonObject } from './json.js';
 import type { Subagent } from './subagents.js';
-import { subagentFromConfig } from './subagents.js';
+import { isAgentId, subagentFromConfig } from './subagents.js';
 import { validateAgent } from './address.js';
 import { RegistrationCollision, registrationOwner } from './registration.js';
 
@@ -15,6 +15,12 @@ export interface ModeConfig {
   requires_approval?: readonly string[];
   /** Passed unchanged to the model client on every run in this mode. Must be a map. */
   provider_options?: Record<string, unknown>;
+  /** The provider every run in this mode uses, above the agent default (G-321 E). */
+  provider?: string | null;
+  /** The model every run in this mode uses, above the agent default. */
+  model?: string | null;
+  /** Named agents this mode's subagents may run as. Declared, never inherited. */
+  agents?: readonly string[];
 }
 
 export interface ModeRegistryConfig {
@@ -45,6 +51,12 @@ export class AgentMode {
     readonly requiresApproval: readonly string[] = [],
     /** Options handed to the provider on every run in this mode, unchanged. */
     readonly providerOptions: Readonly<JsonObject> = {},
+    /** The provider runs in this mode use, or null to fall through to the agent. */
+    readonly provider: string | null = null,
+    /** The model runs in this mode use, or null to fall through to the agent. */
+    readonly model: string | null = null,
+    /** Named agents this mode's subagents may run as. */
+    readonly agents: readonly string[] = [],
   ) {}
 
   /**
@@ -148,15 +160,26 @@ export class ModeRegistry {
       throw HarnessError.modeMalformed(wanted, 'system_prompt must be a string and max_steps a positive integer');
     }
 
+    for (const key of ['provider', 'model'] as const) {
+      const value: unknown = mode[key];
+      if (value !== undefined && value !== null && (typeof value !== 'string' || value === '')) {
+        throw new HarnessError('mode_malformed', `Harness mode [${wanted}] declares a malformed provider/model: expected a nonempty string or null.`);
+      }
+    }
+    const agents = agentsFor(wanted, mode.agents);
+
     return new AgentMode(
       wanted,
       prompt,
       strings(mode.tools),
       strings(mode.skills),
       maxSteps,
-      this.#subagentsFor(wanted, mode),
+      this.#subagentsFor(wanted, mode, agents),
       strings(mode.requires_approval),
       providerOptionsFor(wanted, mode.provider_options),
+      mode.provider ?? null,
+      mode.model ?? null,
+      agents,
     );
   }
 
@@ -171,7 +194,7 @@ export class ModeRegistry {
    * call time so a typo surfaces when the parent mode is loaded instead of
    * halfway through a run that has already spent budget.
    */
-  #subagentsFor(name: string, mode: ModeConfig): Record<string, Subagent> {
+  #subagentsFor(name: string, mode: ModeConfig, agents: readonly string[]): Record<string, Subagent> {
     const declared = mode.subagents ?? {};
     const subagents: Record<string, Subagent> = {};
 
@@ -180,9 +203,23 @@ export class ModeRegistry {
         throw HarnessError.modeMalformed(name, `subagent [${key}] is not an object`);
       }
 
-      const subagent = subagentFromConfig(key, config as Record<string, unknown>);
+      const subagent = subagentFromConfig(key, config as Record<string, unknown>, name);
 
-      if (this.config.modes?.[subagent.mode] === undefined) {
+      // DELEGATION IS AUTHORITY, so it is declared by the parent mode and never
+      // inherited: a subagent may run as another agent only when this mode
+      // lists that agent. Running as the mode's own agent delegates nothing.
+      if (subagent.agent !== null && subagent.agent !== this.agent && !agents.includes(subagent.agent)) {
+        throw new HarnessError(
+          'mode_malformed',
+          `Harness mode [${name}] declares subagent [${key}] for agent [${subagent.agent}], which the mode does not list in its agents.`,
+        );
+      }
+
+      // The child's mode is looked up where the child RUNS: in the delegated
+      // agent's registry when it names one. Names only; resolving it here
+      // would recurse through any cycle of modes.
+      const target = subagent.agent === null || subagent.agent === this.agent ? this : (this.root ?? this).forAgent(subagent.agent);
+      if (target.config.modes?.[subagent.mode] === undefined) {
         throw HarnessError.modeMalformed(
           name,
           `it declares subagent [${key}], whose mode [${subagent.mode}] is not configured`,
@@ -194,6 +231,19 @@ export class ModeRegistry {
 
     return subagents;
   }
+}
+
+/**
+ * A mode's `agents` list, held to the agent-id rule exactly: never trimmed and
+ * never case-folded, because a folded lookalike would select another agent.
+ */
+function agentsFor(name: string, declared: unknown): string[] {
+  if (declared === undefined || declared === null) return [];
+  if (!Array.isArray(declared) || !declared.every(isAgentId)) {
+    throw new HarnessError('mode_malformed', `Harness mode [${name}] declares a malformed agents list: each entry must be a lowercase agent id of 1-64 ASCII bytes.`);
+  }
+
+  return [...declared];
 }
 
 function strings(value: readonly unknown[] | undefined): string[] {

@@ -179,6 +179,54 @@ new ModeRegistry({
 A value that is not a map is refused when the mode is resolved, with
 `mode_malformed`.
 
+## Provider and model per mode, subagent and agent
+
+`request.provider` and `request.model` are resolved field by field. For a run:
+
+1. the session override (`usingProvider()` / `usingModel()`);
+2. the mode's `provider` / `model`;
+3. the agent's `provider` / `model` (`agents.<id>` on `AgentRuntime`);
+4. the runtime `config`, then `'unknown'`.
+
+A subagent's child run resolves:
+
+1. the parent session's override, only when the declaration sets
+   `inherit_session_model: true`;
+2. the subagent declaration's `provider` / `model`;
+3. the child's own mode;
+4. the parent's mode, only when the child runs in the parent's agent;
+5. the child agent's default, then the runtime `config`.
+
+A subagent can run as another named agent with `agent`, but only when the parent
+mode lists that agent in `agents`. Any other agent, and any id that is padded or
+not lowercase, is refused with `mode_malformed` when the mode is resolved. Ids
+are never trimmed or case-folded.
+
+```ts
+new ModeRegistry({ agents: {
+  planner: { owner: 'app', modes: { plan: {
+    model: 'big-model',
+    agents: ['researcher'],
+    subagents: { research: { mode: 'research', agent: 'researcher' } },
+  } } },
+  researcher: { owner: 'app', modes: { research: {} } },
+} });
+new AgentRuntime({ /* ... */ agents: {
+  planner: { provider: 'anthropic', model: 'planner-model' },
+  researcher: { provider: 'my-vllm', model: 'small-model', spend_ceiling: 0.25 },
+} });
+```
+
+`spend_ceiling` is the most an agent may spend, in USD, within one run tree. It is
+checked against the tree's own ledger before each model call, so it never opens a
+second account. An agent at its ceiling is refused with
+`agent_spend_ceiling_exceeded`. If its provider reported no cost, it is refused
+with `budget_unpriced`, because the ceiling cannot be measured. A refused
+subagent returns to the parent as an `exhausted` result, and the parent keeps
+running. The ceiling covers one run tree; there is no per-day window.
+
+Every run event of a named agent carries `harnessAgent`. Legacy events do not.
+
 ## What your model client receives
 
 `request.messages` is the thread, oldest first, in the shape the PHP reference
