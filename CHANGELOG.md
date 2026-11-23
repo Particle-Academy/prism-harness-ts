@@ -29,10 +29,18 @@
   applies from the next call; a call already waiting keeps waiting, and a call
   the old policy allowed is refused if the new one no longer does. The policy
   is never sent to the model and has no tool surface.
-- `HarnessTool` takes optional `server` (the MCP server a tool comes from, set
-  by the code that connected it) and `tier` (`read_only`, `write`,
-  `destructive`; advisory). `ToolRegistry.declarations()` lists what the static
-  tools declare.
+- `HarnessTool` takes optional `server` (the MCP server a tool comes from) and
+  `tier` (`read_only`, `write`, `destructive`; advisory).
+  `ToolRegistry.declarations()` lists what the static tools declare.
+- A tool that arrives through `registerProvider` is scoped by the registry:
+  its `server` is the provider's registered name, whatever the tool itself
+  declares. A provider that forgets to set `server`, or a tool that claims
+  another server, can no longer make a provider's tool match an unscoped
+  entry or another server's entry. Only a natively registered tool matches an
+  entry without `server`. Name a provider (`registerProvider(provider, owner,
+  name)`) to give a policy a stable scope to list; an unnamed one is scoped as
+  `provider:<n>`. `ToolAuthorizer`'s call-time wrapper now keeps `server` and
+  `tier`, which it used to drop.
 - Events `tool_auto_allowed`, `tool_approval_asked`, `tool_approved` and
   `tool_denied` for every call to an approval-gated tool, carrying
   `policyRevision`, `server`, `tool`, `argsDigest` (sha256 of the arguments'

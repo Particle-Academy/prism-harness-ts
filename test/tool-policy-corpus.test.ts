@@ -27,13 +27,14 @@ import {
  * Every row's `expected` was written by hand before any language recorded.
  * This runner drives the real runtime with a fake model that asks for the
  * row's calls, then answers. Every tool needs approval by mode; a tool with
- * `server` is provided at resolve time, as an MCP bridge provides one.
+ * `provider` is supplied at resolve time by a provider registered under that
+ * name, as an MCP bridge supplies one, and `server` on it is only its claim.
  */
 interface PolicyCase {
   id: string;
   title: string;
   policy: unknown;
-  tools: { name: string; server?: string; tier?: ToolTier }[];
+  tools: { name: string; server?: string; provider?: string; tier?: ToolTier }[];
   calls: { name: string; args: JsonObject }[];
   then: { policy: unknown } | null;
   expected: unknown;
@@ -47,13 +48,13 @@ async function record(row: PolicyCase): Promise<unknown> {
   const ran: string[] = [];
   const events: HarnessEvent[] = [];
   const registry = new ToolRegistry();
-  const provided: HarnessTool[] = [];
-  for (const spec of row.tools) {
+  const provided = new Map<string, HarnessTool[]>();
+  for (const { provider, ...spec } of row.tools) {
     const tool: HarnessTool = { ...spec, handle: () => { ran.push(spec.name); return 'ok'; } };
-    if (spec.server === undefined) registry.register(tool);
-    else provided.push(tool);
+    if (provider === undefined) registry.register(tool);
+    else provided.set(provider, [...(provided.get(provider) ?? []), tool]);
   }
-  if (provided.length > 0) registry.registerProvider(() => provided, 'mcp');
+  for (const [name, tools] of provided) registry.registerProvider(() => tools, 'mcp', name);
   const modes = new ModeRegistry({
     default: 'guarded',
     modes: { guarded: { system_prompt: 'Careful.', tools: row.tools.map((tool) => tool.name), max_steps: 6, requires_approval: ['*'] } },

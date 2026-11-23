@@ -11,6 +11,7 @@ import {
   MemorySessionStore,
   ModeRegistry,
   PrismHarness,
+  ToolAuthorizer,
   ToolPolicy,
   ToolRegistry,
   argsDigest,
@@ -179,7 +180,7 @@ describe('matching is exact', () => {
   });
 
   it('never lets an unscoped entry match an MCP tool named like a native one', async () => {
-    const mcp = (tools: ToolRegistry, ran: string[]) => { tools.registerProvider(() => [tool('search', ran, { server: 'web' })], 'mcp.web'); };
+    const mcp = (tools: ToolRegistry, ran: string[]) => { tools.registerProvider(() => [tool('search', ran, { server: 'web' })], 'mcp.web', 'web'); };
     const shadow = await world([call('search')], allow({ tool: 'search' }), mcp);
     expect((await shadow.runtime.send(shadow.session, 'go')).finishReason).toBe('awaiting_approval');
     expect(shadow.ran).toEqual([]);
@@ -199,7 +200,7 @@ describe('matching is exact', () => {
   });
 
   it('asks for a destructive MCP tool even when its name is listed, since the provider is only known per session', async () => {
-    const mcp = (tools: ToolRegistry, ran: string[]) => { tools.registerProvider(() => [tool('drop', ran, { server: 'db', tier: 'destructive' })], 'mcp.db'); };
+    const mcp = (tools: ToolRegistry, ran: string[]) => { tools.registerProvider(() => [tool('drop', ran, { server: 'db', tier: 'destructive' })], 'mcp.db', 'db'); };
     const w = await world([call('drop')], allow({ server: 'db', tool: 'drop' }), mcp);
     expect((await w.runtime.send(w.session, 'go')).finishReason).toBe('awaiting_approval');
     expect(w.ran).toEqual([]);
@@ -299,5 +300,94 @@ describe('the record never carries raw arguments', () => {
     expect(canonicalJson({ b: 1.5, a: [1e21, 1e-7, 0.000001, -0, 100] })).toBe('{"a":[1e+21,1e-7,0.000001,0,100],"b":1.5}');
     expect(canonicalJson({ '\u{1F600}': 1, '\uFF5E': 2 })).toBe('{"\u{1F600}":1,"\uFF5E":2}');
     expect(canonicalJson({ s: 'a"b\\c\n\u0001\u2028' })).toBe('{"s":"a\\"b\\\\c\\n\\u0001\u2028"}');
+  });
+});
+
+describe('a tool that reaches the agent through a provider is scoped by the registry', () => {
+  // An MCP bridge registers a PROVIDER. Whether its tools count as MCP tools
+  // must not depend on the bridge remembering to set `server`, or on what a
+  // tool claims about itself: the registry scopes them, with the provider's
+  // registered name. Only a natively registered tool matches an unscoped entry.
+  const fromProvider = (server: string, made: (ran: string[]) => HarnessTool) =>
+    (tools: ToolRegistry, ran: string[]) => { tools.registerProvider(() => [made(ran)], undefined, server); };
+
+  it('a provider tool that declares no server never matches an unscoped entry', async () => {
+    const w = await world([call('read')], allow({ tool: 'read' }), fromProvider('files', (ran) => tool('read', ran)));
+    const response = await w.runtime.send(w.session, 'go');
+
+    expect(response.finishReason).toBe('awaiting_approval');
+    expect(w.ran).toEqual([]);
+    expect(decisions(w.events)).toMatchObject([{ type: 'tool_approval_asked', server: 'files', tool: 'read', decidedBy: 'person' }]);
+  });
+
+  it('a provider tool is matched by its provider name', async () => {
+    const w = await world([call('read')], allow({ server: 'files', tool: 'read' }), fromProvider('files', (ran) => tool('read', ran)));
+    await w.runtime.send(w.session, 'go');
+
+    expect(w.ran).toEqual(['read']);
+    expect(decisions(w.events)).toMatchObject([{ type: 'tool_auto_allowed', server: 'files', tool: 'read', decidedBy: 'policy' }]);
+  });
+
+  it('a provider tool claiming another server gets its provider name instead', async () => {
+    const spoof = fromProvider('scratch', (ran) => tool('read', ran, { server: 'files' }));
+
+    const claimed = await world([call('read')], allow({ server: 'files', tool: 'read' }), spoof);
+    expect((await claimed.runtime.send(claimed.session, 'go')).finishReason).toBe('awaiting_approval');
+    expect(claimed.ran).toEqual([]);
+    expect(decisions(claimed.events)).toMatchObject([{ type: 'tool_approval_asked', server: 'scratch', tool: 'read' }]);
+
+    const unscoped = await world([call('read')], allow({ tool: 'read' }), spoof);
+    expect((await unscoped.runtime.send(unscoped.session, 'go')).finishReason).toBe('awaiting_approval');
+    expect(unscoped.ran).toEqual([]);
+
+    const real = await world([call('read')], allow({ server: 'scratch', tool: 'read' }), spoof);
+    await real.runtime.send(real.session, 'go');
+    expect(real.ran).toEqual(['read']);
+  });
+
+  it('a native tool with the same name as a provider tool is the one an unscoped entry matches', async () => {
+    const both = (tools: ToolRegistry, ran: string[]) => {
+      tools.register({ name: 'read', handle: () => { ran.push('native'); return 'ok'; } });
+      tools.registerProvider(() => [{ name: 'read', handle: () => { ran.push('provider'); return 'ok'; } }], undefined, 'files');
+    };
+    const native = await world([call('read')], allow({ tool: 'read' }), both);
+    await native.runtime.send(native.session, 'go');
+    expect(native.ran).toEqual(['native']);
+    expect(decisions(native.events)).toMatchObject([{ type: 'tool_auto_allowed', server: null }]);
+
+    // A factory resolves AFTER a provider, so here the provider's tool is the
+    // one offered, and an unscoped entry must not reach it.
+    const factory = (tools: ToolRegistry, ran: string[]) => {
+      tools.registerFactory('read', () => ({ name: 'read', handle: () => { ran.push('native'); return 'ok'; } }));
+      tools.registerProvider(() => [{ name: 'read', handle: () => { ran.push('provider'); return 'ok'; } }], undefined, 'files');
+    };
+    const shadowed = await world([call('read')], allow({ tool: 'read' }), factory);
+    expect((await shadowed.runtime.send(shadowed.session, 'go')).finishReason).toBe('awaiting_approval');
+    expect(shadowed.ran).toEqual([]);
+  });
+
+  it('an enabled authorizer keeps the scope and tier the policy decides on', async () => {
+    const build = async (policy: ToolPolicy, register: (tools: ToolRegistry, ran: string[]) => void) => {
+      const w = await world([call('read')], policy, register);
+      const tools = new ToolRegistry();
+      register(tools, w.ran);
+      const runtime = new AgentRuntime({
+        client: model([call('read')], w.requests), modes, tools, toolPolicy: policy,
+        authorizer: new ToolAuthorizer({ enabled: true }), events: (() => { const bus = new HarnessEvents(); bus.listen((event) => { w.events.push(event); }); return bus; })(),
+      });
+      return { ...w, runtime };
+    };
+
+    const mcp = await build(allow({ tool: 'read' }), fromProvider('files', (ran) => tool('read', ran)));
+    expect((await mcp.runtime.send(mcp.session, 'go')).finishReason).toBe('awaiting_approval');
+    expect(mcp.ran).toEqual([]);
+
+    const declared = await build(allow({ tool: 'read' }), (tools, ran) => { tools.register(tool('read', ran, { server: 'files' })); });
+    expect((await declared.runtime.send(declared.session, 'go')).finishReason).toBe('awaiting_approval');
+    expect(declared.ran).toEqual([]);
+
+    const destructive = await build(allow({ server: 'files', tool: 'read' }), fromProvider('files', (ran) => tool('read', ran, { tier: 'destructive' })));
+    expect((await destructive.runtime.send(destructive.session, 'go')).finishReason).toBe('awaiting_approval');
+    expect(destructive.ran).toEqual([]);
   });
 });
