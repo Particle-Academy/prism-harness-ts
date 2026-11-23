@@ -1,4 +1,5 @@
 import type { JsonObject, JsonValue } from './json.js';
+import { usableArguments } from './tool-arguments.js';
 
 /**
  * The rows a run writes to a thread, in the shape the PHP reference stores.
@@ -192,6 +193,24 @@ export function approvalRunSteps(rows: readonly JsonObject[]): number | null {
   return steps;
 }
 
+/**
+ * The ids of stored calls whose arguments cannot be used. Read from the rows as
+ * written, because the thread view has already replaced such arguments with
+ * none, and an approved call must not run on an empty set nobody sent.
+ */
+export function unusableStoredCalls(rows: readonly JsonObject[]): Set<string> {
+  const unusable = new Set<string>();
+
+  for (const row of rows) {
+    if (row.type !== 'assistant') continue;
+    for (const call of list(row.tool_calls)) {
+      if (usableArguments(call.arguments) === null) unusable.add(text(call.id));
+    }
+  }
+
+  return unusable;
+}
+
 function normalise(row: JsonObject, view: JsonObject[]): JsonObject | null {
   switch (row.type) {
     case 'assistant':
@@ -200,7 +219,7 @@ function normalise(row: JsonObject, view: JsonObject[]): JsonObject | null {
         list(row.tool_calls).map((call) => ({
           id: text(call.id),
           name: text(call.name),
-          arguments: isObject(call.arguments) ? call.arguments : {},
+          arguments: usableArguments(call.arguments) ?? {},
           resultId: nullableText(call.result_id),
           reasoningId: nullableText(call.reasoning_id),
           reasoningSummary: Array.isArray(call.reasoning_summary) ? call.reasoning_summary : null,

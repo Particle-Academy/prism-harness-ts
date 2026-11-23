@@ -12,7 +12,9 @@ import {
   type AssistantRow,
   type ToolResultEntry,
   type ToolResultRow,
+  unusableStoredCalls,
 } from './thread-rows.js';
+import { usableArguments } from './tool-arguments.js';
 import { admitAttachments } from './attachments.js';
 import { HarnessError } from './errors.js';
 import type { HarnessEvents } from './events.js';
@@ -660,7 +662,16 @@ export class AgentRuntime {
       text = response.text;
       finishReason = response.finishReason;
 
-      const toolCalls = response.toolCalls ?? [];
+      // A client can hand back arguments it could not parse. Such a call is
+      // recorded with none, asks nobody and runs nothing: the model is told.
+      const unusable = new Set<LlmToolCall>();
+      const toolCalls = (response.toolCalls ?? []).map((call) => {
+        const usable = usableArguments(call.arguments);
+        if (usable !== null) return usable === call.arguments ? call : { ...call, arguments: usable };
+        const recorded: LlmToolCall = { ...call, arguments: {} };
+        unusable.add(recorded);
+        return recorded;
+      });
       if (steps !== undefined) {
         // Provider state names reasoning `thinking` (Anthropic, as prism-ts
         // records it); the client returns a whole response, so each is one delta.
@@ -669,7 +680,7 @@ export class AgentRuntime {
         if (response.text !== '') steps.text(response.text);
       }
       const failedFinish = finishReason === 'error' || finishReason === 'unknown' ? finishReason : null;
-      const gated = failedFinish === null ? toolCalls.filter((call) => mode.needsApproval(call.name)) : [];
+      const gated = failedFinish === null ? toolCalls.filter((call) => !unusable.has(call) && mode.needsApproval(call.name)) : [];
       const requests: ApprovalRequestEntry[] = gated.map((call) => ({
         approval_id: `apr_${randomUUID().replaceAll('-', '')}`,
         tool_call_id: call.id,
@@ -723,6 +734,12 @@ export class AgentRuntime {
       for (const call of toolCalls) steps?.toolCall(call.id, call.name, call.arguments);
 
       for (const call of toolCalls.filter((candidate) => !gated.includes(candidate))) {
+        if (unusable.has(call)) {
+          const entry = toolResultEntry(call, `Not run: the arguments for ${call.name} are not a JSON object.`);
+          steps?.toolResult(call.id, entry.result, { ok: false, code: 'tool_failed', refused: false });
+          results.push(entry);
+          continue;
+        }
         called.push(call.name);
         const invoked = await this.#invoke(offered, call);
         steps?.toolResult(call.id, invoked.entry.result, invoked.outcome);
@@ -812,7 +829,11 @@ export class AgentRuntime {
         const approvalId = work.approvalIds.get(call.id);
         const decision = approvalId === undefined ? undefined : work.decisions.get(approvalId);
 
-        if (decision?.approved === true) {
+        if (decision?.approved === true && work.unusable.has(call.id)) {
+          const entry = toolResultEntry(input, `Not run: the arguments for ${call.name} are not a JSON object.`);
+          steps?.toolResult(call.id, entry.result, { ok: false, code: 'tool_failed', refused: false });
+          resolved.push(entry);
+        } else if (decision?.approved === true) {
           called.push(call.name);
           const invoked = await this.#runApproved(bounded, input);
           steps?.toolResult(call.id, invoked.entry.result, invoked.outcome);
@@ -848,6 +869,7 @@ export class AgentRuntime {
     decisions: Map<string, ApprovalDecisionEntry>;
     approvalIds: Map<string, string>;
     scope: ReturnType<typeof approvalToolScope>;
+    unusable: Set<string>;
   } | null> {
     const rows = (await session.thread().messages()).map((entry) => entry.message);
     const view = threadView(rows);
@@ -871,7 +893,7 @@ export class AgentRuntime {
       (call) => !results.has(call.id) && (approvalIds.has(call.id) || mode.needsApproval(call.name)),
     );
 
-    return calls.length === 0 ? null : { calls, results, decisions, approvalIds, scope: approvalToolScope(rows) };
+    return calls.length === 0 ? null : { calls, results, decisions, approvalIds, scope: approvalToolScope(rows), unusable: unusableStoredCalls(rows) };
   }
 
   /**
