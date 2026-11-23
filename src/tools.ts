@@ -1,3 +1,4 @@
+import type { ToolDeclaration, ToolTier } from './tool-policy.js';
 import type { JsonObject } from './json.js';
 import { HarnessError } from './errors.js';
 import type { Session } from './session.js';
@@ -15,6 +16,15 @@ import { RegistrationCollision, registrationOwner } from './registration.js';
 export interface HarnessTool {
   readonly name: string;
   readonly description?: string;
+  /**
+   * The MCP server this tool comes from, set by the code that connected the
+   * server, never taken from the server's own answer. Absent for a native
+   * harness tool. A tool policy entry without `server` never matches a tool
+   * that has one.
+   */
+  readonly server?: string;
+  /** Advisory: how much this tool can change. `destructive` is never auto-allowed. */
+  readonly tier?: ToolTier;
   handle(args: JsonObject): unknown | Promise<unknown>;
 }
 
@@ -130,6 +140,15 @@ export class ToolRegistry {
     this.#metadata.set(name, { owner: label, source });
   }
   #strict(): boolean { return this.namespace !== null || this.#refuseDuplicates; }
+
+  /** What the statically registered tools declare about themselves. */
+  declarations(): ToolDeclaration[] {
+    return [...this.#tools.values()].map((tool) => ({
+      name: tool.name,
+      ...(tool.server === undefined ? {} : { server: tool.server }),
+      ...(tool.tier === undefined ? {} : { tier: tool.tier }),
+    }));
+  }
 
   /** Every name this registry can produce without a session. */
   names(): string[] {

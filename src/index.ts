@@ -44,7 +44,32 @@ export type {
 } from './tools.js';
 
 export { HarnessEvents } from './events.js';
-export type { HarnessAgentTag, HarnessEvent, HarnessListener, RunFailed, RunFinished, RunResumed, RunStarted, RunStepped } from './events.js';
+export type {
+  HarnessAgentTag,
+  HarnessEvent,
+  HarnessListener,
+  RunFailed,
+  RunFinished,
+  RunResumed,
+  RunStarted,
+  RunStepped,
+  ToolApprovalAsked,
+  ToolApproved,
+  ToolAutoAllowed,
+  ToolDecisionEvent,
+  ToolDenied,
+} from './events.js';
+
+export {
+  TOOL_TIERS,
+  ToolPolicy,
+  argsDigest,
+  canonicalJson,
+  isPersonOnlyTool,
+  isWellFormedToolName,
+  normaliseToolName,
+} from './tool-policy.js';
+export type { ToolDeclaration, ToolPolicyEntry, ToolPolicyJson, ToolTier } from './tool-policy.js';
 
 export { RUN_STEP_CONTRACT_VERSION, RUN_STEP_ERROR_MESSAGE } from './steps.js';
 export type {

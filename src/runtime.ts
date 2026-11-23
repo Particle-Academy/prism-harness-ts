@@ -15,7 +15,8 @@ import {
 } from './thread-rows.js';
 import { admitAttachments } from './attachments.js';
 import { HarnessError } from './errors.js';
-import type { HarnessEvents } from './events.js';
+import type { HarnessEvents, ToolDecisionEvent } from './events.js';
+import { ToolPolicy, argsDigest } from './tool-policy.js';
 import type { AgentMode, ModeRegistry } from './modes.js';
 import type { Session } from './session.js';
 import { schemaName, schemaProblems } from './structured.js';
@@ -155,6 +156,13 @@ export interface AgentRuntimeOptions {
    * upgraded. `streamSteps()` and `streamDecision()` yield steps either way.
    */
   stepEvents?: boolean;
+  /**
+   * Which approval-gated tools run without asking a person (G-326). Owned by
+   * the HOST: passed per launch and replaced with `setToolPolicy()`. Never
+   * sent to the model and never reachable from a tool. Defaults to
+   * `ToolPolicy.none()`: everything that needs approval asks.
+   */
+  toolPolicy?: ToolPolicy;
 }
 
 /** One human decision on a pending approval. `approvalId` is `PendingApproval.id`. */
@@ -245,6 +253,7 @@ export class AgentRuntime {
   readonly #agents: Record<string, RuntimeConfig>;
   readonly #narrowRequestedTools: boolean;
   readonly #stepEvents: boolean;
+  #toolPolicy: ToolPolicy;
 
   constructor(options: AgentRuntimeOptions) {
     if (options.stepEvents !== undefined && typeof options.stepEvents !== 'boolean') throw new TypeError('stepEvents must be a boolean');
@@ -264,6 +273,56 @@ export class AgentRuntime {
       validateAgent(agent); validateRuntimeConfig(config); return [agent, { ...config }];
     }));
     validateRuntimeConfig(this.#config);
+    this.#toolPolicy = this.#admitPolicy(options.toolPolicy ?? ToolPolicy.none());
+  }
+
+  /** The host tool policy in force. */
+  get toolPolicy(): ToolPolicy {
+    return this.#toolPolicy;
+  }
+
+  /**
+   * Replace the host tool policy (G-326).
+   *
+   * Applies from the next tool call. A call already waiting on a person keeps
+   * waiting: a policy that would now allow it does not run it. A call the old
+   * policy allowed that has not started yet is refused, not run, when the new
+   * policy no longer allows it, so a revoke takes effect at once.
+   *
+   * Validated against the registered tools' declarations: a policy naming a
+   * tool that declares `destructive` is refused and the old policy stays.
+   *
+   * @throws HarnessError `tool_policy_refused`
+   */
+  setToolPolicy(policy: ToolPolicy): void {
+    this.#toolPolicy = this.#admitPolicy(policy);
+  }
+
+  #admitPolicy(policy: ToolPolicy): ToolPolicy {
+    if (!(policy instanceof ToolPolicy)) throw new TypeError('toolPolicy must be a ToolPolicy.');
+
+    return ToolPolicy.fromJson(policy.toJSON(), this.#tools.declarations());
+  }
+
+  #toolDecision(
+    type: 'tool_auto_allowed' | 'tool_approval_asked' | 'tool_approved' | 'tool_denied',
+    session: Session,
+    runId: string,
+    call: { id: string; name: string; arguments: unknown },
+    tool: HarnessTool | undefined,
+    decidedBy: ToolDecisionEvent['decidedBy'],
+  ): void {
+    this.#events?.emit({
+      type,
+      runId,
+      sessionKey: session.key(),
+      policyRevision: this.#toolPolicy.revision,
+      server: tool?.server ?? null,
+      tool: call.name,
+      argsDigest: argsDigest(call.arguments),
+      decidedBy,
+      harnessAgent: session.agent,
+    });
   }
 
   #setting<K extends keyof RuntimeConfig>(session: Session, key: K): RuntimeConfig[K] {
@@ -711,7 +770,20 @@ export class AgentRuntime {
         if (response.text !== '') steps.text(response.text);
       }
       const failedFinish = finishReason === 'error' || finishReason === 'unknown' ? finishReason : null;
-      const gated = failedFinish === null ? toolCalls.filter((call) => mode.needsApproval(call.name)) : [];
+      // The host policy is read per call, never cached for the run, so a
+      // replacement applies from the next call (G-326).
+      const autoAllowed = new Set<LlmToolCall>();
+      const gated = failedFinish === null
+        ? toolCalls.filter((call) => {
+          if (!mode.needsApproval(call.name)) return false;
+          const tool = offered.find((candidate) => candidate.name === call.name);
+          if (tool !== undefined && this.#toolPolicy.allows(tool)) {
+            autoAllowed.add(call);
+            return false;
+          }
+          return true;
+        })
+        : [];
       const requests: ApprovalRequestEntry[] = gated.map((call) => ({
         approval_id: `apr_${randomUUID().replaceAll('-', '')}`,
         tool_call_id: call.id,
@@ -764,7 +836,22 @@ export class AgentRuntime {
 
       for (const call of toolCalls) steps?.toolCall(call.id, call.name, call.arguments);
 
+      for (const call of gated) this.#toolDecision('tool_approval_asked', session, runId, call, offered.find((tool) => tool.name === call.name), 'person');
+
       for (const call of toolCalls.filter((candidate) => !gated.includes(candidate))) {
+        if (autoAllowed.has(call)) {
+          // Checked again at the moment it would run: a revoke since the step
+          // began refuses it rather than letting the old answer stand.
+          const tool = offered.find((candidate) => candidate.name === call.name);
+          if (tool === undefined || !this.#toolPolicy.allows(tool)) {
+            this.#toolDecision('tool_denied', session, runId, call, tool, 'policy');
+            const entry = toolResultEntry(call, 'Not run: this call needs approval, and the tool policy no longer allows it.');
+            steps?.toolResult(call.id, entry.result, REFUSED_CALL);
+            results.push(entry);
+            continue;
+          }
+          this.#toolDecision('tool_auto_allowed', session, runId, call, tool, 'policy');
+        }
         called.push(call.name);
         const invoked = await this.#invoke(offered, call);
         steps?.toolResult(call.id, invoked.entry.result, invoked.outcome);
@@ -854,13 +941,16 @@ export class AgentRuntime {
         const approvalId = work.approvalIds.get(call.id);
         const decision = approvalId === undefined ? undefined : work.decisions.get(approvalId);
 
+        const declared = bounded.find((tool) => tool.name === call.name);
         if (decision?.approved === true) {
+          this.#toolDecision('tool_approved', live, runId, input, declared, 'person');
           called.push(call.name);
           const invoked = await this.#runApproved(bounded, input);
           steps?.toolResult(call.id, invoked.entry.result, invoked.outcome);
           resolved.push(invoked.entry);
         } else {
           // Denied, or never answered: either way not approved, and refused.
+          this.#toolDecision('tool_denied', live, runId, input, declared, 'person');
           const entry = toolResultEntry(input, decision === undefined ? 'No approval response provided' : (decision.reason ?? 'User denied tool execution'));
           steps?.toolResult(call.id, entry.result, { ok: false, code: 'approval_denied', refused: true });
           resolved.push(entry);
