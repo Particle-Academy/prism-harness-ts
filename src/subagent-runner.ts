@@ -2,7 +2,7 @@ import type { JsonObject } from './json.js';
 import type { PrismHarness } from './harness.js';
 import type { AgentRuntime } from './runtime.js';
 import type { Session } from './session.js';
-import { MAX_DEPTH, RunContext, type Subagent } from './subagents.js';
+import { MAX_DEPTH, RunContext, type ModelBinding, type Subagent } from './subagents.js';
 import type { HarnessTool } from './tools.js';
 import { HarnessError } from './errors.js';
 import { markRefused } from './refusals.js';
@@ -92,7 +92,16 @@ export class SubagentRunner {
       );
     }
 
-    const childContext = context.forChild(subagent, parentRunId);
+    // The child runs as the agent its declaration names (which the parent mode
+    // had to list), else as the parent's.
+    const agent = subagent.agent ?? parent.agent;
+    let binding: ModelBinding;
+    try {
+      binding = await this.#binding(subagent, parent, agent);
+    } catch (error) {
+      return refused(subagent.name, runId, parentRunId, 'failed', error instanceof Error ? error.message : String(error));
+    }
+    const childContext = context.forChild(subagent, parentRunId, binding);
 
     // Refused BEFORE the child's address is built. Two modes naming each other
     // as subagents form a cycle budgets would eventually stop — but only after
@@ -110,14 +119,13 @@ export class SubagentRunner {
     }
 
     const child = this.harness
-      .pending(parent.participant, parent.agent, parent.actor)
+      .pending(parent.participant, agent, parent.actor)
       .session(subagent.scopeUnder(parent.scope));
 
-    // The child's authority comes from ITS mode, not the parent's.
+    // The child's authority comes from ITS mode, not the parent's. Its
+    // provider and model come from the binding on its context: the parent's
+    // session override is NOT copied onto the child session (G-321 E).
     await child.usingMode(subagent.mode);
-    const provider = await parent.provider(), model = await parent.model();
-    if (parent.agent === null || provider !== null) await child.usingProvider(provider ?? 'unknown');
-    if (parent.agent === null || model !== null) await child.usingModel(model ?? 'unknown');
 
     try {
       const response = await this.runtime.send(child, task, undefined, childContext);
@@ -137,15 +145,46 @@ export class SubagentRunner {
     } catch (error) {
       // Framed, not thrown. Tearing down the parent run would discard work it
       // has already done, and "that subagent failed" is something the parent
-      // can act on.
+      // can act on. A child agent stopped by its own spend ceiling is the tree
+      // refusing to let it spend, not the child breaking: reported as such, so
+      // the parent does not retry it.
+      const ceiling = error instanceof HarnessError
+        && (error.code === 'agent_spend_ceiling_exceeded' || error.code === 'budget_unpriced');
+
       return refused(
         subagent.name,
         runId,
         parentRunId,
-        'failed',
+        ceiling ? 'exhausted' : 'failed',
         error instanceof Error ? error.message : String(error),
       );
     }
+  }
+
+  /** What the child resolves its provider and model from; see `ModelBinding`. */
+  async #binding(subagent: Subagent, parent: Session, agent: string | null): Promise<ModelBinding> {
+    const inherit = subagent.inheritSessionModel;
+    const sameAgent = agent === parent.agent;
+    // A caller may run a subagent beneath a session that is not itself in a
+    // configured mode (no run of its own). Then there is no parent mode to
+    // fall back to; any OTHER failure to resolve it is still a failure.
+    const parentMode = sameAgent
+      ? await this.runtime.modeOf(parent).catch((error: unknown) => {
+        if (error instanceof HarnessError && error.code === 'mode_not_configured') return null;
+        throw error;
+      })
+      : null;
+
+    return {
+      session: {
+        provider: inherit ? await parent.provider() : null,
+        model: inherit ? await parent.model() : null,
+      },
+      declared: { provider: subagent.provider, model: subagent.model },
+      // The parent mode's binding belongs to the parent's agent; it does not
+      // cross into a delegated agent, whose own default applies instead.
+      parentMode: { provider: parentMode?.provider ?? null, model: parentMode?.model ?? null },
+    };
   }
 }
 

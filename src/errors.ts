@@ -74,7 +74,15 @@ export type HarnessErrorCode =
   /** A structured turn came back with text holding no readable document. */
   | 'structured_unreadable'
   /** A structured turn returned a document its schema refuses. */
-  | 'structured_schema_violation';
+  | 'structured_schema_violation'
+  /**
+   * A named agent's run would spend under a ceiling no provider gives numbers
+   * for: it reported no cost, so the ceiling cannot be enforced (G-321 E).
+   * The same code the PHP reference uses for an unpriced capped call.
+   */
+  | 'budget_unpriced'
+  /** A named agent reached its `spend_ceiling` in this run tree (G-321 E). */
+  | 'agent_spend_ceiling_exceeded';
 
 export interface HarnessErrorOptions {
   cause?: unknown;

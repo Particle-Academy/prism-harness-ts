@@ -19,7 +19,7 @@ import type { HarnessEvents } from './events.js';
 import type { AgentMode, ModeRegistry } from './modes.js';
 import type { Session } from './session.js';
 import { schemaName, schemaProblems } from './structured.js';
-import { RunBudget, RunContext } from './subagents.js';
+import { RunBudget, RunContext, type ModelBinding } from './subagents.js';
 import type { HarnessTool, ToolAuthorizer, ToolRegistry } from './tools.js';
 import { settleWithRefusalScope } from './refusals.js';
 import { RunStepTagger, StepChannel, type RunStep, type ToolCallOutcome } from './steps.js';
@@ -190,6 +190,15 @@ export interface RuntimeConfig {
   max_output_tokens_per_call?: number | null;
   lock_ttl?: number;
   lock_wait?: number;
+  /**
+   * The most a named agent may spend, in USD, within one run TREE (G-321 E).
+   *
+   * Evaluated against the tree's own ledger, so it narrows the tree's spend and
+   * never opens a second account. Per tree only: a per-day window is not
+   * implemented. A provider that reports no cost cannot be held to it, so an
+   * agent with a ceiling fails closed (`budget_unpriced`) once one does.
+   */
+  spend_ceiling?: number | null;
 }
 
 export interface EffectiveTool {
@@ -270,6 +279,30 @@ export class AgentRuntime {
       budget.maxCostUsd, budget.maxSeconds,
       output == null ? budget.maxOutputTokensPerCall : Math.min(budget.maxOutputTokensPerCall ?? output, output),
     ));
+  }
+
+  /** The mode a session's next run resolves to, as the runtime would resolve it. */
+  async modeOf(session: Session): Promise<AgentMode> {
+    return this.#modes.forAgent(session.agent).resolve(await session.mode());
+  }
+
+  /**
+   * The provider and model a run ACTUALLY requests, field by field (G-321 E).
+   *
+   * Root run: session override > mode > agent default > global.
+   * Subagent child (a context carrying a binding): the parent's session
+   * override only when the subagent asked to inherit it > the subagent
+   * declaration > the child's mode > the parent's mode (same agent only) >
+   * the child agent's default > global. The child session's own override
+   * slot is not read for a child: the runner owns that address.
+   */
+  async #choose(session: Session, mode: AgentMode, binding: ModelBinding | null, key: 'provider' | 'model'): Promise<string> {
+    const configured = this.#setting(session, key) ?? null;
+    const chosen = binding === null
+      ? (await session[key]()) ?? mode[key] ?? configured
+      : binding.session[key] ?? binding.declared[key] ?? mode[key] ?? binding.parentMode[key] ?? configured;
+
+    return chosen ?? 'unknown';
   }
 
   /** Inspect the offer without a run/handler or logical mutation; reads may purge expired entries. */
@@ -517,12 +550,14 @@ export class AgentRuntime {
     // and it should not cost a run, events or budget.
     const attachments = admitAttachments(prompt, additionalContent);
     const mode = this.#modes.forAgent(session.agent).resolve(await session.mode());
-    const provider = (await session.provider()) ?? this.#setting(session, 'provider') ?? 'unknown';
-    const model = (await session.model()) ?? this.#setting(session, 'model') ?? 'unknown';
-    const runId = stepping?.runId ?? randomUUID();
     // A turnId/actor-only context is METADATA: the run takes exactly the path
     // and budget it would take with no context at all.
     const execution = executionContext(context);
+    const binding = execution?.binding ?? null;
+    const provider = await this.#choose(session, mode, binding, 'provider');
+    const model = await this.#choose(session, mode, binding, 'model');
+    const runId = stepping?.runId ?? randomUUID();
+    const tag = session.agent === null ? {} : { harnessAgent: session.agent };
     const run = this.#boundedRun(session, execution ?? RunContext.root(runId, new RunBudget(mode.maxSteps)));
     const thread = session.thread();
     const steps = stepping?.tagger;
@@ -534,7 +569,7 @@ export class AgentRuntime {
       );
     }
 
-    steps?.bind(session.key(), runId, run.parentRunId, run.rootRunId);
+    steps?.bind(session.key(), runId, run.parentRunId, run.rootRunId, session.agent);
     await session.beginRun(runId, mode.name, provider, model);
     this.#events?.emit({
       // A parked run continued under its own id has already STARTED once; a
@@ -548,6 +583,7 @@ export class AgentRuntime {
       rootRunId: run.rootRunId,
       depth: run.depth,
       at: new Date().toISOString(),
+      ...tag,
     });
 
     try {
@@ -605,6 +641,7 @@ export class AgentRuntime {
         failure,
         steps: run.ledger.steps,
         at: new Date().toISOString(),
+        ...tag,
       });
 
       throw error;
@@ -638,6 +675,11 @@ export class AgentRuntime {
         return await this.#finish(session, runId, called, 'budget_exhausted', text, run, exhausted);
       }
 
+      // A named agent's ceiling, on the same root ledger: refused before the
+      // call, and only this agent is refused (G-321 E).
+      const ceiling = session.agent === null ? null : (this.#agents[session.agent]?.spend_ceiling ?? null);
+      if (session.agent !== null && ceiling !== null) run.ledger.assertAgentCeiling(session.agent, ceiling);
+
       steps?.stepStart();
       const response = await this.#client({
         systemPrompt: mode.systemPrompt,
@@ -651,7 +693,7 @@ export class AgentRuntime {
       });
 
       run.ledger.recordSteps(1);
-      run.ledger.recordCost(response.costUsd ?? null);
+      run.ledger.recordCost(response.costUsd ?? null, session.agent);
       text = response.text;
       finishReason = response.finishReason;
 
@@ -972,6 +1014,7 @@ export class AgentRuntime {
       steps: run.ledger.steps,
       costUsd: run.ledger.unmeteredRuns > 0 ? null : run.ledger.costUsd,
       at: new Date().toISOString(),
+      ...(session.agent === null ? {} : { harnessAgent: session.agent }),
     });
 
     return {
@@ -1013,6 +1056,10 @@ function validateRuntimeConfig(config: RuntimeConfig): void {
   for (const key of ['lock_ttl', 'lock_wait'] as const) {
     const value = config[key];
     if (value !== undefined && (!Number.isSafeInteger(value) || value < (key === 'lock_ttl' ? 1 : 0))) throw new TypeError('Agent lock settings must be whole seconds with positive TTL and nonnegative wait.');
+  }
+  const ceiling: unknown = config.spend_ceiling;
+  if (ceiling !== undefined && ceiling !== null && (typeof ceiling !== 'number' || !Number.isFinite(ceiling) || ceiling <= 0)) {
+    throw new TypeError('Agent spend_ceiling must be a positive finite number of USD or null.');
   }
 }
 

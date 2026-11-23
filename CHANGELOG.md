@@ -1,5 +1,42 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Modes take optional `provider`, `model` and `agents` keys. Subagent declarations
+  take optional `provider`, `model`, `agent` and `inherit_session_model` keys
+  (G-321 E). For a run, the order is session > mode > agent > global.
+- A subagent may run as another named agent with `agent`, but only when the parent
+  mode lists that agent in `agents`. An unlisted agent, or a padded or mixed-case
+  id, is refused with `mode_malformed` when the mode is resolved. Ids are never
+  trimmed or case-folded.
+- `agents.<id>.spend_ceiling` on `AgentRuntime` caps what that agent spends in one
+  run tree. It is checked against the same root ledger before each model call. An
+  agent over its ceiling is refused with `agent_spend_ceiling_exceeded`. One whose
+  provider reported no cost is refused with `budget_unpriced`. A refused subagent
+  returns to its parent as `exhausted`. Per-day windows are not implemented.
+- Every run event of a named agent carries `harnessAgent`. Legacy events are
+  unchanged.
+- `RunLedger.agentCostUsd()`, `agentUnmeteredRuns()` and `assertAgentCeiling()`.
+  `RunLedger.recordCost()` takes an optional agent label.
+- `AgentRuntime.modeOf()`, `RunContext.binding`, a `binding` argument on
+  `forChild()`, and the `ModelBinding`, `ModelChoice` and `HarnessAgentTag` types.
+- `isAgentId()`.
+
+### Changed (breaking)
+
+- **A subagent's child no longer inherits the parent session's provider/model
+  override.** `SubagentRunner` used to copy the parent's override onto the child
+  session. For a legacy parent with no override, it wrote `'unknown'`. It now
+  writes nothing. The child resolves its own subagent declaration first, then its
+  own mode, then the parent's mode (same agent only), then the agent default and
+  the global default. To keep the old behaviour, set
+  `inherit_session_model: true` on the declaration. The child session's own
+  override slot is not read for a subagent run, so a value an earlier version
+  wrote there has no effect. The rule is the same in PHP and Python and is pinned
+  by the `harness-agent-binding` corpus.
+
 ## 0.11.0
 
 ### Added

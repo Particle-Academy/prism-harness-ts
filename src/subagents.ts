@@ -1,3 +1,5 @@
+import { HarnessError } from './errors.js';
+
 /**
  * How deep a run tree may nest.
  *
@@ -103,6 +105,11 @@ export class RunLedger {
 
   #unmeteredRuns = 0;
 
+  /** Spend attributed to each named agent, in the SAME account as the tree total. */
+  readonly #agentCost = new Map<string, number>();
+
+  readonly #agentUnmetered = new Map<string, number>();
+
   #cancelled = false;
 
   #cancelReason: string | null = null;
@@ -146,14 +153,56 @@ export class RunLedger {
    * Counted separately so `exhaustion()` can say the cap is UNENFORCEABLE
    * instead of quietly failing open.
    */
-  recordCost(usd: number | null): void {
+  recordCost(usd: number | null, agent: string | null = null): void {
     if (usd === null) {
       this.#unmeteredRuns += 1;
+      if (agent !== null) this.#agentUnmetered.set(agent, (this.#agentUnmetered.get(agent) ?? 0) + 1);
 
       return;
     }
 
     this.#costUsd += Math.max(0, usd);
+    if (agent !== null) this.#agentCost.set(agent, (this.#agentCost.get(agent) ?? 0) + Math.max(0, usd));
+  }
+
+  /**
+   * What one named agent has spent in this tree.
+   *
+   * A LABEL on the tree's own account, not a second account: the same charge
+   * already counts toward `costUsd`, so an agent ceiling can only narrow what
+   * the tree may spend, never add to it.
+   */
+  agentCostUsd(agent: string): number {
+    return this.#agentCost.get(agent) ?? 0;
+  }
+
+  /** Calls by one named agent that reported no cost. */
+  agentUnmeteredRuns(agent: string): number {
+    return this.#agentUnmetered.get(agent) ?? 0;
+  }
+
+  /**
+   * Refuse the next call by `agent` when it has reached its ceiling (G-321 E).
+   *
+   * Checked BEFORE the call, like every budget here. An agent whose provider
+   * has reported no cost cannot be held to a ceiling at all, so that fails
+   * CLOSED as `budget_unpriced` rather than spending against a cap nobody can
+   * measure.
+   */
+  assertAgentCeiling(agent: string, ceilingUsd: number): void {
+    if (this.agentUnmeteredRuns(agent) > 0) {
+      throw new HarnessError(
+        'budget_unpriced',
+        `Agent [${agent}] has a spend ceiling, but its provider reported no cost, so spend against the ceiling is unknown.`,
+      );
+    }
+    const spent = this.agentCostUsd(agent);
+    if (spent >= ceilingUsd) {
+      throw new HarnessError(
+        'agent_spend_ceiling_exceeded',
+        `Agent [${agent}] reached its spend ceiling (${spent.toFixed(4)} of ${ceilingUsd.toFixed(4)} USD used in this run tree).`,
+      );
+    }
   }
 
   /**
@@ -247,6 +296,20 @@ export class Subagent {
      * conversation instead of starting a fresh one. Defaults to the name.
      */
     readonly scopeSuffix: string | null = null,
+    /** The provider this subagent runs on, above any mode's (G-321 E). */
+    readonly provider: string | null = null,
+    /** The model this subagent runs on, above any mode's. */
+    readonly model: string | null = null,
+    /**
+     * The named agent the child runs as. Only an agent the PARENT MODE lists
+     * in its `agents`; the mode registry refuses any other.
+     */
+    readonly agent: string | null = null,
+    /**
+     * Opt in to the parent SESSION's provider/model override. Off by default:
+     * an override belongs to the session that set it.
+     */
+    readonly inheritSessionModel: boolean = false,
   ) {}
 
   /**
@@ -264,10 +327,28 @@ export class Subagent {
   }
 }
 
-export function subagentFromConfig(name: string, config: Record<string, unknown>): Subagent {
+/** `modeName` names the declaring mode in a refusal; it defaults to the subagent's own name. */
+export function subagentFromConfig(name: string, config: Record<string, unknown>, modeName: string = name): Subagent {
   const description = config.description;
   const mode = config.mode;
   const scope = config.scope;
+  const malformed = (detail: string) => new HarnessError('mode_malformed', `Harness mode [${modeName}] declares subagent [${name}] with ${detail}.`);
+  for (const key of ['provider', 'model'] as const) {
+    const value = config[key];
+    if (value !== undefined && value !== null && (typeof value !== 'string' || value === '')) {
+      throw malformed('a malformed provider/model: expected a nonempty string or null');
+    }
+  }
+  const inherit = config.inherit_session_model;
+  if (inherit !== undefined && typeof inherit !== 'boolean') {
+    throw malformed('a malformed inherit_session_model: expected a boolean');
+  }
+  // Held to the agent-id rule EXACTLY: never trimmed and never case-folded, so
+  // a near-miss is a configuration error rather than another agent's authority.
+  const agent = config.agent;
+  if (agent !== undefined && agent !== null && !isAgentId(agent)) {
+    throw malformed('a malformed agent id: agent ids are lowercase identifiers of 1-64 ASCII bytes');
+  }
 
   return new Subagent(
     name,
@@ -277,7 +358,42 @@ export function subagentFromConfig(name: string, config: Record<string, unknown>
     typeof mode === 'string' && mode !== '' ? mode : name,
     RunBudget.fromConfig(config),
     typeof scope === 'string' ? scope : null,
+    (config.provider as string | null | undefined) ?? null,
+    (config.model as string | null | undefined) ?? null,
+    (agent as string | null | undefined) ?? null,
+    inherit === true,
   );
+}
+
+/** The agent-id rule `validateAgent()` enforces, as a predicate. */
+export function isAgentId(value: unknown): value is string {
+  return typeof value === 'string' && /^[a-z][a-z0-9_-]{0,63}$/.exec(value)?.[0] === value;
+}
+
+/** A provider and a model, either of which may be unset. */
+export interface ModelChoice {
+  provider: string | null;
+  model: string | null;
+}
+
+/**
+ * What a SUBAGENT's child run resolves its provider and model from, besides its
+ * own mode and agent (G-321 E). Built by `SubagentRunner`; per field:
+ *
+ *   session (only when the subagent asked to inherit it)
+ *   > declared (the subagent declaration)
+ *   > the child's own mode
+ *   > parentMode (only when the child runs in the parent's agent)
+ *   > the child agent's default > global.
+ *
+ * The child session's own override slot is not consulted: the runner owns that
+ * address, and copying the parent's override into it is exactly the drift this
+ * replaced.
+ */
+export interface ModelBinding {
+  session: ModelChoice;
+  declared: ModelChoice;
+  parentMode: ModelChoice;
 }
 
 /**
@@ -318,6 +434,8 @@ export class RunContext {
     readonly parentRunId: string | null = null,
     readonly depth: number = 0,
     metadata: RunMetadata = {},
+    /** Set for a subagent's child run; see `ModelBinding`. Null resolves like a root run. */
+    readonly binding: ModelBinding | null = null,
   ) {
     // Runtime guards: these arrive from an app's request handling, and an
     // annotation stops nothing that came out of a JSON body.
@@ -350,17 +468,17 @@ export class RunContext {
 
   /** The same run, serving an ACP turn. */
   withTurn(turnId: string | null): RunContext {
-    return new RunContext(this.ledger, this.budget, this.parentRunId, this.depth, { turnId, actor: this.actor, metadataOnly: this.metadataOnly });
+    return new RunContext(this.ledger, this.budget, this.parentRunId, this.depth, { turnId, actor: this.actor, metadataOnly: this.metadataOnly }, this.binding);
   }
 
   /** The same run, acting for an actor the application has authorized. */
   withActor(actor: string | null): RunContext {
-    return new RunContext(this.ledger, this.budget, this.parentRunId, this.depth, { turnId: this.turnId, actor, metadataOnly: this.metadataOnly });
+    return new RunContext(this.ledger, this.budget, this.parentRunId, this.depth, { turnId: this.turnId, actor, metadataOnly: this.metadataOnly }, this.binding);
   }
 
   /** The same run tree under a different budget, keeping its metadata. */
   withBudget(budget: RunBudget): RunContext {
-    return new RunContext(this.ledger, budget, this.parentRunId, this.depth, { turnId: this.turnId, actor: this.actor, metadataOnly: this.metadataOnly });
+    return new RunContext(this.ledger, budget, this.parentRunId, this.depth, { turnId: this.turnId, actor: this.actor, metadataOnly: this.metadataOnly }, this.binding);
   }
 
   get rootRunId(): string {
@@ -378,13 +496,14 @@ export class RunContext {
    * ledger would let every node report itself inside budget while the tree
    * spent without limit.
    */
-  forChild(subagent: Subagent, parentRunId: string): RunContext {
+  forChild(subagent: Subagent, parentRunId: string, binding: ModelBinding | null = null): RunContext {
     return new RunContext(
       this.ledger,
       subagent.budget.nestedWithin(this.budget, this.ledger),
       parentRunId,
       this.depth + 1,
       { turnId: this.turnId, actor: this.actor },
+      binding,
     );
   }
 

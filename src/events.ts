@@ -22,7 +22,20 @@ import type { RunStep } from './steps.js';
  */
 export type HarnessEvent = RunStarted | RunResumed | RunFinished | RunFailed | RunStepped;
 
-export interface RunStarted {
+/**
+ * The named agent a run belongs to (G-321 E), on every event of a named
+ * agent's run and ABSENT for the legacy namespace, so a legacy event is the
+ * same object it always was.
+ *
+ * Its own name on purpose: it is the harness agent id, unrelated to the
+ * presence `agentId` agent-integrations uses, and the harness never maps one
+ * onto the other.
+ */
+export interface HarnessAgentTag {
+  harnessAgent?: string;
+}
+
+export interface RunStarted extends HarnessAgentTag {
   type: 'run.started';
   runId: string;
   sessionKey: string;
@@ -56,7 +69,7 @@ export interface RunResumed extends Omit<RunStarted, 'type'> {
  * ask for it. `streamSteps()` and `streamDecision()` yield steps either way.
  * Observation only: a listener that throws is isolated, as for every event.
  */
-export interface RunStepped {
+export interface RunStepped extends HarnessAgentTag {
   type: 'run.stepped';
   runId: string;
   sessionKey: string;
@@ -65,7 +78,7 @@ export interface RunStepped {
   step: RunStep;
 }
 
-export interface RunFinished {
+export interface RunFinished extends HarnessAgentTag {
   type: 'run.finished';
   runId: string;
   sessionKey: string;
@@ -77,7 +90,7 @@ export interface RunFinished {
   at: string;
 }
 
-export interface RunFailed {
+export interface RunFailed extends HarnessAgentTag {
   type: 'run.failed';
   runId: string;
   sessionKey: string;

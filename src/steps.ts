@@ -135,6 +135,8 @@ export class RunStepTagger {
   #parentRunId: string | null = null;
   #rootRunId: string | null = null;
   #sessionKey = '';
+
+  #harnessAgent: string | null = null;
   #seq: number;
   #lastObservedAt = performance.now();
   /** performance.now() at which each tool call was observed. */
@@ -155,8 +157,9 @@ export class RunStepTagger {
     return this.#seq;
   }
 
-  bind(sessionKey: string, runId: string, parentRunId: string | null, rootRunId: string | null): void {
+  bind(sessionKey: string, runId: string, parentRunId: string | null, rootRunId: string | null, harnessAgent: string | null = null): void {
     this.#sessionKey = sessionKey;
+    this.#harnessAgent = harnessAgent;
     this.#runId = runId;
     this.#parentRunId = parentRunId;
     this.#rootRunId = rootRunId ?? runId;
@@ -272,6 +275,7 @@ export class RunStepTagger {
       parentRunId: step.parentRunId,
       rootRunId: step.rootRunId,
       step,
+      ...(this.#harnessAgent === null ? {} : { harnessAgent: this.#harnessAgent }),
     });
   }
 }
