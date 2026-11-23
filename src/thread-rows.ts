@@ -172,6 +172,26 @@ export function approvalToolScope(rows: readonly JsonObject[]): { names: string[
   return null;
 }
 
+/**
+ * The model steps the run paused at the transcript tail has already taken, or
+ * null when nothing at the tail is waiting on an approval.
+ *
+ * A run that pauses for a person and is resumed is the SAME run, so its step
+ * limit continues rather than starting again. Counted from the stored rows
+ * (one assistant row per model step since the turn's user row), so the count
+ * survives a reload, a different worker and a deploy, with no extra state.
+ */
+export function approvalRunSteps(rows: readonly JsonObject[]): number | null {
+  if (approvalToolScope(rows) === null) return null;
+  let steps = 0;
+  for (let index = rows.length - 1; index >= 0; index -= 1) {
+    const type = rows[index]!.type;
+    if (type === 'user') break;
+    if (type === 'assistant') steps += 1;
+  }
+  return steps;
+}
+
 function normalise(row: JsonObject, view: JsonObject[]): JsonObject | null {
   switch (row.type) {
     case 'assistant':

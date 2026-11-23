@@ -3,7 +3,7 @@ import { validateAgent } from './address.js';
 import type { JsonObject, JsonValue } from './json.js';
 import {
   assistantRow,
-  approvalToolScope,
+  approvalToolScope, approvalRunSteps,
   threadView,
   toolResultEntry,
   toolResultRow,
@@ -556,7 +556,12 @@ export class AgentRuntime {
         const resolved = await this.#tools.resolve(toolNames ?? mode.tools, session);
         offered = this.#authorizer ? await this.#authorizer.allowed(session, resolved) : [...resolved.values()];
       } else offered = (await this.#offer(session, mode, toolNames)).tools;
-      const scope = approvalToolScope((await thread.messages()).map(entry => entry.message));
+      const stored = (await thread.messages()).map(entry => entry.message);
+      const scope = approvalToolScope(stored);
+      // A resume continues the paused run's step count; it never opens a new
+      // allowance. Only for a root run: a child's steps are already on the
+      // tree ledger its caller hands back in.
+      if (prompt === '' && execution == null) run.ledger.recordSteps(approvalRunSteps(stored) ?? 0);
       if (scope !== null) {
         if (scope.legacy) console.warn('Pending approval has no valid stored tool scope; offering approved requests only.');
         offered = offered.filter(tool => scope.names.includes(tool.name)
