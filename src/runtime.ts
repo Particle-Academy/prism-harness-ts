@@ -761,7 +761,15 @@ export class AgentRuntime {
       text = response.text;
       finishReason = response.finishReason;
 
-      const toolCalls = response.toolCalls ?? [];
+      // A client can hand back arguments it could not parse. Such a call is
+      // recorded with none, asks nobody and runs nothing: the model is told.
+      const unusable = new Set<LlmToolCall>();
+      const toolCalls = (response.toolCalls ?? []).map((call) => {
+        if (hasObjectArguments(call)) return call;
+        const recorded: LlmToolCall = { ...call, arguments: {} };
+        unusable.add(recorded);
+        return recorded;
+      });
       if (steps !== undefined) {
         // Provider state names reasoning `thinking` (Anthropic, as prism-ts
         // records it); the client returns a whole response, so each is one delta.
@@ -775,7 +783,7 @@ export class AgentRuntime {
       const autoAllowed = new Set<LlmToolCall>();
       const gated = failedFinish === null
         ? toolCalls.filter((call) => {
-          if (!mode.needsApproval(call.name)) return false;
+          if (unusable.has(call) || !mode.needsApproval(call.name)) return false;
           const tool = offered.find((candidate) => candidate.name === call.name);
           if (tool !== undefined && this.#toolPolicy.allows(tool)) {
             autoAllowed.add(call);
@@ -839,6 +847,12 @@ export class AgentRuntime {
       for (const call of gated) this.#toolDecision('tool_approval_asked', session, runId, call, offered.find((tool) => tool.name === call.name), 'person');
 
       for (const call of toolCalls.filter((candidate) => !gated.includes(candidate))) {
+        if (unusable.has(call)) {
+          const entry = toolResultEntry(call, `Not run: the arguments for ${call.name} are not a JSON object.`);
+          steps?.toolResult(call.id, entry.result, { ok: false, code: 'tool_failed', refused: false });
+          results.push(entry);
+          continue;
+        }
         if (autoAllowed.has(call)) {
           // Checked again at the moment it would run: a revoke since the step
           // began refuses it rather than letting the old answer stand.
@@ -1235,4 +1249,10 @@ async function rememberSeq(session: Session, runId: string, steps: RunStepTagger
   } catch (error) {
     process.emitWarning(`prism-harness could not record the step sequence of run [${runId}]: ${String(error)}`);
   }
+}
+
+function hasObjectArguments(call: LlmToolCall): boolean {
+  const args: unknown = call.arguments;
+
+  return typeof args === 'object' && args !== null && !Array.isArray(args);
 }
