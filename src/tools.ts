@@ -1,3 +1,4 @@
+import type { ToolDeclaration, ToolTier } from './tool-policy.js';
 import type { JsonObject } from './json.js';
 import { HarnessError } from './errors.js';
 import type { Session } from './session.js';
@@ -15,6 +16,18 @@ import { RegistrationCollision, registrationOwner } from './registration.js';
 export interface HarnessTool {
   readonly name: string;
   readonly description?: string;
+  /**
+   * The MCP server this tool comes from. Absent for a native harness tool. A
+   * tool policy entry without `server` never matches a tool that has one.
+   *
+   * For a tool that arrives through `registerProvider`, the REGISTRY sets this
+   * to the provider's registered name, whatever the tool itself says: a bridge
+   * that forgets to set it, or a tool that claims another server, cannot make
+   * a provider's tool look native or look like it came from somewhere else.
+   */
+  readonly server?: string;
+  /** Advisory: how much this tool can change. `destructive` is never auto-allowed. */
+  readonly tier?: ToolTier;
   handle(args: JsonObject): unknown | Promise<unknown>;
 }
 
@@ -131,6 +144,15 @@ export class ToolRegistry {
   }
   #strict(): boolean { return this.namespace !== null || this.#refuseDuplicates; }
 
+  /** What the statically registered tools declare about themselves. */
+  declarations(): ToolDeclaration[] {
+    return [...this.#tools.values()].map((tool) => ({
+      name: tool.name,
+      ...(tool.server === undefined ? {} : { server: tool.server }),
+      ...(tool.tier === undefined ? {} : { tier: tool.tier }),
+    }));
+  }
+
   /** Every name this registry can produce without a session. */
   names(): string[] {
     return [...new Set([...this.#tools.keys(), ...this.#factories.keys()])].sort();
@@ -158,11 +180,11 @@ export class ToolRegistry {
     const provided = new Map<string, HarnessTool>(), metadata = new Map(this.#metadata);
 
     if (session !== undefined) {
-      for (const { provider, owner } of this.#providers.values()) {
+      for (const [server, { provider, owner }] of this.#providers) {
         for (const tool of await provider(session)) {
           const previous = metadata.get(tool.name);
           if (this.#strict() && previous) throw new RegistrationCollision(this.namespace, tool.name, previous.owner, owner);
-          provided.set(tool.name, tool); metadata.set(tool.name, { owner, source: 'provider' });
+          provided.set(tool.name, scopedTool(tool, server)); metadata.set(tool.name, { owner, source: 'provider' });
         }
       }
     }
@@ -204,6 +226,41 @@ export class ToolRegistry {
 
     return resolved;
   }
+}
+
+/**
+ * A provider's tool, scoped to the provider's registered name (G-326).
+ *
+ * OVERRIDES rather than refuses a tool that claims another server: refusing
+ * would let one tool with a bad claim take every tool of every provider out of
+ * the run, and once overridden the claim has no effect anyway, because the tool
+ * can then only match an entry that names the provider it really came from.
+ *
+ * A Proxy over an empty target rather than a copy, so the tool keeps every
+ * field a model adapter reads (a parameter schema, say) and its methods run
+ * against the original object; and an empty target so that a frozen tool that
+ * claims a server cannot trip the Proxy invariants.
+ */
+export function scopedTool(tool: HarnessTool, server: string): HarnessTool {
+  if (tool.server === server) return tool;
+
+  return new Proxy(Object.create(Object.getPrototypeOf(tool) as object | null) as HarnessTool, {
+    get(_target, key) {
+      if (key === 'server') return server;
+      const value: unknown = Reflect.get(tool, key, tool);
+      return typeof value === 'function' ? (value as (...args: unknown[]) => unknown).bind(tool) : value;
+    },
+    has: (_target, key) => key === 'server' || Reflect.has(tool, key),
+    ownKeys: () => [...new Set([...Reflect.ownKeys(tool), 'server'])],
+    getOwnPropertyDescriptor(_target, key) {
+      if (key === 'server') return { value: server, writable: false, enumerable: true, configurable: true };
+      const descriptor = Reflect.getOwnPropertyDescriptor(tool, key);
+      return descriptor === undefined ? undefined : { ...descriptor, configurable: true };
+    },
+    set: () => false,
+    defineProperty: () => false,
+    deleteProperty: () => false,
+  });
 }
 
 /** Whether a tool may be OFFERED to a run. */
@@ -338,6 +395,11 @@ export function authorizedTool(
   return {
     name: tool.name,
     description: tool.description,
+    // Carried through, because the host tool policy decides on them: a wrapper
+    // that dropped `server` would let an unscoped entry match an MCP tool, and
+    // one that dropped `tier` would let a destructive tool run unasked.
+    ...(tool.server === undefined ? {} : { server: tool.server }),
+    ...(tool.tier === undefined ? {} : { tier: tool.tier }),
     async handle(args: JsonObject): Promise<unknown> {
       if (!(await authorizer.allowsCall(session, tool, args))) {
         throw HarnessError.callNotAuthorized(tool.name);

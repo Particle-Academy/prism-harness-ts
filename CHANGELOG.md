@@ -16,6 +16,38 @@
 
 ### Added
 
+- `ToolPolicy`, a host-owned list of approval-gated tools that run without
+  asking a person (G-326). Built with `ToolPolicy.fromJson({ revision, allow:
+  [{ server?, tool }], honor })`, the same JSON shape as the PHP and Python
+  harnesses. Passed per launch as `AgentRuntime({ toolPolicy })` and replaced
+  live with `runtime.setToolPolicy()`; the default `ToolPolicy.none()` changes
+  nothing. Matching is exact: a padded, look-alike or case-variant name never
+  matches, an entry without `server` never matches a tool that has one, and
+  there are no wildcards. Confirmation and approval tools, malformed entries,
+  and tools declaring `tier: 'destructive'` are refused with
+  `tool_policy_refused`. `honor: false` turns the list off. A replacement
+  applies from the next call; a call already waiting keeps waiting, and a call
+  the old policy allowed is refused if the new one no longer does. The policy
+  is never sent to the model and has no tool surface.
+- `HarnessTool` takes optional `server` (the MCP server a tool comes from) and
+  `tier` (`read_only`, `write`, `destructive`; advisory).
+  `ToolRegistry.declarations()` lists what the static tools declare.
+- A tool that arrives through `registerProvider` is scoped by the registry:
+  its `server` is the provider's registered name, whatever the tool itself
+  declares. A provider that forgets to set `server`, or a tool that claims
+  another server, can no longer make a provider's tool match an unscoped
+  entry or another server's entry. Only a natively registered tool matches an
+  entry without `server`. Name a provider (`registerProvider(provider, owner,
+  name)`) to give a policy a stable scope to list; an unnamed one is scoped as
+  `provider:<n>`. `ToolAuthorizer`'s call-time wrapper now keeps `server` and
+  `tier`, which it used to drop.
+- Events `tool_auto_allowed`, `tool_approval_asked`, `tool_approved` and
+  `tool_denied` for every call to an approval-gated tool, carrying
+  `policyRevision`, `server`, `tool`, `argsDigest` (sha256 of the arguments'
+  RFC 8785 canonical JSON; never the arguments), `decidedBy` (`policy` or
+  `person`) and `harnessAgent`. They are emitted whether or not a policy is
+  set, so a listener that expects only `run.*` events will now also see these.
+- `canonicalJson()` and `argsDigest()`.
 - Modes take optional `provider`, `model` and `agents` keys. Subagent declarations
   take optional `provider`, `model`, `agent` and `inherit_session_model` keys
   (G-321 E). For a run, the order is session > mode > agent > global.

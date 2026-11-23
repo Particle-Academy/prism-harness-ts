@@ -628,7 +628,7 @@ describe('streamDecision', () => {
     seen.length = 0;
 
     await collect(rt.streamDecision(session, [{ approvalId, approved: true }], RunContext.root('approval-root', new RunBudget(10))));
-    const runEvents = seen.filter((event) => event.type !== 'run.stepped');
+    const runEvents = seen.filter((event) => event.type.startsWith('run.') && event.type !== 'run.stepped');
 
     expect(runEvents.map((event) => event.type)).toEqual(['run.resumed', 'run.finished']);
     expect(runEvents[0]).toMatchObject({ runId: parkedRunId, rootRunId: 'approval-root' });

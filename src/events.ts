@@ -20,7 +20,59 @@ import type { RunStep } from './steps.js';
  * The one exception is `run.stepped`, which carries a run step whole and is
  * therefore OFF unless the runtime is built with `stepEvents: true`.
  */
-export type HarnessEvent = RunStarted | RunResumed | RunFinished | RunFailed | RunStepped;
+export type HarnessEvent =
+  | RunStarted
+  | RunResumed
+  | RunFinished
+  | RunFailed
+  | RunStepped
+  | ToolAutoAllowed
+  | ToolApprovalAsked
+  | ToolApproved
+  | ToolDenied;
+
+/**
+ * One decision about a call to a tool that needs approval (G-326).
+ *
+ * Carries the arguments' DIGEST, never the arguments or the result: the sha256
+ * of their RFC 8785 canonical JSON, so the same call digests identically in
+ * every language. `policyRevision` is the revision of the host policy in force
+ * when the decision was made.
+ */
+export interface ToolDecisionEvent {
+  runId: string;
+  sessionKey: string;
+  policyRevision: string;
+  server: string | null;
+  tool: string;
+  argsDigest: string;
+  decidedBy: 'policy' | 'person';
+  harnessAgent: string | null;
+}
+
+/** The host policy let the call run without asking. */
+export interface ToolAutoAllowed extends ToolDecisionEvent {
+  type: 'tool_auto_allowed';
+}
+
+/** The call is waiting on a person. */
+export interface ToolApprovalAsked extends ToolDecisionEvent {
+  type: 'tool_approval_asked';
+}
+
+/** A person approved the call; it runs now. */
+export interface ToolApproved extends ToolDecisionEvent {
+  type: 'tool_approved';
+}
+
+/**
+ * The call does not run: a person denied it or never answered
+ * (`decidedBy: person`), or the host revoked the policy that had let it run
+ * before it started (`decidedBy: policy`).
+ */
+export interface ToolDenied extends ToolDecisionEvent {
+  type: 'tool_denied';
+}
 
 /**
  * The named agent a run belongs to (G-321 E), on every event of a named

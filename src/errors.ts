@@ -32,6 +32,8 @@ export type HarnessErrorCode =
   | 'unsafe_authorization_configuration'
   /** A tool call was refused by the call-time policy. */
   | 'call_not_authorized'
+  /** A host tool policy names something that may never run without asking, or is malformed. */
+  | 'tool_policy_refused'
   /** A skill file was asked for that would resolve outside its own skill. */
   | 'skill_path_refused'
   /** A task was added under an id the source already holds. */
