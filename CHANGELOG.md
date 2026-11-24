@@ -17,6 +17,14 @@
 
 ### Fixed
 
+- A decision for an approval the session is not waiting on is refused with
+  `approval_not_pending` (G-354). Before, a made-up approval id recorded while a
+  call was pending closed that call as "No approval response provided" on
+  resume, and one streamed while nothing was pending started a model turn with
+  no new user message. `recordApproval()`, `recordDecisions()` and
+  `streamDecision()` now refuse an id the run never issued, one already
+  answered, or the same id twice in one batch, before anything is written or
+  sent. Streaming the same decision again is refused rather than replayed.
 - A run's step limit (`max_steps`, and `max_steps_ceiling` for a named agent)
   now covers the whole run, including every pause for an approval and every
   resume after one. A resume (`send(session, '')` or `streamDecision()`) continues the paused run's step count
