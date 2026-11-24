@@ -21,6 +21,8 @@ export interface ModeConfig {
   model?: string | null;
   /** Named agents this mode's subagents may run as. Declared, never inherited. */
   agents?: readonly string[];
+  /** Whether runs in this mode may keep an agent plan (G-360). Off unless true; anything but a boolean is refused. */
+  plans?: boolean;
 }
 
 export interface ModeRegistryConfig {
@@ -57,6 +59,8 @@ export class AgentMode {
     readonly model: string | null = null,
     /** Named agents this mode's subagents may run as. */
     readonly agents: readonly string[] = [],
+    /** Whether runs in this mode may keep an agent plan (G-360). Off unless set. */
+    readonly plans: boolean = false,
   ) {}
 
   /**
@@ -167,6 +171,12 @@ export class ModeRegistry {
       }
     }
     const agents = agentsFor(wanted, mode.agents);
+    // G-360: a mode opts in to agent plans. Anything but true or false is
+    // refused, so a string "false" cannot quietly turn plans on.
+    const plans: unknown = mode.plans ?? false;
+    if (typeof plans !== 'boolean') {
+      throw new HarnessError('mode_malformed', `Harness mode [${wanted}] declares a malformed plans flag: expected true or false.`);
+    }
 
     return new AgentMode(
       wanted,
@@ -180,6 +190,7 @@ export class ModeRegistry {
       mode.provider ?? null,
       mode.model ?? null,
       agents,
+      plans,
     );
   }
 

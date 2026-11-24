@@ -59,9 +59,11 @@ export type {
   ToolAutoAllowed,
   ToolDecisionEvent,
   ToolDenied,
+  PlanUpdated,
 } from './events.js';
 
 export {
+  RESERVED_TOOLS,
   TOOL_TIERS,
   ToolPolicy,
   argsDigest,
@@ -77,6 +79,7 @@ export type {
   ApprovalRequestStep,
   DecisionRecordedStep,
   ErrorStep,
+  PlanUpdatedStep,
   RunStep,
   RunStepEnvelope,
   RunStepType,
@@ -156,3 +159,16 @@ export type { SubagentOutcome, SubagentResult } from './subagent-runner.js';
 export { admitAttachments } from './attachments.js';
 export { RegistrationCollision } from './registration.js';
 export type { Attachment, MediaLike } from './attachments.js';
+
+export { PlanIds } from './plans/ids.js';
+export { PlanLimits } from './plans/limits.js';
+export type { PlanLimitsInit, PlansConfig } from './plans/limits.js';
+export { PlanMachine, iso as planTime } from './plans/machine.js';
+export type { CheckedDraft, DraftInput, PendingCall, PendingChange, Plan, PlanStep, PrepareOutcome } from './plans/machine.js';
+export { PLAN_REFUSALS, PlanRefused, PlansDisabled, planRefusalForModel, planRefusalMessage } from './plans/refusal.js';
+export type { PlanRefusalCode } from './plans/refusal.js';
+export { PlanText, acceptablePlanText, planTextLength, renderPlanText } from './plans/text.js';
+export { PLAN_CONTRACT_VERSION, PLAN_FRAME_END, PlanView, firstEventBytes } from './plans/view.js';
+export type { PlanCounts, PlanStepView, PlanUpdate } from './plans/view.js';
+export { AdvanceOutcome, PlanHandle, PlanSnapshot, Plans } from './plans/plans.js';
+export type { PlansOptions } from './plans/plans.js';

@@ -90,7 +90,11 @@ export type HarnessErrorCode =
    */
   | 'budget_unpriced'
   /** A named agent reached its `spend_ceiling` in this run tree (G-321 E). */
-  | 'agent_spend_ceiling_exceeded';
+  | 'agent_spend_ceiling_exceeded'
+  /** An agent plan operation was refused (G-360); the same codes in every language. */
+  | import('./plans/refusal.js').PlanRefusalCode
+  /** Plans are off for this session: the host config or the mode does not turn them on (G-360). */
+  | 'plan.disabled';
 
 export interface HarnessErrorOptions {
   cause?: unknown;

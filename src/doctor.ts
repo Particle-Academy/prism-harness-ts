@@ -21,6 +21,12 @@ export interface DoctorSubjects {
   tools?: ToolRegistry;
   stores?: SessionStoreManager;
   authorizer?: ToolAuthorizer;
+  /**
+   * The plan reaper's state (G-360), from `await plans.doctor({ queued })`.
+   * With plans on and advanced by a queue, a missing or stale reaper heartbeat
+   * fails: one lost job would otherwise stop a plan for ever.
+   */
+  plans?: DoctorFinding | null;
 }
 
 /**
@@ -55,6 +61,10 @@ export function diagnose(subjects: DoctorSubjects): DoctorReport {
 
   if (subjects.modes !== undefined) {
     findings.push(...checkModes(subjects.modes, subjects.tools));
+  }
+
+  if (subjects.plans !== undefined && subjects.plans !== null) {
+    findings.push(subjects.plans);
   }
 
   const problems = findings.filter((finding) => !finding.ok).length;

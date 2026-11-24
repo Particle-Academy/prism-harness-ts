@@ -48,6 +48,9 @@ const INVISIBLE = new RegExp(`^[${INVISIBLE_CLASS}]+|[${INVISIBLE_CLASS}]+$`, 'g
 /** Verbs whose tools belong to the person: confirmation and approval. */
 const RESERVED_VERBS: ReadonlySet<string> = new Set(['confirm', 'reject', 'accept', 'approve', 'deny']);
 
+/** The agent plan tools (G-360): a plan is a person's agreement, never auto-allowed. */
+export const RESERVED_TOOLS: readonly string[] = Object.freeze(['plan_draft', 'plan_propose_change', 'plan_pause_for_person', 'plan_complete_step']);
+
 /** A name with the invisible edges removed. */
 export function normaliseToolName(name: string): string {
   return name.replace(INVISIBLE, '');
@@ -66,9 +69,17 @@ export function isWellFormedToolName(name: string): boolean {
  *
  * Normalised, then split on every separator and camelCase boundary; reserved
  * when ANY token is a reserved verb. The same rule as human-plus.
+ *
+ * The plan tools are reserved by name as well (G-360), because the verb
+ * tokeniser does not catch them: a plan_draft or a plan change that a policy
+ * let run without asking would be a plan no person approved. Compared after
+ * normalising, in ASCII lower case, as the reference does.
  */
 export function isPersonOnlyTool(name: string): boolean {
-  return normaliseToolName(name)
+  const normalised = normaliseToolName(name);
+  if (RESERVED_TOOLS.includes(normalised.replace(/[A-Z]/g, (letter) => letter.toLowerCase()))) return true;
+
+  return normalised
     .split(/[_.:-]+/)
     .some((segment) => segment.split(/(?<=[a-z0-9])(?=[A-Z])/).some((token) => RESERVED_VERBS.has(token.toLowerCase())));
 }
