@@ -30,7 +30,8 @@ export type HarnessEvent =
   | ToolApprovalAsked
   | ToolApproved
   | ToolDenied
-  | ToolApprovalExpired;
+  | ToolApprovalExpired
+  | PlanUpdated;
 
 /**
  * One decision about a call to a tool that needs approval (G-326).
@@ -161,6 +162,27 @@ export interface RunFailed extends HarnessAgentTag {
   failure: string;
   steps: number;
   at: string;
+}
+
+/**
+ * A plan was written (G-360): drafted, decided, settled, answered, resumed,
+ * cancelled or swept, inside a run or outside one.
+ *
+ * COUNTS AND IDS ONLY, and a fixed size, so it fits a broadcast payload cap
+ * with room to spare. A client that sees a new revision fetches the plan from
+ * the host (`PlanHandle.current()`). No title, instruction, note, question or
+ * answer travels here. `runId` is the run that made the write, or '' for a
+ * host call made outside a run.
+ */
+export interface PlanUpdated extends HarnessAgentTag {
+  type: 'plan.updated';
+  sessionKey: string;
+  runId: string;
+  planId: string;
+  revision: number;
+  status: string;
+  holdingApprovalId: string | null;
+  counts: { total: number; todo: number; running: number; held: number; waiting: number; done: number; failed: number; skipped: number };
 }
 
 export type HarnessListener = (event: HarnessEvent) => void;

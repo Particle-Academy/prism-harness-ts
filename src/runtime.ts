@@ -29,6 +29,7 @@ import { RunBudget, RunContext, type ModelBinding } from './subagents.js';
 import type { HarnessTool, ToolAuthorizer, ToolRegistry } from './tools.js';
 import { settleWithRefusalScope } from './refusals.js';
 import { RunStepTagger, StepChannel, type RunStep, type ToolCallOutcome } from './steps.js';
+import { planApprovalGate } from './plans/tools.js';
 
 /**
  * What the runtime needs from a model, and NOTHING MORE.
@@ -186,6 +187,8 @@ interface Stepping {
   resuming?: boolean;
   /** True when the caller already holds the session lock for the whole turn. */
   locked?: boolean;
+  /** True when this turn should mix `plan_updated` steps in itself (G-360); a decision stream watches before its decision steps. */
+  watchPlan?: boolean;
 }
 
 /** A tool call's result as recorded, and how it ended. */
@@ -380,18 +383,23 @@ export class AgentRuntime {
     return (await this.#offer(session, mode)).descriptors;
   }
 
-  async #offer(session: Session, mode: AgentMode, requested?: readonly string[]): Promise<{ tools: HarnessTool[]; descriptors: EffectiveTool[] }> {
+  async #offer(session: Session, mode: AgentMode, requested?: readonly string[], planTools: readonly HarnessTool[] = []): Promise<{ tools: HarnessTool[]; descriptors: EffectiveTool[] }> {
     return session.resolveReadOnly(mode.name, async view => {
       const names = session.agent !== null || this.#narrowRequestedTools ? narrowedTools(mode.tools, requested) : (requested ?? mode.tools);
       const detailed = await this.#tools.resolveDetailed(names, view);
       const tools = new Map([...detailed].map(([name, entry]) => [name, entry.tool]));
+      const owners = new Map<string, { owner: string; source: string }>([...detailed.values()].map(entry => [entry.tool.name, { owner: entry.owner, source: entry.source }]));
+      // G-360: the plan tools, built for the live session; never during inspection.
+      for (const tool of planTools) {
+        tools.set(tool.name, tool);
+        owners.set(tool.name, { owner: 'harness.plans', source: 'builtin' });
+      }
       if (view.agent !== null && tools.has('complete_task')) {
         const authorizer = this.#authorizer?.forAgent(view.agent);
         if (!authorizer?.enabled || !authorizer.hasCallPolicy()) throw new HarnessError('unsafe_authorization_configuration', 'Named task completion requires enabled authorization and an explicit call policy.');
       }
       const offered = this.#authorizer ? await this.#authorizer.allowed(view, tools) : [...tools.values()];
-      const ownership = new Map([...detailed.values()].map(entry => [entry.tool.name, entry]));
-      const descriptors = offered.map(tool => ({ name: tool.name, owner: ownership.get(tool.name)!.owner, source: ownership.get(tool.name)!.source }));
+      const descriptors = offered.map(tool => ({ name: tool.name, owner: owners.get(tool.name)!.owner, source: owners.get(tool.name)!.source }));
       return { tools: offered, descriptors };
     });
   }
@@ -447,7 +455,7 @@ export class AgentRuntime {
     const tagger = this.#tagger(context, channel, 0);
 
     return yield* channel.drain(() => this.#holdingTurnLock(session, (live) =>
-      this.#turn(live, prompt, toolNames, context, additionalContent, undefined, { tagger, locked: true })));
+      this.#turn(live, prompt, toolNames, context, additionalContent, undefined, { tagger, locked: true, watchPlan: true })));
   }
 
   /**
@@ -502,17 +510,41 @@ export class AgentRuntime {
       const execution = executionContext(context);
       const runId = parked?.id ?? randomUUID();
       tagger.bind(live.key(), runId, execution?.parentRunId ?? null, execution?.rootRunId ?? runId);
+      const unwatch = await this.#watchPlan(live, tagger);
 
-      for (const decision of decisions) {
-        // From the APP's run context, never from the model or the request.
-        tagger.decision(decision.approvalId, decision.approved, decision.reason ?? null, context?.actor ?? null);
+      try {
+        for (const decision of decisions) {
+          // From the APP's run context, never from the model or the request.
+          tagger.decision(decision.approvalId, decision.approved, decision.reason ?? null, context?.actor ?? null);
+        }
+
+        // An EMPTY prompt: the thread already holds the request, the decisions
+        // and everything before them, and the turn resolves approvals from it
+        // before any model call.
+        return await this.#turn(live, '', undefined, context, [], undefined, { tagger, runId, resuming: parked !== null, locked: true });
+      } finally {
+        unwatch();
       }
-
-      // An EMPTY prompt: the thread already holds the request, the decisions
-      // and everything before them, and the turn resolves approvals from it
-      // before any model call.
-      return await this.#turn(live, '', undefined, context, [], undefined, { tagger, runId, resuming: parked !== null, locked: true });
     }));
+  }
+
+  /**
+   * Mix `plan_updated` steps into this stream when the host turned them on
+   * (G-360, contract g282.3): the plans config's `events.run_steps`, and plans
+   * on for this session. Off by default: the stream then stays g282.1.
+   */
+  async #watchPlan(session: Session, tagger: RunStepTagger): Promise<() => void> {
+    const plans = session.planService();
+    if (plans === null) return () => {};
+    try {
+      if (!(await plans.enabledFor(session)) || !plans.limits().runSteps) return () => {};
+    } catch {
+      return () => {};
+    }
+    const initial = await plans.load(session);
+    tagger.plans(() => initial);
+
+    return plans.watch(session.key(), (plan) => tagger.planUpdated(plan));
   }
 
   /**
@@ -642,6 +674,7 @@ export class AgentRuntime {
     }
 
     steps?.bind(session.key(), runId, run.parentRunId, run.rootRunId, session.agent);
+    const unwatchPlan = steps !== undefined && stepping?.watchPlan === true ? await this.#watchPlan(session, steps) : () => {};
     await session.beginRun(runId, mode.name, provider, model);
     this.#events?.emit({
       // A parked run continued under its own id has already STARTED once; a
@@ -659,11 +692,24 @@ export class AgentRuntime {
     });
 
     try {
+      // G-360: the plan, in the system prompt of this turn and never in the
+      // thread, read after the run begins and before any model call. A turn
+      // with a new user message ends every pending approval, so the plan is
+      // reconciled as if nothing were pending before it is rendered.
+      const plans = session.planService();
+      const planContext = plans === null ? '' : await plans.context(session, prompt);
+      const systemPrompt = planContext.trim() === '' ? mode.systemPrompt
+        : (mode.systemPrompt === '' ? planContext : `${mode.systemPrompt}\n\n${planContext}`);
+      // The plan tools, when the host and this mode turned plans on. They gate
+      // themselves, so the mode's approval list and the host policy never
+      // wrap them; the authorizer still filters them like any other tool.
+      const planTools = plans === null ? [] : await plans.tools(session, mode.name);
       let offered: HarnessTool[];
       if (session.agent === null && !this.#narrowRequestedTools) {
         const resolved = await this.#tools.resolve(toolNames ?? mode.tools, session);
+        for (const tool of planTools) resolved.set(tool.name, tool);
         offered = this.#authorizer ? await this.#authorizer.allowed(session, resolved) : [...resolved.values()];
-      } else offered = (await this.#offer(session, mode, toolNames)).tools;
+      } else offered = (await this.#offer(session, mode, toolNames, planTools)).tools;
       const stored = (await thread.messages()).map(entry => entry.message);
       const scope = approvalToolScope(stored);
       // A resume continues the paused run's step count; it never opens a new
@@ -673,7 +719,7 @@ export class AgentRuntime {
       if (scope !== null) {
         if (scope.legacy) console.warn('Pending approval has no valid stored tool scope; offering approved requests only.');
         offered = offered.filter(tool => scope.names.includes(tool.name)
-          && (mode.tools.includes('*') || mode.tools.includes(tool.name)));
+          && (mode.tools.includes('*') || mode.tools.includes(tool.name) || planApprovalGate(tool) !== null));
       }
       const called: string[] = [];
 
@@ -694,7 +740,7 @@ export class AgentRuntime {
         await thread.record([turn], runId);
       }
 
-      return await this.#loop(session, mode, run, runId, provider, model, offered, called, schema, steps);
+      return await this.#loop(session, mode, run, runId, provider, model, offered, called, systemPrompt, schema, steps);
     } catch (error) {
       // THE MODEL'S OWN WORDS DO NOT BELONG IN A RUN ROW OR AN EVENT. A schema
       // violation names the values that missed, so its message carries pieces
@@ -723,6 +769,7 @@ export class AgentRuntime {
 
       throw error;
     } finally {
+      unwatchPlan();
       if (steps !== undefined) await rememberSeq(session, runId, steps);
     }
   }
@@ -736,6 +783,7 @@ export class AgentRuntime {
     model: string,
     offered: readonly HarnessTool[],
     called: string[],
+    systemPrompt: string,
     schema?: Readonly<JsonObject>,
     steps?: RunStepTagger,
   ): Promise<AgentResponse> {
@@ -759,7 +807,7 @@ export class AgentRuntime {
 
       steps?.stepStart();
       const response = await this.#client({
-        systemPrompt: mode.systemPrompt,
+        systemPrompt,
         messages: threadView((await thread.messages()).map((entry) => entry.message)),
         tools: offered,
         provider,
@@ -795,17 +843,24 @@ export class AgentRuntime {
       // The host policy is read per call, never cached for the run, so a
       // replacement applies from the next call (G-326).
       const autoAllowed = new Set<LlmToolCall>();
-      const gated = failedFinish === null
-        ? toolCalls.filter((call) => {
-          if (unusable.has(call) || !mode.needsApproval(call.name)) return false;
-          const tool = offered.find((candidate) => candidate.name === call.name);
-          if (tool !== undefined && this.#toolPolicy.allows(tool)) {
-            autoAllowed.add(call);
-            return false;
-          }
-          return true;
-        })
-        : [];
+      const gated: LlmToolCall[] = [];
+      for (const call of failedFinish === null ? toolCalls : []) {
+        if (unusable.has(call)) continue;
+        const tool = offered.find((candidate) => candidate.name === call.name);
+        // A plan tool gates itself (G-360), in place of the mode's list and
+        // the host policy: neither can ask about it or let it through.
+        const own = planApprovalGate(tool);
+        if (own !== null) {
+          if (await own(call.arguments)) gated.push(call);
+          continue;
+        }
+        if (!mode.needsApproval(call.name)) continue;
+        if (tool !== undefined && this.#toolPolicy.allows(tool)) {
+          autoAllowed.add(call);
+          continue;
+        }
+        gated.push(call);
+      }
       const requests: ApprovalRequestEntry[] = gated.map((call) => ({
         approval_id: `apr_${randomUUID().replaceAll('-', '')}`,
         tool_call_id: call.id,
@@ -897,6 +952,10 @@ export class AgentRuntime {
       steps?.stepFinish(response.text);
 
       if (requests.length > 0) {
+        // G-360: the run stops here for a person; a plan binds the approvals
+        // this turn staged, as it does when a run finishes.
+        await session.planService()?.afterTurn(session);
+
         // FAILS CLOSED. The gated calls have not run, and the requests are in
         // the thread, so a different process can resume after a person answers.
         return {
@@ -1251,6 +1310,10 @@ async function writeDecisions(session: Session, decisions: readonly ApprovalDeci
     approved: decision.approved,
     reason: decision.reason ?? null,
   })))], run?.id ?? null);
+
+  // A plan held on one of these approvals reads the decision from the thread,
+  // before the run resumes (G-360).
+  await session.planService()?.decided(session);
 }
 
 /** Runtime guards: a decision arrives from an app's request handling, not from a typed caller. */

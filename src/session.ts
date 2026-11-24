@@ -6,6 +6,9 @@ import type { SessionStore } from './stores/session-store.js';
 import { StoreTaskSource } from './store-task-source.js';
 import type { StoreTaskSourceOptions } from './store-task-source.js';
 import { Thread } from './thread.js';
+import type { AgentRuntime } from './runtime.js';
+import { PlansDisabled } from './plans/refusal.js';
+import type { PlanHandle, Plans } from './plans/plans.js';
 
 /**
  * Who a session belongs to.
@@ -41,6 +44,10 @@ export interface SessionOptions {
   actor?: object;
   addressIndex?: StoreAddressIndex;
   maxAddressesPerParticipant?: number | null;
+  /** Agent plans (G-360). Off unless given, enabled in its config, and turned on by the session's mode. */
+  plans?: Plans;
+  /** The runtime a plan's driver runs its turns on (`plan().advance()`). */
+  runtime?: AgentRuntime;
 }
 
 /**
@@ -75,6 +82,9 @@ export class Session {
 
   readonly #ttlSeconds: number | null;
 
+  readonly #plans: Plans | null;
+  readonly #runtime: AgentRuntime | null;
+
   #cachedState: JsonObject | null = null;
   #resolutionOnly = false;
   #resolvedMode: string | null = null;
@@ -95,6 +105,8 @@ export class Session {
     this.#durable = index ? indexedStore(options.durable, index, this.address, 'durable') : options.durable;
     this.#lockStore = index && storeLockRank(options.durable) > storeLockRank(options.ephemeral) ? this.#durable : this.#ephemeral;
     this.#ttlSeconds = options.ttlSeconds ?? null;
+    this.#plans = options.plans ?? null;
+    this.#runtime = options.runtime ?? null;
     for (const key of strictIdentity ? ['address', 'actor', 'participant', 'scope'] : ['address', 'actor']) Object.defineProperty(this, key, { writable: false, configurable: false });
   }
 
@@ -188,6 +200,54 @@ export class Session {
     this.#assertWritable();
     const store = this.#addressIndex ? indexedStore(this.#rawDurable, this.#addressIndex, this.address, 'durable', 'tasks') : this.#durable;
     return new StoreTaskSource(store, `${this.key()}:tasks`, options);
+  }
+
+  /**
+   * This session's agent plan (G-360).
+   *
+   * Plans are optional and off unless the harness was given a `Plans` whose
+   * config sets `enabled: true` AND the session's mode sets `plans: true`.
+   *
+   * @throws PlansDisabled (`plan.disabled`) when they are off
+   */
+  async plan(): Promise<PlanHandle> {
+    this.#assertWritable();
+    if (this.#plans === null) throw new PlansDisabled();
+
+    return this.#plans.handle(this);
+  }
+
+  /** @internal The plans service this session was resolved with, or null. */
+  planService(): Plans | null {
+    return this.#plans;
+  }
+
+  /** @internal The runtime this session was resolved with, or null. */
+  planRuntime(): AgentRuntime | null {
+    return this.#runtime;
+  }
+
+  /**
+   * Where this session's plan is stored: the durable store, always. A
+   * half-finished plan that vanished on a deploy would read as finished.
+   *
+   * @internal
+   */
+  planStore(): SessionStore {
+    return this.#durable;
+  }
+
+  /**
+   * Hold the plan driver's lock while the callback runs, so one advance runs at
+   * a time per session. A second advance does not wait: it fails at once with
+   * `session_locked` and does nothing.
+   *
+   * @internal
+   */
+  async holdPlanLock<T>(callback: () => T | Promise<T>, ttlSeconds: number): Promise<T> {
+    this.#assertWritable();
+
+    return this.#lockStore.withLock(`${this.key()}:plan-advance`, callback, ttlSeconds, 0);
   }
 
   async capability(name: string): Promise<JsonObject | null> {
@@ -343,12 +403,18 @@ export class Session {
       return this;
     }
 
-    return this.#write('run', {
+    await this.#write('run', {
       ...(current ?? { id }),
       id,
       status,
       finished_at: new Date().toISOString(),
       ...extra,
     });
+
+    // G-360: when the run is over, the plan reads the thread it left: the
+    // approvals the run staged, and the ones a new message ended.
+    await this.#plans?.afterTurn(this);
+
+    return this;
   }
 }

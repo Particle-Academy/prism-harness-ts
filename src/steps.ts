@@ -1,5 +1,7 @@
 import type { HarnessEvents } from './events.js';
 import type { JsonObject } from './json.js';
+import { PlanMachine, type Plan } from './plans/machine.js';
+import { PLAN_CONTRACT_VERSION, PlanView, type PlanStepView, type PlanUpdate } from './plans/view.js';
 
 /**
  * One observed moment of a run, tagged with the run it belongs to (G-282 A).
@@ -26,7 +28,8 @@ export type RunStepType =
   | 'error'
   | 'step_start'
   | 'step_finish'
-  | 'decision_recorded';
+  | 'decision_recorded'
+  | 'plan_updated';
 
 export interface RunStepEnvelope {
   readonly contractVersion: typeof RUN_STEP_CONTRACT_VERSION;
@@ -102,6 +105,20 @@ export interface DecisionRecordedStep extends RunStepEnvelope {
   readonly actor: string | null;
 }
 
+/**
+ * The session's plan changed (G-360). Contract `g282.3`, the one step type
+ * that carries it; emitted only when the host turned on the plans config's
+ * `events.run_steps`, so a consumer that knows g282.1 alone never sees it.
+ *
+ * The first in a stream is a snapshot of every step; later ones carry only
+ * the steps that changed, by id. Ids, titles and states only: never an
+ * instruction, a note, a question or an answer.
+ */
+export interface PlanUpdatedStep extends Omit<RunStepEnvelope, 'contractVersion' | 'type'>, PlanUpdate {
+  readonly contractVersion: typeof PLAN_CONTRACT_VERSION;
+  readonly type: 'plan_updated';
+}
+
 export type RunStep =
   | ThinkingStep
   | TextStep
@@ -112,7 +129,8 @@ export type RunStep =
   | ErrorStep
   | StepStartStep
   | StepFinishStep
-  | DecisionRecordedStep;
+  | DecisionRecordedStep
+  | PlanUpdatedStep;
 
 /** The fixed text an `error` step carries. The same rule as a failed run's events. */
 export const RUN_STEP_ERROR_MESSAGE = 'The model stream reported an error.';
@@ -143,6 +161,11 @@ export class RunStepTagger {
   readonly #calls = new Map<string, number>();
   /** Tool calls observed in the current model step. */
   #stepCalls = 0;
+  /** Reads the session's plan, when plan steps are on for this stream (G-360). */
+  #planSource: (() => Plan | null) | null = null;
+  #planStarted = false;
+  /** The plan steps last sent on this stream. */
+  #planSent: PlanStepView[] | null = null;
 
   constructor(
     private readonly turnId: string | null,
@@ -243,14 +266,38 @@ export class RunStepTagger {
     this.#emit('step_finish', { text });
   }
 
-  #emit(type: RunStepType, data: Record<string, unknown>, observedAt = performance.now()): void {
+  /**
+   * Turn on `plan_updated` steps for this stream (G-360). The first step of
+   * the stream is preceded by a full snapshot when the session has a live
+   * plan, so a reader catches up on anything that changed between runs.
+   */
+  plans(source: () => Plan | null): void {
+    this.#planSource = source;
+  }
+
+  /** The plan was written while this stream ran: a snapshot the first time, then only the steps that changed. */
+  planUpdated(plan: Plan): void {
+    if (this.#planSource === null) return;
+    this.#planStarted = true;
+    const data = PlanView.update(plan, this.#planSent);
+    this.#planSent = PlanView.steps(plan);
+    this.#emit('plan_updated', data as unknown as Record<string, unknown>, performance.now(), PLAN_CONTRACT_VERSION);
+  }
+
+  #emit(type: RunStepType, data: Record<string, unknown>, observedAt = performance.now(), contractVersion: string = RUN_STEP_CONTRACT_VERSION): void {
     const runId = this.#runId;
 
     if (runId === null) throw new Error('A run step was emitted before its run was bound.');
 
+    if (this.#planSource !== null && !this.#planStarted) {
+      this.#planStarted = true;
+      const plan = this.#planSource();
+      if (PlanMachine.isLive(plan)) this.planUpdated(plan);
+    }
+
     this.#seq += 1;
     const step = deepFreeze({
-      contractVersion: RUN_STEP_CONTRACT_VERSION,
+      contractVersion,
       runId,
       parentRunId: this.#parentRunId,
       rootRunId: this.#rootRunId ?? runId,

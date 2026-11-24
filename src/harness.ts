@@ -9,6 +9,7 @@ import { addressLimit, indexedStore, StoreAddressIndex } from './address-index.j
 import { StoreTaskSource } from './store-task-source.js';
 import { Thread } from './thread.js';
 import type { AgentRuntime, EffectiveTool } from './runtime.js';
+import type { Plans } from './plans/plans.js';
 
 export interface AgentHarnessConfig {
   ttlSeconds?: number | null;
@@ -26,6 +27,13 @@ export interface HarnessOptions extends Partial<StoreManagerOptions> {
   participantAdapters?: ParticipantAdapters;
   /** Null (the default) leaves named address growth unlimited. */
   maxAddressesPerParticipant?: number | null;
+  /**
+   * Agent plans (G-360). Optional, and off unless its config sets `enabled`
+   * and the session's mode sets `plans: true`. Its live-plan index and the
+   * reaper heartbeat go in this harness's durable store unless it was given
+   * one of its own.
+   */
+  plans?: Plans;
 }
 
 /**
@@ -58,6 +66,7 @@ export class PrismHarness {
   readonly #agents: Record<string, AgentHarnessConfig>;
   readonly #defaultScope: string;
   readonly #defaultTaskList: string;
+  readonly #plans?: Plans;
 
   constructor(options: HarnessOptions = {}) {
     this.#runtime = options.runtime;
@@ -74,6 +83,8 @@ export class PrismHarness {
       stores: options.stores,
       drivers: options.drivers ?? { default: () => new MemorySessionStore() },
     });
+    this.#plans = options.plans;
+    this.#plans?.useIndexStore(() => this.#stores.durable());
   }
 
   /** Bind to a participant. Returns a builder, because the scope comes next. */
@@ -95,7 +106,7 @@ export class PrismHarness {
     validateAgent(agent);
     const config = agent === null ? undefined : this.#agents[agent];
     const ttl = config?.ttlSeconds === undefined ? this.#ttlSeconds : config.ttlSeconds;
-    return new PendingSession(participant, this.#stores, ttl, agent, actor, this.#participants, this.#maxAddresses, config?.defaultScope ?? this.#defaultScope);
+    return new PendingSession(participant, this.#stores, ttl, agent, actor, this.#participants, this.#maxAddresses, config?.defaultScope ?? this.#defaultScope, this.#plans, this.#runtime);
   }
 
   tasks(list?: string, agent: string | null = null): StoreTaskSource {
@@ -135,11 +146,13 @@ export class PendingSession {
     private readonly participants = new ParticipantAdapters(),
     private readonly maxAddresses: number | null = null,
     private readonly defaultScope = 'default',
+    private readonly plans?: Plans,
+    private readonly runtime?: AgentRuntime,
   ) {}
 
   asActor(actor: object): PendingSession {
     if (this.participant instanceof ParticipantRef) throw new Error('Typed participants require a registered actor adapter.');
-    return new PendingSession(this.participant, this.stores, this.ttlSeconds, this.agent, actor, this.participants, this.maxAddresses, this.defaultScope);
+    return new PendingSession(this.participant, this.stores, this.ttlSeconds, this.agent, actor, this.participants, this.maxAddresses, this.defaultScope, this.plans, this.runtime);
   }
 
   /**
@@ -161,6 +174,8 @@ export class PendingSession {
       agent: this.agent,
       actor,
       addressIndex: this.agent !== null || this.participant instanceof ParticipantRef ? new StoreAddressIndex(durable, this.maxAddresses) : undefined,
+      plans: this.plans,
+      runtime: this.runtime,
     });
   }
 }

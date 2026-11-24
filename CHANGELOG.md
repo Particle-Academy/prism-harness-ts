@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Added
+
+- Agent plans (G-360), the port of the reference's: an agent drafts an ordered
+  plan with `plan_draft`, a person approves it, and `session.plan().advance()`
+  runs one step per turn. Off unless the new `Plans` service's config sets
+  `enabled` and the mode sets `plans: true`. A step is done only when the agent
+  called `plan_complete_step` and the turn ended cleanly; a refused approval
+  fails its step. Plans are bounded (40 steps, 160-character titles, a first
+  update under 8 KB) and refused, never truncated, when over. `plan_updated`
+  run steps (contract `g282.3`) are off unless the config's
+  `events.run_steps` is on; `plan.updated` events carry ids and counts only.
+  See the README's "Agent plans".
+- `ToolPolicy` refuses a policy naming a plan tool, in any spelling
+  (`RESERVED_TOOLS`).
+
 ### Changed
 
 - Approval requests are now written with `arguments_format: 1`, which records

@@ -500,6 +500,137 @@ ordering is not here: drive [`fancy-flow`](https://github.com/Particle-Academy/f
 for that. A task list that grows a scheduler has rebuilt a workflow engine
 badly.
 
+## Agent plans
+
+A plan is an optional, ordered list of steps that an agent writes for a goal.
+A person approves it, and then the host moves it forward one step per turn. A
+plan says what to do next and when to stop for a person. It grants nothing:
+every tool call a step makes still goes through the mode's tools, approvals,
+the tool policy and the run budget. A plan step is a separate thing from a task
+in the list above, and a done plan step never closes a task.
+
+### Turning plans on
+
+Plans are off unless both switches are on: the `Plans` config's `enabled`, and
+the mode's `plans` flag. Give the harness the same `Plans` its runtime's
+sessions use:
+
+```ts
+import { AgentRuntime, ModeRegistry, Plans, PrismHarness, RunContext, diagnose } from '@particle-academy/prism-harness';
+
+const modes = new ModeRegistry({ modes: { study: { tools: ['search'], plans: true } } });
+const plans = new Plans({ modes, events, config: { enabled: true } });
+const runtime = new AgentRuntime({ client, modes, tools, events });
+const harness = new PrismHarness({ drivers, stores, runtime, plans });
+```
+
+When either switch is off, no plan tool is offered, nothing is added to the
+system prompt, no plan step is streamed, and `await session.plan()` rejects
+with `PlansDisabled` (code `plan.disabled`). A mode's `plans` must be `true` or
+`false`; anything else is refused with `mode_malformed`.
+
+### A person approves every plan
+
+A drafted plan waits for a person before any step runs. The draft is an
+ordinary tool approval, answered with `recordApproval()`, `recordDecisions()`
+or `streamDecision()`, then resumed with `send(session, '')`. Turning this off
+is a host decision made in config (`require_approval: false`). There is no
+per-call option, and nothing the model sends can change it. Plan changes and
+approval pauses always go to a person.
+
+### The agent's tools
+
+| tool | asks a person | what it does |
+|---|---|---|
+| `plan_draft(goal, steps)` | yes | Proposes the plan. Each step is the agent's own (`owner: agent`, with an `instruction`) or a question for the person (`owner: human`, `interaction: input`, with a `question`). |
+| `plan_complete_step(summary)` | no | Reports the current step done. The next `advance()` settles it. |
+| `plan_pause_for_person(kind, question, options?)` | `approve`: yes | Stops before the current step. `approve` is a tool approval; `input` waits for `answerStep()`. |
+| `plan_propose_change(reason, base_revision, steps)` | yes | Proposes a new list for the steps that can still be replaced. Every other step is kept by id. |
+
+Each plan tool carries a JSON Schema for its arguments as `parameters`, for
+your model client to send to its provider. No tool takes an approval id, and
+only `plan_propose_change` takes step ids (to keep steps unchanged). A refusal
+is a fixed sentence and a code, such as `[plan.text]`.
+
+The plan tools decide for themselves which calls need a person. A mode's
+`requires_approval` (even `'*'`) and the host tool policy never apply to them,
+and no tool policy can name one: `ToolPolicy.fromJson()` refuses a plan tool in
+any spelling.
+
+### Bounds
+
+A plan has at most 40 steps (`max_steps`, 20 by default). A title is at most
+160 characters, an instruction at most 600, and a note at most 200, counted in
+Unicode code points. The first update must stay under 8 KB. Text with line
+breaks, control, bidi or zero-width characters, guillemets, a lone surrogate,
+or the plan frame's markers is refused. A plan over a bound is refused when it
+is drafted, and is never truncated.
+
+### Driving a plan
+
+```ts
+const plan = await session.plan();
+
+await plan.advance();                   // settle the last step, run one turn on the next
+for await (const step of plan.streamAdvance()) render(step); // the same, as run steps
+(await plan.current())?.toJSON();       // the whole plan, for a fetch-on-change endpoint
+
+// Host calls: authorize first, and name the person as the actor.
+await plan.answerStep(stepId, 'Paris', null, RunContext.metadata(null, 'user:42'));
+await plan.resume(RunContext.metadata(null, 'user:42'));
+await plan.cancel(RunContext.metadata(null, 'user:42'));
+```
+
+`advance()` runs at most one step and returns an `AdvanceOutcome`: `ran`,
+`waiting`, `blocked` (with a `reason`), `done` or `not_active`. A step is done
+only when the agent called `plan_complete_step` and the turn ended cleanly with
+nothing pending. A turn that ends without the tool sends the step back to
+`todo`, and it counts as an attempt. Completion is never read from the model's
+text. The model's turn is always "Continue the plan. Work on step N."; the
+step's instruction reaches it only in the plan block of the system prompt.
+
+When a step's turn asks for a tool approval, the step is held on that
+approval. Once a person answers it, call `advance()` again. A refused approval
+fails the step. It is never shown as done. An answer to a question step never
+releases a held step.
+
+Limits: `max_attempts` per step (3), `max_pauses_per_step` (1),
+`max_changes` per plan (5), and `max_advances` per plan (60). Hitting one
+blocks the plan. `resume()` adds a retry step where that makes sense. It never
+replays a step that paused too often, and it never resumes a plan that ran out
+of advances.
+
+Only one `advance()` runs at a time per session. A second one fails at once
+with `session_locked` and changes nothing.
+
+### Hosts with queues
+
+If a queued job calls `advance()`, register a reaper callback and run the sweep
+on a schedule:
+
+```ts
+plans.reapUsing((sessionKey, planId) => queue.dispatch('advance-plan', { sessionKey }));
+setInterval(() => void plans.sweep(), 5 * 60 * 1000);
+
+diagnose({ modes, stores, plans: await plans.doctor({ queued: true }) });
+```
+
+With plans on and `queued: true`, the doctor fails when the sweep has not run
+recently.
+
+### What a client sees
+
+- A `plan.updated` event on every write. It carries ids, the revision, the
+  status and counts only. Fetch `current()` for the rest.
+- With the config's `events: { run_steps: true }`, `streamSteps()`,
+  `streamDecision()` and `streamAdvance()` carry `plan_updated` steps
+  (contract `g282.3`). The first is a full snapshot, and later ones carry only
+  the steps that changed. Every other step stays `g282.1`. Leave this off until
+  your consumer knows `g282.3`.
+- The plan block the model reads each turn is built per run and never stored
+  in the thread. Instructions, notes, questions and answers do not appear in
+  events, plan steps or warnings.
+
 ## Drivers
 
 - **`MemorySessionStore`** — volatile, and says so. Right for the ephemeral slot
