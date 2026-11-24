@@ -13,7 +13,7 @@ import {
   type ToolResultEntry,
   type ToolResultRow,
   unusableStoredCalls,
-  ambiguousStoredCalls,
+  ambiguousCalls,
   ARGUMENTS_AS_SENT,
 } from './thread-rows.js';
 import { usableArguments } from './tool-arguments.js';
@@ -1043,7 +1043,7 @@ export class AgentRuntime {
       (call) => !results.has(call.id) && (approvalIds.has(call.id) || mode.needsApproval(call.name)),
     );
 
-    return calls.length === 0 ? null : { calls, results, decisions, approvalIds, scope: approvalToolScope(rows), unusable: unusableStoredCalls(rows), ambiguous: ambiguousStoredCalls(rows) };
+    return calls.length === 0 ? null : { calls, results, decisions, approvalIds, scope: approvalToolScope(rows), unusable: unusableStoredCalls(rows), ambiguous: ambiguousCalls(assistant) };
   }
 
   /**

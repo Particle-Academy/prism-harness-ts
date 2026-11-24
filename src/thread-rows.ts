@@ -222,33 +222,24 @@ export function unusableStoredCalls(rows: readonly JsonObject[]): Set<string> {
 }
 
 /**
- * The ids of stored calls whose approval expires rather than runs: the request
- * has no marker and the call was stored as no arguments, which is also how
- * 0.11.0 and earlier stored a call whose arguments were a bare number or
- * boolean. Read from the rows as written, like `unusableStoredCalls`.
+ * The ids of the calls in one assistant turn whose approval expires rather
+ * than runs: a request for the call has no marker, and the call is stored as
+ * no arguments, which is also how 0.11.0 and earlier stored a call whose
+ * arguments were a bare number or boolean.
+ *
+ * Read from the one turn being resumed, never the whole thread: providers that
+ * number calls per response reuse ids, and an older turn's request must not
+ * decide a newer one. Pass the turn as the thread view gives it; a call whose
+ * stored arguments cannot be used is refused before this is asked.
  */
-export function ambiguousStoredCalls(rows: readonly JsonObject[]): Set<string> {
-  const unmarked = new Set<string>();
+export function ambiguousCalls(assistant: AssistantRow): Set<string> {
+  const unmarked = new Set(assistant.tool_approval_requests
+    .filter(request => request.arguments_format !== ARGUMENTS_AS_SENT)
+    .map(request => request.tool_call_id));
 
-  for (const row of threadView(rows)) {
-    if (row.type !== 'assistant') continue;
-    for (const request of (row as AssistantRow).tool_approval_requests) {
-      if (request.arguments_format !== ARGUMENTS_AS_SENT) unmarked.add(request.tool_call_id);
-    }
-  }
-
-  const ambiguous = new Set<string>();
-
-  for (const row of rows) {
-    if (row.type !== 'assistant') continue;
-    for (const call of list(row.tool_calls)) {
-      const id = text(call.id);
-      const usable = usableArguments(call.arguments);
-      if (unmarked.has(id) && usable !== null && Object.keys(usable).length === 0) ambiguous.add(id);
-    }
-  }
-
-  return ambiguous;
+  return new Set(assistant.tool_calls
+    .filter(call => unmarked.has(call.id) && Object.keys(call.arguments).length === 0)
+    .map(call => call.id));
 }
 
 function normalise(row: JsonObject, view: JsonObject[]): JsonObject | null {
