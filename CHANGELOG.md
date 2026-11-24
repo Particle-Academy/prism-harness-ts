@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.12.0
+
+Includes every fix released on the 0.11 line in 0.11.1 and 0.11.2.
 
 ### Changed
 
