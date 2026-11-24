@@ -8,6 +8,49 @@ import { isJsonObject } from '../json.js';
 import { HarnessError } from '../errors.js';
 import { withFileOwnerLock, pendingFileOwnerReleases } from './file-owner-lock.js';
 import { fileLockIdentityStatus } from './file-lock-identity.js';
+
+/**
+ * JSON.parse, keeping the approval marker's number AS WRITTEN.
+ *
+ * `arguments_format: 1` marks an approval request whose call was stored as the
+ * model sent it. JavaScript reads `1.0` as the same number, where the PHP and
+ * Python harnesses read it as no marker; a request whose marker is not the
+ * exact text `1` keeps that text, a string, so it is not read as the marker
+ * here either. Only the requests on thread messages are touched: a key of the
+ * same name inside a tool call's arguments is the model's data.
+ */
+function parseStored(text: string): unknown {
+  // Nearly every line holds no request: parse those without a reviver. A key
+  // spelled with escapes cannot hide from this, since it then holds a "\u".
+  if (!text.includes('arguments_format') && !text.includes('\\u')) return JSON.parse(text);
+  const written = new WeakMap<object, string>();
+  const value: unknown = JSON.parse(text, function (this: unknown, key: string, parsed: unknown, context?: { source?: string }) {
+    if (key === 'arguments_format' && typeof parsed === 'number' && typeof this === 'object' && this !== null && typeof context?.source === 'string') {
+      written.set(this, context.source);
+    }
+
+    return parsed;
+  } as (this: unknown, key: string, value: unknown) => unknown);
+
+  const requests = (message: unknown): void => {
+    if (!isJsonObject(message) || !Array.isArray(message.tool_approval_requests)) return;
+    for (const request of message.tool_approval_requests) {
+      if (!isJsonObject(request)) continue;
+      const source = written.get(request);
+      if (source !== undefined && source !== String(request.arguments_format)) request.arguments_format = source;
+    }
+  };
+  const entry = (candidate: unknown): void => {
+    if (isJsonObject(candidate)) requests(candidate.message);
+  };
+
+  if (isJsonObject(value)) {
+    entry(value);
+    if (Array.isArray(value.messages)) value.messages.forEach(entry);
+  }
+
+  return value;
+}
 import type { FileLockIdentityStatus } from './file-lock-identity.js';
 import type { PendingFileLockRelease } from './file-owner-lock.js';
 import type { AppendLogStore, Durability, SessionStore } from './session-store.js';
@@ -75,7 +118,7 @@ export class FileSessionStore implements SessionStore, AppendLogStore {
     let document: unknown;
 
     try {
-      document = JSON.parse(raw);
+      document = parseStored(raw);
     } catch (error) {
       throw HarnessError.unmappableContent(`the stored payload for [${key}] is not valid JSON`, {
         cause: error,
@@ -172,7 +215,7 @@ export class FileSessionStore implements SessionStore, AppendLogStore {
       index = await scanLog(this.#logPathFor(key), (line, number) => {
         let entry: unknown;
         try {
-          entry = JSON.parse(line);
+          entry = parseStored(line);
         } catch (error) {
           throw HarnessError.unmappableContent(`line ${number} of the thread log for [${key}] is not valid JSON`, { cause: error });
         }

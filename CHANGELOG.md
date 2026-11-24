@@ -32,6 +32,28 @@
 
 ### Fixed
 
+- An approval has one answer. `recordApproval()` and `recordDecisions()` now
+  check that an id is pending and record the decision under the session lock,
+  so two decisions racing for the same id (two reviewers, a retry) cannot both
+  be recorded: the second is refused with `approval_not_pending`, and one that
+  cannot get the lock fails with `session_locked` having recorded nothing.
+  Where a thread already holds two decisions for one id, the FIRST one is the
+  answer for the resume, the tool scope and the plan alike; before, the resume
+  acted on the later one, so a denial followed by an approval ran the call.
+  The provider replay view is unchanged.
+- A named agent's `spend_ceiling` now holds across an approval pause. The
+  agent's spend so far is stored on the row that asks for the approval
+  (`harness_agent_spend`) and counted again when the run resumes, instead of
+  starting at nothing. A subagent's child run resumed outside the runner keeps
+  the provider and model it was bound to (`harness_binding`) instead of
+  resolving them like a root run. Each `send()` with a prompt, and each
+  `plan.advance()` without a context, still starts a new run tree; see the
+  README.
+- Whether a stored call's arguments are unusable is read from the turn being
+  resumed only, so an older turn's call with a reused id no longer refuses a
+  newer approved call.
+- The file store reads a stored `arguments_format` written as anything but
+  `1` (for example `1.0`) as no marker, as the PHP and Python harnesses do.
 - A decision for an approval the session is not waiting on is refused with
   `approval_not_pending` (G-354). Before, a made-up approval id recorded while a
   call was pending closed that call as "No approval response provided" on

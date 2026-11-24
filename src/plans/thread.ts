@@ -64,7 +64,9 @@ export function approvalDecisions(rows: readonly JsonObject[]): Map<string, bool
  * self-gated tool requires before it applies anything.
  */
 export function approvedCallsAwaitingResult(rows: readonly JsonObject[], name: string, digest: string): number {
-  const approved = new Set<string>();
+  // Read newest first, so the last write per id is the FIRST decision
+  // recorded: the one answer that counts, as for the resume and the plan.
+  const decided = new Map<string, boolean>();
   const finished = new Set<string>();
   for (let index = rows.length - 1; index >= 0; index -= 1) {
     const row = rows[index]!;
@@ -72,15 +74,15 @@ export function approvedCallsAwaitingResult(rows: readonly JsonObject[], name: s
       for (const result of list(row.tool_results)) {
         if (typeof result.tool_call_id === 'string') finished.add(result.tool_call_id);
       }
-      for (const response of list(row.tool_approval_responses)) {
-        if (typeof response.approval_id === 'string' && response.approved === true) approved.add(response.approval_id);
+      for (const response of list(row.tool_approval_responses).reverse()) {
+        if (typeof response.approval_id === 'string') decided.set(response.approval_id, response.approved === true);
       }
       continue;
     }
     if (row.type !== 'assistant') return 0;
 
     const approvedCalls = new Set(list(row.tool_approval_requests)
-      .filter((request) => typeof request.approval_id === 'string' && approved.has(request.approval_id) && typeof request.tool_call_id === 'string')
+      .filter((request) => typeof request.approval_id === 'string' && decided.get(request.approval_id) === true && typeof request.tool_call_id === 'string')
       .map((request) => request.tool_call_id as string));
 
     return list(row.tool_calls).filter((call) => typeof call.id === 'string' && approvedCalls.has(call.id)
