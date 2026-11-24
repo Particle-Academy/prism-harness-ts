@@ -150,7 +150,16 @@ function copy<T>(value: T): T {
 
 /** PHP's trim(): space, tab, newline, carriage return, NUL and vertical tab. */
 export function phpTrim(value: string): string {
-  return value.replace(/^[ \t\n\r\0\x0B]+|[ \t\n\r\0\x0B]+$/g, '');
+  // Index scans, not a regular expression: an anchored alternation over the
+  // same class backtracks quadratically on a long run of trimmed characters
+  // that does not reach the end, and the actor comes from the host's request.
+  const trimmed = ' \t\n\r\0\x0B';
+  let start = 0;
+  let end = value.length;
+  while (start < end && trimmed.includes(value[start]!)) start++;
+  while (end > start && trimmed.includes(value[end - 1]!)) end--;
+
+  return value.slice(start, end);
 }
 
 /**
