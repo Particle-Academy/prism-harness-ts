@@ -49,7 +49,7 @@ async function exercise(options: {
   let refusal: string | null = null;
   try {
     if (options.seed) {
-      const row: JsonObject = assistantRow('', [{id: 'safe-call', name: 'scope_safe', arguments: {}}], {}, [{approval_id: 'approval-1', tool_call_id: 'safe-call'}]);
+      const row: JsonObject = assistantRow('', [{id: 'safe-call', name: 'scope_safe', arguments: {}}], {}, [{approval_id: 'approval-1', tool_call_id: 'safe-call', arguments_format: 1}]);
       if ('scope' in options.seed) row.harness_tool_names = options.seed.scope!;
       await session.thread().record([row]);
       pendingId = 'approval-1';
@@ -78,7 +78,7 @@ async function exercise(options: {
             // affirms the model's request for an unoffered gated tool.
             await fresh.thread().record([
               {type: 'user', content: 'A concurrent narrowed turn.'},
-              {...assistantRow('', [{id: 'new-call', name: 'scope_ceiling', arguments: {}}], {}, [{approval_id: 'new-approval', tool_call_id: 'new-call'}]), harness_tool_names: ['scope_safe']},
+              {...assistantRow('', [{id: 'new-call', name: 'scope_ceiling', arguments: {}}], {}, [{approval_id: 'new-approval', tool_call_id: 'new-call', arguments_format: 1}]), harness_tool_names: ['scope_safe']},
               {type: 'tool_result', tool_results: [], tool_approval_responses: [{approval_id: 'new-approval', approved: true, reason: null}]},
             ]);
           }

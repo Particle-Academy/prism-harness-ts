@@ -44,7 +44,7 @@ export type {
 } from './tools.js';
 
 export { HarnessEvents } from './events.js';
-export type { HarnessEvent, HarnessListener, RunFailed, RunFinished, RunResumed, RunStarted, RunStepped } from './events.js';
+export type { HarnessEvent, HarnessListener, RunFailed, RunFinished, RunResumed, RunStarted, RunStepped, ToolApprovalExpired } from './events.js';
 
 export { RUN_STEP_CONTRACT_VERSION, RUN_STEP_ERROR_MESSAGE } from './steps.js';
 export type {

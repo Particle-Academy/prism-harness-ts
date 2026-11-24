@@ -36,7 +36,17 @@ export type ToolResultEntry = {
 export type ApprovalRequestEntry = {
   approval_id: string;
   tool_call_id: string;
+  /** Present when the call's arguments were stored as the model sent them. */
+  arguments_format?: number;
 };
+
+/**
+ * The marker on an approval request whose call was stored exactly as the model
+ * sent it. 0.11.0 stored a call whose arguments were a bare number or boolean
+ * as `{}`, the same as a real call with no arguments, and 0.11.1 and earlier
+ * wrote no marker; such an approval expires instead of running.
+ */
+export const ARGUMENTS_AS_SENT = 1;
 
 export type ApprovalDecisionEntry = {
   approval_id: string;
@@ -211,6 +221,27 @@ export function unusableStoredCalls(rows: readonly JsonObject[]): Set<string> {
   return unusable;
 }
 
+/**
+ * The ids of the calls in one assistant turn whose approval expires rather
+ * than runs: a request for the call has no marker, and the call is stored as
+ * no arguments, which is also how 0.11.0 stored a call whose arguments were a
+ * bare number or boolean.
+ *
+ * Read from the one turn being resumed, never the whole thread: providers that
+ * number calls per response reuse ids, and an older turn's request must not
+ * decide a newer one. Pass the turn as the thread view gives it; a call whose
+ * stored arguments cannot be used is refused before this is asked.
+ */
+export function ambiguousCalls(assistant: AssistantRow): Set<string> {
+  const unmarked = new Set(assistant.tool_approval_requests
+    .filter(request => request.arguments_format !== ARGUMENTS_AS_SENT)
+    .map(request => request.tool_call_id));
+
+  return new Set(assistant.tool_calls
+    .filter(call => unmarked.has(call.id) && Object.keys(call.arguments).length === 0)
+    .map(call => call.id));
+}
+
 function normalise(row: JsonObject, view: JsonObject[]): JsonObject | null {
   switch (row.type) {
     case 'assistant':
@@ -228,6 +259,7 @@ function normalise(row: JsonObject, view: JsonObject[]): JsonObject | null {
         list(row.tool_approval_requests).map((request) => ({
           approval_id: text(request.approval_id),
           tool_call_id: text(request.tool_call_id),
+          ...(request.arguments_format === ARGUMENTS_AS_SENT ? { arguments_format: ARGUMENTS_AS_SENT } : {}),
         })),
       );
 

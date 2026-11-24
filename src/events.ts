@@ -20,7 +20,26 @@ import type { RunStep } from './steps.js';
  * The one exception is `run.stepped`, which carries a run step whole and is
  * therefore OFF unless the runtime is built with `stepEvents: true`.
  */
-export type HarnessEvent = RunStarted | RunResumed | RunFinished | RunFailed | RunStepped;
+export type HarnessEvent = RunStarted | RunResumed | RunFinished | RunFailed | RunStepped | ToolApprovalExpired;
+
+/**
+ * A person approved the call, but the approval was stored by 0.11.1 or earlier
+ * without a marker, on a call stored as no arguments, which cannot be told
+ * apart from a garbled call. The call does not run and the model is told to
+ * call again.
+ *
+ * Carries the arguments' DIGEST, never the arguments: `argsDigest` is the
+ * sha256 of the RFC 8785 canonical JSON of no arguments (`{}`), the same value
+ * later versions emit for this event.
+ */
+export interface ToolApprovalExpired {
+  type: 'tool_approval_expired';
+  runId: string;
+  sessionKey: string;
+  tool: string;
+  argsDigest: string;
+  decidedBy: 'policy';
+}
 
 export interface RunStarted {
   type: 'run.started';
