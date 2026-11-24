@@ -70,7 +70,7 @@ function plansOp(op: Op, state: { plan: Plan | null }, ids: PlanIds, limits: Pla
   };
   switch (op.op) {
     case 'draft': {
-      const draft = PlanMachine.checkDraft(op.args, limits);
+      const draft = PlanMachine.checkDraft(op.args, limits, op.authorized ?? true);
       if (PlanMachine.isLive(state.plan)) throw PlanRefused.because('plan.exists');
       state.plan = PlanMachine.propose(draft, op.digest, ids, now, run, limits);
 
@@ -105,7 +105,7 @@ function plansOp(op: Op, state: { plan: Plan | null }, ids: PlanIds, limits: Pla
 
       return { ok: true };
     case 'pause': {
-      const [plan, code] = PlanMachine.pause(needs(), op.args, op.digest ?? null, ids, limits, now, run);
+      const [plan, code] = PlanMachine.pause(needs(), op.args, op.digest ?? null, ids, limits, now, run, op.authorized ?? true);
       state.plan = plan;
 
       return code === null ? { ok: true } : { refused: code };
@@ -122,7 +122,7 @@ function plansOp(op: Op, state: { plan: Plan | null }, ids: PlanIds, limits: Pla
       const args = { ...op.args };
       if (args.base_revision === 'current') args.base_revision = current.revision;
       args.steps = (args.steps as Op[]).map((entry) => Object.hasOwn(entry, 'ref') ? { id: current.steps[entry.ref]!.id } : entry);
-      state.plan = PlanMachine.proposeChange(current, args, op.digest, ids, limits, now, run);
+      state.plan = PlanMachine.proposeChange(current, args, op.digest, ids, limits, now, run, op.authorized ?? true);
 
       return { ok: true };
     }
@@ -196,8 +196,8 @@ describe('the harness-plans corpus (G-360)', () => {
     return;
   }
 
-  it('vendors all 37 cases', () => {
-    expect(corpus.cases).toHaveLength(37);
+  it('vendors all 38 cases', () => {
+    expect(corpus.cases).toHaveLength(38);
   });
 
   it.each(corpus.cases.map((entry) => [entry.id, entry] as const))('%s runs as the reference recorded it', (_id, entry) => {
