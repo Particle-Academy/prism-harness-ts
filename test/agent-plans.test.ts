@@ -733,6 +733,21 @@ describe('agent plans (G-360)', () => {
     expect(streamed[0]!.seq).toBeLessThan(streamed[1]!.seq);
   });
 
+  it('streams the plan a decision ended: a rejected draft reaches the reader', async () => {
+    // The decision is written before the stream watches the plan. A decision
+    // that ends a plan left it no longer live, and the opening snapshot is only
+    // for live plans, so the reader never learned the draft was rejected.
+    const r = new Rig({ config: { events: { run_steps: true } } });
+    r.calls([['plan_draft', draft()]]);
+    const pending = (await r.send('Plan the trip')).pendingApprovals[0]!;
+
+    r.text('Understood.');
+    const streamed = await drain(r.runtime.streamDecision(r.session(), [{ approvalId: pending.id, approved: false }], actor()));
+    const plans = streamed.filter((step) => step.type === 'plan_updated') as unknown as Record<string, unknown>[];
+    expect(plans.map((step) => step.planStatus)).toContain('rejected');
+    expect(streamed.findIndex((step) => step.type === 'plan_updated')).toBeLessThan(streamed.findIndex((step) => step.type === 'decision_recorded'));
+  });
+
   it.each(['config enabled', 'mode plans'])('offers nothing, adds nothing and streams g282.1 only when plans are off: %s', async (which) => {
     const r = which === 'config enabled'
       ? new Rig({ config: { enabled: false, events: { run_steps: true } } })

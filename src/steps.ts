@@ -163,6 +163,8 @@ export class RunStepTagger {
   #stepCalls = 0;
   /** Reads the session's plan, when plan steps are on for this stream (G-360). */
   #planSource: (() => Plan | null) | null = null;
+  /** Open with the plan even when it is no longer live: this stream's own decision just wrote it. */
+  #planAlways = false;
   #planStarted = false;
   /** The plan steps last sent on this stream. */
   #planSent: PlanStepView[] | null = null;
@@ -271,8 +273,9 @@ export class RunStepTagger {
    * the stream is preceded by a full snapshot when the session has a live
    * plan, so a reader catches up on anything that changed between runs.
    */
-  plans(source: () => Plan | null): void {
+  plans(source: () => Plan | null, always = false): void {
     this.#planSource = source;
+    this.#planAlways = always;
   }
 
   /** The plan was written while this stream ran: a snapshot the first time, then only the steps that changed. */
@@ -292,7 +295,7 @@ export class RunStepTagger {
     if (this.#planSource !== null && !this.#planStarted) {
       this.#planStarted = true;
       const plan = this.#planSource();
-      if (PlanMachine.isLive(plan)) this.planUpdated(plan);
+      if (plan !== null && (this.#planAlways || PlanMachine.isLive(plan))) this.planUpdated(plan);
     }
 
     this.#seq += 1;
