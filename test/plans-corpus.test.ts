@@ -46,7 +46,7 @@ function runPlansCase(entry: PlansCase): { results: unknown[]; final: unknown } 
   });
   let counter = 0;
   const ids = new PlanIds((prefix) => `${prefix}_${String(++counter).padStart(26, '0')}`);
-  const state: { plan: Plan | null } = { plan: null };
+  const state: { plan: Plan | null; marked?: ReturnType<typeof PlanView.steps> | null } = { plan: null, marked: null };
   const results: unknown[] = [];
   for (const op of entry.ops) {
     const now = (op.now ?? entry.now ?? 1767225600) as number;
@@ -61,7 +61,7 @@ function runPlansCase(entry: PlansCase): { results: unknown[]; final: unknown } 
   return { results, final: state.plan === null ? null : plansFinal(state.plan, limits) };
 }
 
-function plansOp(op: Op, state: { plan: Plan | null }, ids: PlanIds, limits: PlanLimits, now: number): unknown {
+function plansOp(op: Op, state: { plan: Plan | null; marked?: ReturnType<typeof PlanView.steps> | null }, ids: PlanIds, limits: PlanLimits, now: number): unknown {
   const run = 'run_case';
   const needs = (): Plan => {
     if (state.plan === null) throw PlanRefused.because('plan.no_plan');
@@ -138,6 +138,12 @@ function plansOp(op: Op, state: { plan: Plan | null }, ids: PlanIds, limits: Pla
       state.plan = PlanMachine.cancel(needs(), now);
 
       return { ok: true };
+    case 'mark':
+      state.marked = PlanView.steps(needs());
+
+      return { ok: true };
+    case 'update_since_mark':
+      return { update: PlanView.update(needs(), state.marked ?? null) };
     case 'stalled':
       return { stalled: PlanMachine.stalled(needs(), now, op.stale_after) };
     case 'policy':
@@ -196,8 +202,8 @@ describe('the harness-plans corpus (G-360)', () => {
     return;
   }
 
-  it('vendors all 38 cases', () => {
-    expect(corpus.cases).toHaveLength(38);
+  it('vendors all 39 cases', () => {
+    expect(corpus.cases).toHaveLength(39);
   });
 
   it.each(corpus.cases.map((entry) => [entry.id, entry] as const))('%s runs as the reference recorded it', (_id, entry) => {

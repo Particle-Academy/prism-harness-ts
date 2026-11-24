@@ -112,18 +112,20 @@ export const PlanView = {
 
   /**
    * The fields of a `plan_updated` run step. The full list goes out on a
-   * snapshot; otherwise only the steps that differ from `previous`. A step
-   * that disappeared forces a snapshot, because a patch cannot remove one.
+   * snapshot; otherwise only the steps that differ from `previous`. Any change
+   * to the list of step ids is a snapshot, because a patch cannot place or drop a step.
    *
    * @param previous the steps last sent on this stream, or null
    */
   update(plan: Plan, previous: readonly PlanStepView[] | null): PlanUpdate {
     const steps = PlanView.steps(plan);
-    let snapshot = previous === null;
-    if (previous !== null) {
-      const ids = steps.map((step) => step.id);
-      if (previous.some((old) => !ids.includes(old.id))) snapshot = true;
-    }
+    // A patch can say WHAT changed, by id, but not WHERE a step goes. So it is
+    // sent only while the list of ids is the same, in the same order; an insert
+    // (a pause puts the person's step before the current one), a removal or a
+    // reorder is a snapshot.
+    const snapshot = previous === null
+      || previous.length !== steps.length
+      || previous.some((old, index) => old.id !== steps[index]!.id);
     let sent = steps;
     if (!snapshot && previous !== null) {
       const before = new Map(previous.map((old) => [old.id, JSON.stringify(old)]));
