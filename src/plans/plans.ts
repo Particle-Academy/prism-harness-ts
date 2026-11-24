@@ -3,7 +3,7 @@ import { HarnessError } from '../errors.js';
 import type { HarnessEvents } from '../events.js';
 import type { JsonObject } from '../json.js';
 import type { ModeRegistry } from '../modes.js';
-import type { AgentRuntime } from '../runtime.js';
+import type { AgentResponse, AgentRuntime } from '../runtime.js';
 import type { Session } from '../session.js';
 import { StepChannel, type RunStep } from '../steps.js';
 import type { SessionStore } from '../stores/session-store.js';
@@ -373,7 +373,9 @@ function reportQuietly(error: unknown): void {
  * What one `advance()` did (G-360).
  *
  * `ran`: one turn ran on `stepId`, as run `runId`. Call `advance()` again to
- * settle it and run the next step.
+ * settle it and run the next step. `response` is that run's response, so a
+ * host can put the approvals it staged (`pendingApprovals`) in front of a
+ * person. It is not part of `toJSON()`.
  * `waiting`: the head step waits on a person (an approval or an answer).
  * `blocked`: the plan stopped on a limit; `reason` says which.
  * `done`: every step is closed.
@@ -386,6 +388,7 @@ export class AdvanceOutcome {
     readonly stepId: string | null = null,
     readonly runId: string | null = null,
     readonly reason: string | null = null,
+    readonly response: AgentResponse | null = null,
   ) {
     Object.freeze(this);
   }
@@ -474,7 +477,7 @@ export class PlanHandle {
       if (step === null) return outcome;
       const response = await runtime.send(this.session, prompt(step), undefined, context);
 
-      return new AdvanceOutcome('ran', 'active', step.id, response.runId);
+      return new AdvanceOutcome('ran', 'active', step.id, response.runId, null, response);
     }, this.plans.lockTtl());
   }
 
@@ -493,17 +496,19 @@ export class PlanHandle {
       if (step === null) return outcome;
       const stream = runtime.streamSteps(this.session, prompt(step), undefined, context);
       let runId: string | null = null;
+      let response: AgentResponse | null = null;
       for (;;) {
         const next = await stream.next();
         if (next.done === true) {
           runId ??= next.value.runId;
+          response = next.value;
           break;
         }
         runId ??= next.value.runId;
         channel.push(next.value);
       }
 
-      return new AdvanceOutcome('ran', 'active', step.id, runId);
+      return new AdvanceOutcome('ran', 'active', step.id, runId, null, response);
     }, this.plans.lockTtl()));
   }
 

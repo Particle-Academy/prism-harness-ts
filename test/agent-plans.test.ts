@@ -245,6 +245,28 @@ describe('agent plans (G-360)', () => {
     expect(plan.counters.settledByTool).toBe(2);
   });
 
+  it('hands back the run an advance ran, so a host can ask the person about the approvals it staged', async () => {
+    // A host driving the plan (an ACP driver, say) has to put the step's
+    // pending approvals in front of a person. Both advance() and
+    // streamAdvance() return the run's response for that.
+    const r = new Rig({ config: { events: { run_steps: true } } });
+    await r.active(steps(3));
+    r.calls([['weather', { city: 'Paris' }]]);
+    const outcome = await (await r.handle()).advance();
+    expect(outcome.status).toBe('ran');
+    expect(outcome.response?.pendingApprovals.map((pending) => pending.tool)).toEqual(['weather']);
+
+    const streamed = new Rig({ config: { events: { run_steps: true } } });
+    await streamed.active(steps(3));
+    streamed.calls([['weather', { city: 'Oslo' }]]);
+    const stream = (await streamed.handle()).streamAdvance();
+    let next = await stream.next();
+    while (next.done !== true) next = await stream.next();
+    expect(next.value.status).toBe('ran');
+    expect(next.value.response?.pendingApprovals.map((pending) => pending.tool)).toEqual(['weather']);
+    expect(next.value.toJSON()).not.toHaveProperty('response');
+  });
+
   it('holds a step on the approval its turn staged, and releases it only through a decision', async () => {
     const r = new Rig();
     await r.active();
