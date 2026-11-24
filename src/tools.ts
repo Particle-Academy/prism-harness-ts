@@ -4,6 +4,7 @@ import { HarnessError } from './errors.js';
 import type { Session } from './session.js';
 import { validateAgent } from './address.js';
 import { RegistrationCollision, registrationOwner } from './registration.js';
+import { carryPlanApprovalGate } from './plans/gates.js';
 
 /**
  * The shape this package needs from a tool.
@@ -392,7 +393,7 @@ export function authorizedTool(
   session: Session,
   authorizer: ToolAuthorizer,
 ): HarnessTool {
-  return {
+  const wrapped: HarnessTool = {
     name: tool.name,
     description: tool.description,
     // Carried through, because the host tool policy decides on them: a wrapper
@@ -408,4 +409,8 @@ export function authorizedTool(
       return tool.handle(args);
     },
   };
+  // A plan tool keeps its own approval gate through this wrapper (G-360).
+  carryPlanApprovalGate(tool, wrapped);
+
+  return wrapped;
 }

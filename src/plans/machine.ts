@@ -191,7 +191,12 @@ export const PlanMachine = {
   // -- Drafting ---------------------------------------------------------------
 
   /** Check a draft at the tool boundary. Refused, never truncated. */
-  checkDraft(args: unknown, limits: PlanLimits): CheckedDraft {
+  checkDraft(args: unknown, limits: PlanLimits, authorized = true): CheckedDraft {
+    if (!authorized) {
+      // The host's call policy refused this call: nothing is checked,
+      // recorded or proposed, and the live-plan slot stays free.
+      throw PlanRefused.because('plan.not_authorized');
+    }
     const map = isPlainObject(args) || Array.isArray(args) ? args : null;
     if (map === null || Array.isArray(map) || !has(map, 'goal') || !has(map, 'steps') || diff(keysOf(map), ['goal', 'steps']).length > 0) {
       throw PlanRefused.because('plan.shape');
@@ -455,7 +460,12 @@ export const PlanMachine = {
    *
    * @returns the plan, and a refusal code or null
    */
-  pause(original: Plan, input: unknown, digest: string | null, ids: PlanIds, limits: PlanLimits, now: number, runId: string | null): [Plan, string | null] {
+  pause(original: Plan, input: unknown, digest: string | null, ids: PlanIds, limits: PlanLimits, now: number, runId: string | null, authorized = true): [Plan, string | null] {
+    if (!authorized) {
+      // The host's call policy refused this call: nothing is checked,
+      // recorded or proposed, and the live-plan slot stays free.
+      throw PlanRefused.because('plan.not_authorized');
+    }
     const args = asMap(input);
     if (args === null || diff(keysOf(args), ['kind', 'question', 'options']).length > 0
       || !['approve', 'input'].includes(get(args, 'kind') as string)) {
@@ -542,7 +552,12 @@ export const PlanMachine = {
    * stale revision, an unknown id and a step that cannot be replaced get the
    * same refusal.
    */
-  proposeChange(original: Plan, input: unknown, digest: string, ids: PlanIds, limits: PlanLimits, now: number, runId: string | null): Plan {
+  proposeChange(original: Plan, input: unknown, digest: string, ids: PlanIds, limits: PlanLimits, now: number, runId: string | null, authorized = true): Plan {
+    if (!authorized) {
+      // The host's call policy refused this call: nothing is checked,
+      // recorded or proposed, and the live-plan slot stays free.
+      throw PlanRefused.because('plan.not_authorized');
+    }
     const args = asMap(input);
     const entries = args === null ? null : asList(get(args, 'steps'));
     if (args === null || diff(keysOf(args), ['reason', 'base_revision', 'steps']).length > 0 || entries === null) {

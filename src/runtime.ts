@@ -851,7 +851,11 @@ export class AgentRuntime {
         // the host policy: neither can ask about it or let it through.
         const own = planApprovalGate(tool);
         if (own !== null) {
-          if (await own(call.arguments)) gated.push(call);
+          // The host's call policy first: a call it forbids records nothing,
+          // asks no one, and is refused by the authorizer when it runs.
+          const authorized = this.#authorizer === undefined || tool === undefined
+            ? true : await this.#authorizer.allowsCall(session, tool, call.arguments);
+          if (await own(call.arguments, authorized)) gated.push(call);
           continue;
         }
         if (!mode.needsApproval(call.name)) continue;

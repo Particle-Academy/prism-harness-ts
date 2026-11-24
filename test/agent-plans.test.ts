@@ -8,6 +8,7 @@ import {
   Plans,
   PrismHarness,
   RunContext,
+  ToolAuthorizer,
   ToolPolicy,
   ToolRegistry,
   diagnose,
@@ -51,6 +52,7 @@ interface RigOptions {
   config?: PlansConfig;
   mode?: Partial<ModeConfig> & Record<string, unknown>;
   toolPolicy?: ToolPolicy;
+  authorizer?: ToolAuthorizer;
 }
 
 type Call = [string, JsonObject];
@@ -82,6 +84,7 @@ class Rig {
       tools,
       events,
       ...(options.toolPolicy === undefined ? {} : { toolPolicy: options.toolPolicy }),
+      ...(options.authorizer === undefined ? {} : { authorizer: options.authorizer }),
       client: async (request) => {
         this.requests.push(request);
         const next = this.queue.shift();
@@ -779,4 +782,75 @@ describe('agent plans (G-360)', () => {
       expect(() => modes.resolve('chat')).toThrow(expect.objectContaining({ code: 'mode_malformed' }));
     },
   );
+});
+
+describe('a host call policy that forbids a plan tool (G-360 follow-up)', () => {
+  // The host's call policy is asked BEFORE a draft, a change or an approval
+  // pause is recorded. A forbidden draft writes no plan and leaves the
+  // live-plan slot free; a forbidden change or pause changes nothing.
+  function authorized(forbidden: Set<string>): Rig {
+    return new Rig({ authorizer: new ToolAuthorizer({ enabled: true, offer: () => true, call: (_session, tool) => !forbidden.has(tool.name) }) });
+  }
+
+  it('runs a plan end to end with the authorizer on and nothing forbidden', async () => {
+    const rig = authorized(new Set());
+    rig.calls([['plan_draft', draft()]]);
+    rig.text('spare');
+    const pending = (await rig.send('Plan the trip')).pendingApprovals;
+    expect(pending).toHaveLength(1);
+    expect((await rig.plan()).status).toBe('proposed');
+    rig.text('ok');
+    await rig.approve(pending[0]!.id);
+    expect((await rig.plan()).status).toBe('active');
+  });
+
+  it('records nothing and keeps the slot free when the host forbids plan_draft', async () => {
+    const forbidden = new Set(['plan_draft']);
+    const rig = authorized(forbidden);
+    rig.calls([['plan_draft', draft()]]);
+    // The authorizer refuses by throwing, so the run ends; nothing was recorded.
+    await rig.send('Plan the trip').catch(() => undefined);
+    expect(await rig.plans.load(rig.session())).toBeNull();
+
+    forbidden.clear();
+    rig.calls([['plan_draft', draft()]]);
+    expect((await rig.send('Plan the trip')).pendingApprovals).toHaveLength(1);
+    expect((await rig.plan()).status).toBe('proposed');
+  });
+
+  it('records no change when the host forbids plan_propose_change', async () => {
+    const forbidden = new Set<string>();
+    const rig = authorized(forbidden);
+    rig.calls([['plan_draft', draft()]]);
+    const pending = (await rig.send('Plan the trip')).pendingApprovals[0]!;
+    rig.text('ok');
+    await rig.approve(pending.id);
+    const plan = await rig.plan();
+
+    forbidden.add('plan_propose_change');
+    rig.calls([['plan_propose_change', { reason: 'better', base_revision: plan.revision, steps: [{ id: plan.steps[0].id }, { title: 'New', instruction: 'Do it.', owner: 'agent' }] }]]);
+    rig.text('Refused.');
+    await rig.send('Change it').catch(() => undefined);
+    const after = await rig.plan();
+    expect(after.pendingChange).toBeNull();
+    expect(after.status).toBe('active');
+    expect(after.counters.changes).toBe(0);
+  });
+
+  it('inserts no person step when the host forbids plan_pause_for_person', async () => {
+    const forbidden = new Set<string>();
+    const rig = authorized(forbidden);
+    rig.calls([['plan_draft', draft()]]);
+    const pending = (await rig.send('Plan the trip')).pendingApprovals[0]!;
+    rig.text('ok');
+    await rig.approve(pending.id);
+
+    forbidden.add('plan_pause_for_person');
+    rig.calls([['plan_pause_for_person', { kind: 'approve', question: 'May I book it?' }]]);
+    rig.text('Refused.');
+    await (await rig.handle()).advance().catch(() => undefined);
+    const plan = await rig.plan();
+    expect(plan.steps.map((step: Record<string, unknown>) => step.owner)).toEqual(['agent', 'agent']);
+    expect(plan.steps[0].pauses).toBe(0);
+  });
 });

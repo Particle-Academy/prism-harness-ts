@@ -6,30 +6,9 @@ import { PlanMachine, type Plan } from './machine.js';
 import type { Plans } from './plans.js';
 import { PlanRefused, planRefusalForModel } from './refusal.js';
 import { approvedCallsAwaitingResult } from './thread.js';
+import { setPlanApprovalGate } from './gates.js';
 
-/** A plan tool decides for itself, per call, whether a person must approve it. */
-type ApprovalGate = (args: JsonObject) => Promise<boolean>;
-
-/**
- * The plan tools' own approval gates, keyed by the tool object the harness
- * built. Only a tool built here is in this map, so no registered tool can
- * claim to gate itself and slip out from under its mode's approval list.
- */
-const GATES = new WeakMap<HarnessTool, ApprovalGate>();
-
-/**
- * The approval gate of a plan tool, or null for every other tool.
- *
- * A plan tool gates itself: a draft, a change and an approval pause are core
- * approvals bound to their exact arguments. The runtime consults this INSTEAD
- * of the mode's approval list and the host tool policy, so neither a mode
- * gating `*` nor a permissive policy can wrap or bypass it.
- *
- * @internal
- */
-export function planApprovalGate(tool: HarnessTool | undefined): ApprovalGate | null {
-  return tool === undefined ? null : (GATES.get(tool) ?? null);
-}
+export { planApprovalGate } from './gates.js';
 
 function digest(args: JsonObject): string {
   return argsDigest(args);
@@ -84,9 +63,9 @@ export function planTools(plans: Plans, session: Session): HarnessTool[] {
   const approved = async (tool: string, hash: string): Promise<boolean> =>
     approvedCallsAwaitingResult((await session.thread().messages()).map((entry) => entry.message), tool, hash) > 0;
 
-  const proposal = async (args: JsonObject, hash: string): Promise<Plan> => {
+  const proposal = async (args: JsonObject, hash: string, authorized = true): Promise<Plan> => {
     const limits = plans.limits();
-    const draft = PlanMachine.checkDraft(args, limits);
+    const draft = PlanMachine.checkDraft(args, limits, authorized);
     if (PlanMachine.isLive(await plans.load(session))) throw PlanRefused.because('plan.exists');
 
     return PlanMachine.propose(draft, hash, plans.ids(), plans.now(), await plans.runId(session), limits);
@@ -97,13 +76,13 @@ export function planTools(plans: Plans, session: Session): HarnessTool[] {
     throw error;
   };
 
-  const applyPause = async (args: JsonObject, hash: string | null): Promise<string | null> => {
+  const applyPause = async (args: JsonObject, hash: string | null, authorized = true): Promise<string | null> => {
     let code: string | null = null;
     let plan: Plan | null;
     try {
       const runId = await plans.runId(session);
       plan = await plans.mutate(session, (current) => {
-        const [next, refusal] = PlanMachine.pause(current, args, hash, plans.ids(), plans.limits(), plans.now(), runId);
+        const [next, refusal] = PlanMachine.pause(current, args, hash, plans.ids(), plans.limits(), plans.now(), runId, authorized);
         code = refusal;
 
         return next;
@@ -150,11 +129,11 @@ export function planTools(plans: Plans, session: Session): HarnessTool[] {
       }
     },
   };
-  GATES.set(draft, async (args) => {
+  setPlanApprovalGate(draft, async (args, authorized) => {
     if (!plans.limits().requireApproval) return false;
     const hash = digest(args);
     try {
-      const plan = await proposal(args, hash);
+      const plan = await proposal(args, hash, authorized);
       await plans.write(session, plan, (await plans.load(session))?.revision ?? null);
     } catch (error) {
       refusals.set(PlanMachine.DRAFT + hash, refusedCode(error));
@@ -187,7 +166,7 @@ export function planTools(plans: Plans, session: Session): HarnessTool[] {
       return 'Noted. The step will be settled after this turn. Stop work on it now.';
     },
   };
-  GATES.set(complete, async () => false);
+  setPlanApprovalGate(complete, async () => false);
 
   const pause: PlanTool = {
     name: PlanMachine.PAUSE,
@@ -215,10 +194,10 @@ export function planTools(plans: Plans, session: Session): HarnessTool[] {
         : 'The question is with the person. End your turn now; the plan continues after they answer.';
     },
   };
-  GATES.set(pause, async (args) => {
+  setPlanApprovalGate(pause, async (args, authorized) => {
     if (args.kind !== 'approve') return false;
     const hash = digest(args);
-    const code = await applyPause(args, hash);
+    const code = await applyPause(args, hash, authorized);
     if (code !== null) {
       refusals.set(PlanMachine.PAUSE + hash, code);
 
@@ -253,11 +232,11 @@ export function planTools(plans: Plans, session: Session): HarnessTool[] {
       return 'The person approved the change. The plan now follows the new steps.';
     },
   };
-  GATES.set(change, async (args) => {
+  setPlanApprovalGate(change, async (args, authorized) => {
     const hash = digest(args);
     try {
       const runId = await plans.runId(session);
-      const plan = await plans.mutate(session, (current) => PlanMachine.proposeChange(current, args, hash, plans.ids(), plans.limits(), plans.now(), runId));
+      const plan = await plans.mutate(session, (current) => PlanMachine.proposeChange(current, args, hash, plans.ids(), plans.limits(), plans.now(), runId, authorized));
       if (plan === null) throw PlanRefused.because('plan.no_plan');
     } catch (error) {
       refusals.set(PlanMachine.CHANGE + hash, refusedCode(error));
