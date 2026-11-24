@@ -29,7 +29,8 @@ export type HarnessEvent =
   | ToolAutoAllowed
   | ToolApprovalAsked
   | ToolApproved
-  | ToolDenied;
+  | ToolDenied
+  | ToolApprovalExpired;
 
 /**
  * One decision about a call to a tool that needs approval (G-326).
@@ -72,6 +73,16 @@ export interface ToolApproved extends ToolDecisionEvent {
  */
 export interface ToolDenied extends ToolDecisionEvent {
   type: 'tool_denied';
+}
+
+/**
+ * A person approved the call, but the approval was stored by 0.11.0 or earlier
+ * without a marker, on a call stored as no arguments, which cannot be told
+ * apart from a garbled call. The call does not run and the model is told to
+ * call again. `argsDigest` is the digest of no arguments.
+ */
+export interface ToolApprovalExpired extends ToolDecisionEvent {
+  type: 'tool_approval_expired';
 }
 
 /**

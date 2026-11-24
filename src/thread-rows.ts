@@ -36,7 +36,17 @@ export type ToolResultEntry = {
 export type ApprovalRequestEntry = {
   approval_id: string;
   tool_call_id: string;
+  /** Present when the call's arguments were stored as the model sent them. */
+  arguments_format?: number;
 };
+
+/**
+ * The marker on an approval request whose call was stored exactly as the model
+ * sent it. 0.11.0 and earlier stored a call whose arguments were a bare number
+ * or boolean as `{}`, the same as a real call with no arguments, and wrote no
+ * marker; such an approval expires instead of running.
+ */
+export const ARGUMENTS_AS_SENT = 1;
 
 export type ApprovalDecisionEntry = {
   approval_id: string;
@@ -211,6 +221,36 @@ export function unusableStoredCalls(rows: readonly JsonObject[]): Set<string> {
   return unusable;
 }
 
+/**
+ * The ids of stored calls whose approval expires rather than runs: the request
+ * has no marker and the call was stored as no arguments, which is also how
+ * 0.11.0 and earlier stored a call whose arguments were a bare number or
+ * boolean. Read from the rows as written, like `unusableStoredCalls`.
+ */
+export function ambiguousStoredCalls(rows: readonly JsonObject[]): Set<string> {
+  const unmarked = new Set<string>();
+
+  for (const row of threadView(rows)) {
+    if (row.type !== 'assistant') continue;
+    for (const request of (row as AssistantRow).tool_approval_requests) {
+      if (request.arguments_format !== ARGUMENTS_AS_SENT) unmarked.add(request.tool_call_id);
+    }
+  }
+
+  const ambiguous = new Set<string>();
+
+  for (const row of rows) {
+    if (row.type !== 'assistant') continue;
+    for (const call of list(row.tool_calls)) {
+      const id = text(call.id);
+      const usable = usableArguments(call.arguments);
+      if (unmarked.has(id) && usable !== null && Object.keys(usable).length === 0) ambiguous.add(id);
+    }
+  }
+
+  return ambiguous;
+}
+
 function normalise(row: JsonObject, view: JsonObject[]): JsonObject | null {
   switch (row.type) {
     case 'assistant':
@@ -228,6 +268,7 @@ function normalise(row: JsonObject, view: JsonObject[]): JsonObject | null {
         list(row.tool_approval_requests).map((request) => ({
           approval_id: text(request.approval_id),
           tool_call_id: text(request.tool_call_id),
+          ...(request.arguments_format === ARGUMENTS_AS_SENT ? { arguments_format: ARGUMENTS_AS_SENT } : {}),
         })),
       );
 

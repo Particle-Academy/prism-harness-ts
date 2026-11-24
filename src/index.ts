@@ -54,6 +54,7 @@ export type {
   RunStarted,
   RunStepped,
   ToolApprovalAsked,
+  ToolApprovalExpired,
   ToolApproved,
   ToolAutoAllowed,
   ToolDecisionEvent,

@@ -149,7 +149,7 @@ describe('arguments as the loop reads them', () => {
         content: '',
         tool_calls: [{id: 'call-1', name: 'lookup', arguments: stored as JsonObject, result_id: null, reasoning_id: null, reasoning_summary: null}],
         additional_content: {},
-        tool_approval_requests: [{approval_id: 'apr-1', tool_call_id: 'call-1'}],
+        tool_approval_requests: [{approval_id: 'apr-1', tool_call_id: 'call-1', arguments_format: 1}],
       },
     ]);
 
