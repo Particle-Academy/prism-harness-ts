@@ -356,6 +356,13 @@ A call that has a result never runs again. Who may approve is your application's
 decision: authorize before calling `recordApproval()`. `recordDecisions(session,
 [{ approvalId, approved, reason }])` records several decisions as one row.
 
+A decision must answer an approval the session is waiting on. `recordApproval()`,
+`recordDecisions()` and `streamDecision()` reject with a `HarnessError` coded
+`approval_not_pending` for an approval id the run never issued, or one already
+answered, and refuse the whole batch when any one decision is like that. Nothing
+is written and nothing is sent, so a made-up id cannot cancel a real one, and a
+decision with nothing pending starts no model turn.
+
 ## Run steps for a UI
 
 `streamSteps()` takes the same arguments as `send()` and yields run steps as the
@@ -399,7 +406,8 @@ then, once the stream starts and under the session lock, records them in the
 thread exactly as `recordApproval()` does and resumes the run. The first step for
 each decision is `decision_recorded` (`approvalId`, `verdict`, `reason`,
 `actor`); the run's steps follow, continuing its `seq`. Decisions are saved
-before any tool runs, so resuming again runs nothing twice. The resumed run emits
+before any tool runs, so resuming again runs nothing twice: streaming the same
+decision again is refused with `approval_not_pending`. The resumed run emits
 `run.resumed`, not a second `run.started`. `actor` comes from your `RunContext`,
 never from the model.
 

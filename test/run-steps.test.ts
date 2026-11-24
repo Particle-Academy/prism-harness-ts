@@ -565,16 +565,20 @@ describe('streamDecision', () => {
     expect((await decisionRow(viaStream))?.tool_approval_responses).toEqual([{ approval_id: idOf(viaStream), approved: false, reason: 'no' }]);
   });
 
-  it('runs nothing twice when the same decision is streamed again', async () => {
+  it('refuses the same decision streamed again, and runs nothing twice', async () => {
     const { session, parked, ran, rt } = await parkOnApproval(2);
     const approvalId = ofType(parked, 'approval_request')[0]!.approvalId;
 
     await collect(rt.streamDecision(session, [{ approvalId, approved: true }]));
-    const { steps: again } = await collect(rt.streamDecision(session, [{ approvalId, approved: true }]));
+    const rows = (await session.thread().messages()).length;
+
+    // Already answered, so no longer pending: refused before anything is
+    // recorded or sent (G-354).
+    await expect(collect(rt.streamDecision(session, [{ approvalId, approved: true }])))
+      .rejects.toMatchObject({ code: 'approval_not_pending' });
 
     expect(ran.tick).toBe(1);
-    expect(again[0]!.type).toBe('decision_recorded');
-    expect(ofType(again, 'tool_result')).toEqual([]);
+    expect((await session.thread().messages()).length).toBe(rows);
   });
 
   it('reports a denied decision, and the call it denied as refused', async () => {

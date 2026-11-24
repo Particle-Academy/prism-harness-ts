@@ -14,6 +14,7 @@ import {
   type ToolResultRow,
   unusableStoredCalls,
   ambiguousCalls,
+  pendingApprovalIds,
   ARGUMENTS_AS_SENT,
 } from './thread-rows.js';
 import { usableArguments } from './tool-arguments.js';
@@ -459,8 +460,11 @@ export class AgentRuntime {
    * tool runs or any provider is called; one `decision_recorded` step is
    * yielded per decision; then the run continues as `streamSteps()` does. A
    * stream dropped after it started has still recorded every decision, and
-   * resuming again executes nothing twice. A stream that cannot take the lock
-   * fails with `session_locked` and records nothing.
+   * streaming the same decision again is refused with `approval_not_pending`,
+   * since that approval is no longer pending. A decision for an id the run
+   * never issued is refused the same way, inside the lock, before anything is
+   * recorded or sent (G-354). A stream that cannot take the lock fails with
+   * `session_locked` and records nothing.
    *
    * When the session still knows the run that parked, the continuation runs
    * under that run's id, its `seq` continues where that run's stream ended,
@@ -1226,8 +1230,20 @@ export async function recordDecisions(session: Session, decisions: readonly Appr
   await writeDecisions(session, assertDecisions(decisions));
 }
 
-/** Where decisions are made durable, for every path that takes them. */
+/**
+ * Where decisions are made durable, for every path that takes them.
+ *
+ * Every decision must name an approval the session is waiting on (G-354). An
+ * id the run never issued, an id already answered, or the same id twice in one
+ * batch refuses the WHOLE batch with `approval_not_pending`, before anything
+ * is written and so before any tool or provider call.
+ */
 async function writeDecisions(session: Session, decisions: readonly ApprovalDecision[]): Promise<void> {
+  const pending = new Set(pendingApprovalIds((await session.thread().messages()).map((entry) => entry.message)));
+  for (const decision of decisions) {
+    if (!pending.delete(decision.approvalId)) throw HarnessError.approvalNotPending(decision.approvalId);
+  }
+
   const run = await session.run();
 
   await session.thread().record([toolResultRow([], decisions.map((decision) => ({

@@ -184,6 +184,37 @@ export function approvalToolScope(rows: readonly JsonObject[]): { names: string[
 }
 
 /**
+ * The approval ids the run paused at the transcript tail is still waiting on:
+ * issued by the last assistant step and not yet answered (G-354).
+ *
+ * Read from the stored rows, newest first. A user turn, or an assistant step
+ * that asked nothing, ends the scope: nothing before it is pending. An id
+ * answered once is no longer pending.
+ */
+export function pendingApprovalIds(rows: readonly JsonObject[]): string[] {
+  const answered = new Set<string>();
+  for (let index = rows.length - 1; index >= 0; index -= 1) {
+    const row = rows[index]!;
+    if (row.type === 'tool_result') {
+      for (const response of list(row.tool_approval_responses)) {
+        if (typeof response.approval_id === 'string') answered.add(response.approval_id);
+      }
+      continue;
+    }
+    if (row.type === 'user') return [];
+    if (row.type !== 'assistant') continue;
+
+    const pending = list(row.tool_approval_requests)
+      .map(request => request.approval_id)
+      .filter((id): id is string => typeof id === 'string' && id !== '' && !answered.has(id));
+
+    return [...new Set(pending)];
+  }
+
+  return [];
+}
+
+/**
  * The model steps the run paused at the transcript tail has already taken, or
  * null when nothing at the tail is waiting on an approval.
  *

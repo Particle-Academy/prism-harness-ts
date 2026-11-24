@@ -36,6 +36,12 @@ export type HarnessErrorCode =
   | 'tool_policy_refused'
   /** A skill file was asked for that would resolve outside its own skill. */
   | 'skill_path_refused'
+  /**
+   * A decision named an approval the session is not waiting on: one the run
+   * never issued, or one already answered (G-354). Refused before anything is
+   * written or sent. The same code in the PHP reference and the Python port.
+   */
+  | 'approval_not_pending'
   /** A task was added under an id the source already holds. */
   | 'duplicate_task_id'
   /** A worker id or a task id was the empty string. */
@@ -383,6 +389,20 @@ export class HarnessError extends Error {
         'agent that can close its own tasks turns "run until the goal is met" into "run until it ' +
         'decides it is met". Enable the authorizer and give it a call policy, or do not register ' +
         'this tool.',
+    );
+  }
+
+  /**
+   * A decision for an approval that is not pending (G-354).
+   *
+   * Accepted, a made-up id closed a pending call as unanswered, cancelling the
+   * person's real decision, and with nothing pending started a model turn with
+   * no new user message.
+   */
+  static approvalNotPending(approvalId: string): HarnessError {
+    return new HarnessError(
+      'approval_not_pending',
+      `No pending approval has the id [${approvalId}]. It was never issued, or it has already been answered.`,
     );
   }
 

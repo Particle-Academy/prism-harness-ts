@@ -110,7 +110,8 @@ describe('failed model steps are terminal', () => {
       const assistant = rows.find(row => row.type === 'assistant');
       expect(assistant?.tool_approval_requests).toEqual([]);
       expect(rows.some(row => row.type === 'tool_result' && JSON.stringify(row).includes('Not run'))).toBe(withTools);
-      await recordApproval(session, 'failed-call', true);
+      // The failed step issued no approval, so this answers nothing (G-354).
+      await expect(recordApproval(session, 'failed-call', true)).rejects.toMatchObject({ code: 'approval_not_pending' });
       await rt.send(session, '');
       expect(modelCalls).toBe(2);
       expect(toolCalls).toBe(0);
