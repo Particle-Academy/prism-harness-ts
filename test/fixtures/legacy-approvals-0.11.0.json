@@ -1,0 +1,102 @@
+{
+  "written_by": "@particle-academy/prism-harness 0.11.0",
+  "wire_number": {
+    "approval_id": "apr_4f10ff51d0d64927bde9eb03df429ee6",
+    "rows": [
+      {
+        "type": "user",
+        "content": "Look it up."
+      },
+      {
+        "type": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "id": "call-1",
+            "name": "lookup",
+            "arguments": {},
+            "result_id": null,
+            "reasoning_id": null,
+            "reasoning_summary": null
+          }
+        ],
+        "additional_content": {},
+        "tool_approval_requests": [
+          {
+            "approval_id": "apr_4f10ff51d0d64927bde9eb03df429ee6",
+            "tool_call_id": "call-1"
+          }
+        ],
+        "harness_tool_names": [
+          "lookup"
+        ]
+      }
+    ]
+  },
+  "wire_true": {
+    "approval_id": "apr_5377ad745ac34b2aaa613b529d4cec45",
+    "rows": [
+      {
+        "type": "user",
+        "content": "Look it up."
+      },
+      {
+        "type": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "id": "call-1",
+            "name": "lookup",
+            "arguments": {},
+            "result_id": null,
+            "reasoning_id": null,
+            "reasoning_summary": null
+          }
+        ],
+        "additional_content": {},
+        "tool_approval_requests": [
+          {
+            "approval_id": "apr_5377ad745ac34b2aaa613b529d4cec45",
+            "tool_call_id": "call-1"
+          }
+        ],
+        "harness_tool_names": [
+          "lookup"
+        ]
+      }
+    ]
+  },
+  "empty_object": {
+    "approval_id": "apr_f6285e3d888848829e0d8708128f2681",
+    "rows": [
+      {
+        "type": "user",
+        "content": "Look it up."
+      },
+      {
+        "type": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "id": "call-1",
+            "name": "lookup",
+            "arguments": {},
+            "result_id": null,
+            "reasoning_id": null,
+            "reasoning_summary": null
+          }
+        ],
+        "additional_content": {},
+        "tool_approval_requests": [
+          {
+            "approval_id": "apr_f6285e3d888848829e0d8708128f2681",
+            "tool_call_id": "call-1"
+          }
+        ],
+        "harness_tool_names": [
+          "lookup"
+        ]
+      }
+    ]
+  }
+}

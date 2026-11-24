@@ -13,6 +13,8 @@ import {
   type ToolResultEntry,
   type ToolResultRow,
   unusableStoredCalls,
+  ambiguousCalls,
+  ARGUMENTS_AS_SENT,
 } from './thread-rows.js';
 import { usableArguments } from './tool-arguments.js';
 import { admitAttachments } from './attachments.js';
@@ -193,6 +195,11 @@ interface Invoked {
 
 const REFUSED_CALL: ToolCallOutcome = { ok: false, code: 'tool_call_refused', refused: true };
 
+function approvalExpired(tool: string): string {
+  return `Not run: the approval for ${tool} was recorded by an earlier version and has expired. `
+    + 'Call the tool again if it is still needed, and the person will be asked to approve it again.';
+}
+
 export interface RuntimeConfig {
   provider?: string | null;
   model?: string | null;
@@ -307,7 +314,7 @@ export class AgentRuntime {
   }
 
   #toolDecision(
-    type: 'tool_auto_allowed' | 'tool_approval_asked' | 'tool_approved' | 'tool_denied',
+    type: 'tool_auto_allowed' | 'tool_approval_asked' | 'tool_approved' | 'tool_denied' | 'tool_approval_expired',
     session: Session,
     runId: string,
     call: { id: string; name: string; arguments: unknown },
@@ -798,6 +805,7 @@ export class AgentRuntime {
       const requests: ApprovalRequestEntry[] = gated.map((call) => ({
         approval_id: `apr_${randomUUID().replaceAll('-', '')}`,
         tool_call_id: call.id,
+        arguments_format: ARGUMENTS_AS_SENT,
       }));
 
       // The next step's request is built from this row, so it keeps what a
@@ -963,6 +971,15 @@ export class AgentRuntime {
           const entry = toolResultEntry(input, `Not run: the arguments for ${call.name} are not a JSON object.`);
           steps?.toolResult(call.id, entry.result, { ok: false, code: 'tool_failed', refused: false });
           resolved.push(entry);
+        } else if (decision?.approved === true && work.ambiguous.has(call.id)) {
+          // Stored by 0.11.0 or earlier, which wrote no marker and stored a
+          // bare number or boolean as no arguments. Not run, and recorded
+          // without arguments; the model is told to call again, and a new
+          // call is a new approval for the person.
+          const entry = toolResultEntry({ ...input, arguments: {} }, approvalExpired(call.name));
+          this.#toolDecision('tool_approval_expired', live, runId, { ...input, arguments: {} }, declared, 'policy');
+          steps?.toolResult(call.id, entry.result, { ok: false, code: 'approval_denied', refused: true });
+          resolved.push(entry);
         } else if (decision?.approved === true) {
           this.#toolDecision('tool_approved', live, runId, input, declared, 'person');
           called.push(call.name);
@@ -1002,6 +1019,7 @@ export class AgentRuntime {
     approvalIds: Map<string, string>;
     scope: ReturnType<typeof approvalToolScope>;
     unusable: Set<string>;
+    ambiguous: Set<string>;
   } | null> {
     const rows = (await session.thread().messages()).map((entry) => entry.message);
     const view = threadView(rows);
@@ -1025,7 +1043,7 @@ export class AgentRuntime {
       (call) => !results.has(call.id) && (approvalIds.has(call.id) || mode.needsApproval(call.name)),
     );
 
-    return calls.length === 0 ? null : { calls, results, decisions, approvalIds, scope: approvalToolScope(rows), unusable: unusableStoredCalls(rows) };
+    return calls.length === 0 ? null : { calls, results, decisions, approvalIds, scope: approvalToolScope(rows), unusable: unusableStoredCalls(rows), ambiguous: ambiguousCalls(assistant) };
   }
 
   /**
