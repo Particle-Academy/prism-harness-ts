@@ -503,14 +503,22 @@ export class AgentRuntime {
       const parked = await this.#parkedRun(live);
 
       // DURABLE FIRST, through the one writer every decision path uses, and
-      // before any tool or provider call.
-      await writeDecisions(live, decisions);
+      // before any tool or provider call. A plan the decisions wrote is noted
+      // (G-360): this stream opens with it even when the decision ended it, or
+      // the reader would never learn that a draft was rejected.
+      let decidedPlan = false;
+      const capture = live.planService()?.watch(live.key(), () => { decidedPlan = true; }) ?? (() => {});
+      try {
+        await writeDecisions(live, decisions);
+      } finally {
+        capture();
+      }
 
       const tagger = this.#tagger(context, channel, parked?.lastSeq ?? 0);
       const execution = executionContext(context);
       const runId = parked?.id ?? randomUUID();
       tagger.bind(live.key(), runId, execution?.parentRunId ?? null, execution?.rootRunId ?? runId);
-      const unwatch = await this.#watchPlan(live, tagger);
+      const unwatch = await this.#watchPlan(live, tagger, decidedPlan);
 
       try {
         for (const decision of decisions) {
@@ -533,7 +541,7 @@ export class AgentRuntime {
    * (G-360, contract g282.3): the plans config's `events.run_steps`, and plans
    * on for this session. Off by default: the stream then stays g282.1.
    */
-  async #watchPlan(session: Session, tagger: RunStepTagger): Promise<() => void> {
+  async #watchPlan(session: Session, tagger: RunStepTagger, written = false): Promise<() => void> {
     const plans = session.planService();
     if (plans === null) return () => {};
     try {
@@ -542,7 +550,7 @@ export class AgentRuntime {
       return () => {};
     }
     const initial = await plans.load(session);
-    tagger.plans(() => initial);
+    tagger.plans(() => initial, written);
 
     return plans.watch(session.key(), (plan) => tagger.planUpdated(plan));
   }
