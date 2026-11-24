@@ -164,4 +164,27 @@ describe('approvals that are not ambiguous', () => {
 
     expect(received).toEqual([{city: 'Paris'}]);
   });
+
+  it('runs a marked approval on a call id that an older, resolved, unmarked request also used', async () => {
+    // Some providers number calls per response, so ids repeat across turns.
+    // Only the turn being resumed decides whether an approval is ambiguous.
+    const live = await session();
+    await live.thread().record([
+      ...storedRow({}, {}),
+      {type: 'tool_result', tool_results: [{tool_call_id: 'call-1', tool_name: 'lookup', args: {}, result: 'done before', tool_call_result_id: null, artifacts: []}],
+        tool_approval_responses: [{approval_id: 'apr-1', approved: false, reason: null}]},
+      {type: 'assistant', content: 'ok', tool_calls: [], additional_content: {}, tool_approval_requests: []},
+    ]);
+
+    const first = runtime([{text: '', finishReason: 'tool_calls', toolCalls: [{id: 'call-1', name: 'lookup', arguments: {}}]}]);
+    const paused = await first.agent.send(live, 'Again.');
+    expect(paused.pendingApprovals).toHaveLength(1);
+
+    const second = runtime([]);
+    await recordApproval(live, paused.pendingApprovals[0]!.id, true);
+    await second.agent.send(live, '');
+
+    expect(second.received).toEqual([{}]);
+    expect(second.seen.map(event => event.type)).not.toContain('tool_approval_expired');
+  });
 });
