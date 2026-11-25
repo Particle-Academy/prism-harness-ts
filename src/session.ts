@@ -22,6 +22,12 @@ export interface Participant {
   id: string | number;
 }
 
+/** A subagent child's run tree and shared plan budget references (G-366). */
+export interface ChildRefs {
+  tree: { session: string; run: string } | null;
+  planLedger: { session: string; plan: string } | null;
+}
+
 export interface RunState extends JsonObject {
   id: string;
   status: 'running' | 'completed' | 'failed';
@@ -248,6 +254,47 @@ export class Session {
     this.#assertWritable();
 
     return this.#lockStore.withLock(`${this.key()}:plan-advance`, callback, ttlSeconds, 0);
+  }
+
+  /**
+   * The run tree and shared plan budget this session was last started under
+   * by the subagent runner, as written by the runtime; null for a session the
+   * runner never started, or one written before these were kept here. Every
+   * turn on the child the runner did not start (an answer, a new message, a
+   * host context) continues them rather than starting fresh.
+   *
+   * @internal Read by the runtime and Plans.
+   */
+  async childRefs(): Promise<ChildRefs | null> {
+    const stored = (await this.#durable.get(this.#durableKey())) ?? {};
+    const refs = stored.child_refs;
+    if (!isJsonObject(refs)) return null;
+    const pair = (value: JsonValue | undefined, first: string, second: string): Record<string, string> | null => {
+      if (!isJsonObject(value)) return null;
+      const a = value[first], b = value[second];
+
+      return typeof a === 'string' && a !== '' && typeof b === 'string' && b !== '' ? { [first]: a, [second]: b } : null;
+    };
+
+    return {
+      tree: pair(refs.tree, 'session', 'run') as ChildRefs['tree'],
+      planLedger: pair(refs.plan_ledger, 'session', 'plan') as ChildRefs['planLedger'],
+    };
+  }
+
+  /** @internal Written by the runtime when the subagent runner starts a child run. */
+  async rememberChildRefs(refs: ChildRefs): Promise<this> {
+    this.#assertWritable();
+    const stored = (await this.#durable.get(this.#durableKey())) ?? {};
+    await this.#durable.put(this.#durableKey(), {
+      ...stored,
+      child_refs: {
+        tree: refs.tree === null ? null : { ...refs.tree },
+        plan_ledger: refs.planLedger === null ? null : { ...refs.planLedger },
+      },
+    });
+
+    return this;
   }
 
   async capability(name: string): Promise<JsonObject | null> {

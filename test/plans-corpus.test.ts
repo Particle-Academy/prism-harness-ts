@@ -101,6 +101,8 @@ function plansBudgetOp(op: Op, state: CaseState, now: number): unknown {
         return { ok: true };
       case 'budget_exhaustion':
         return { exhaustion: PlanBudget.exhaustion(state.ledger!) };
+      case 'budget_route':
+        return { route: PlanBudget.route(op.context, op.prompt, op.advancing, op.step_approval, op.saved_tree, op.saved_plan_ledger) };
       default:
         throw new Error(`Unknown op ${String(op.op)}`);
     }
@@ -261,8 +263,8 @@ describe('the harness-plans corpus (G-360)', () => {
     return;
   }
 
-  it('vendors all 52 cases', () => {
-    expect(corpus.cases).toHaveLength(52);
+  it('vendors all 55 cases', () => {
+    expect(corpus.cases).toHaveLength(55);
   });
 
   it.each(corpus.cases.map((entry) => [entry.id, entry] as const))('%s runs as the reference recorded it', (_id, entry) => {

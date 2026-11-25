@@ -231,7 +231,10 @@ the same run: the agent's spend so far is stored with the approval request and
 counts against the ceiling after the resume, as the step count does. A subagent's
 child run resumed that way, outside the runner, also keeps the provider and model
 it was bound to, and continues the run tree it was started in rather than getting
-a fresh root budget. The first time a root run starts a child, the tree's step and
+a fresh root budget. So does every other turn on the child session the runner did
+not start: a new message sent to it instead of an answer, and a turn handed a run
+context the host built, which is narrowed to what the tree (and the plan budget
+below) has left and can never widen it. The first time a root run starts a child, the tree's step and
 cost allowance is kept in the durable store, and the root run settles what the
 whole tree spent when it ends. The resumed child holds what the tree has left
 before it calls a provider, settles what it spent when it ends, and is refused
@@ -669,7 +672,8 @@ full once the plan lock TTL has passed. A plan's budget is fixed when it is
 first chosen or first used: after that its mode cannot change
 (`plan.budget_fixed`) and its limits can only be lowered. A step whose turn is
 handed a run tree of its own is refused (`plan.budget_context`) rather than run
-outside the ledger. An invalid mode or limit throws `PlanBudgetInvalid` when
+outside the ledger. A turn on a subagent child that a plan's turn started, handed
+a host-built context, is narrowed to what the plan budget has left instead. An invalid mode or limit throws `PlanBudgetInvalid` when
 plans are used, before anything runs. A turn the ledger refuses fails with
 `plan_budget_exhausted`.
 
