@@ -72,12 +72,12 @@ class Rig {
   onHost: () => Promise<string> = async () => 'ok';
   #call = 0;
 
-  constructor() {
+  constructor(chatSteps = 20) {
     const modes = new ModeRegistry({
       default: 'chat',
       modes: {
         chat: {
-          system_prompt: 'You delegate.', tools: ['research', 'scout', 'hostcall', 'weather'], requires_approval: ['weather'], max_steps: 20,
+          system_prompt: 'You delegate.', tools: ['research', 'scout', 'hostcall', 'weather'], requires_approval: ['weather'], max_steps: chatSteps,
           subagents: { research: { mode: 'research' }, scout: { mode: 'dig' } },
         } as ModeConfig,
         research: {
@@ -384,6 +384,36 @@ describe('a root that resumes its parked run after the ephemeral half expired', 
 
     expect(r.queue).toHaveLength(0);
     expect((await r.session(1, 'chat::sub::scout').childRefs())?.tree).toEqual({ session: root.key(), run: first.runId });
+  });
+});
+
+describe('a root that resumes its parked run and delegates again', () => {
+  it('leaves a parked subagent its tree budget after the root resumed, delegated and parked again', async () => {
+    const r = new Rig(6);
+    const root = r.session(1);
+    r.calls([['research', { task: 'Find the weather.' }]]); // root
+    r.calls([['weather', { city: 'Paris' }]]);              // research child: parks
+    r.calls([['weather', { city: 'Rome' }]]);               // root: parks
+    await r.runtime.send(root, 'Go');
+    const [first] = await r.pending(root);
+
+    r.calls([['scout', { task: 'Scout.' }]]);               // root, resumed
+    r.text('Scouted.');                                     // scout child
+    r.calls([['weather', { city: 'Oslo' }]]);               // root: parks again
+    await recordApproval(root, first!, true);
+    await r.runtime.send(root, '');
+    expect(await r.pending(root)).toHaveLength(1);
+
+    const child = r.session(1, 'chat::sub::research');
+    const [pending] = await r.pending(child);
+    expect(pending).toBeDefined();
+    r.text('Child done.');
+    const answered = await recordApproval(child, pending!, true).then(() => true, () => false);
+    if (answered) await r.runtime.send(child, '').catch(() => undefined);
+
+    expect(answered).toBe(true);
+    expect(await r.pending(child)).toEqual([]);
+    expect((await child.run())?.status).toBe('completed');
   });
 });
 

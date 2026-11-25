@@ -255,11 +255,17 @@ export const RunTrees = {
         max_cost_micros: entry.budget.maxCostUsd === null ? null : PlanBudget.micros(Math.max(0, entry.budget.maxCostUsd - entry.cost)),
       };
       const now = Math.floor(Date.now() / 1000);
-      // The record is the tree's (planId = its root run); the hold is the
-      // spending run's. They differ for a root resuming its parked run.
+      // A root resuming its parked run is in the tree that run began, but
+      // spends from its own budget: when that tree's record already exists
+      // (the parked run delegated before), it is left alone, so the resumed
+      // root never takes from what the subagents parked in it have left.
+      // Otherwise it is opened here, named by the tree's root run, and held
+      // under the run that spends. Either way it is not tried again; settling
+      // a hold that was never taken changes nothing.
       const tree = membership.tree;
-      await write(child.planStore(), tree, (state) =>
-        PlanBudget.reserve(state ?? PlanBudget.open(tree.run, settings), spends, Math.max(1, settings.max_steps), settings.max_cost_micros, now, entry.ttl));
+      await write(child.planStore(), tree, (state) => state !== null && spends !== tree.run
+        ? [null, null]
+        : PlanBudget.reserve(state ?? PlanBudget.open(tree.run, settings), spends, Math.max(1, settings.max_steps), settings.max_cost_micros, now, entry.ttl));
       entry.held = true;
     }
 
