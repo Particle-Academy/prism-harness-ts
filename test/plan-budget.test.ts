@@ -87,7 +87,7 @@ class Rig {
       default: 'chat',
       modes: {
         chat: { system_prompt: 'You are a travel agent.', tools: ['weather', 'lookup'], requires_approval: ['weather'], plans: true, ...this.options.mode } as ModeConfig,
-        research: { system_prompt: 'You research.', tools: ['lookup'], max_steps: 8 } as ModeConfig,
+        research: { system_prompt: 'You research.', tools: ['weather', 'lookup'], requires_approval: ['weather'], max_steps: 8 } as ModeConfig,
       },
     });
     const tools = new ToolRegistry()
@@ -488,5 +488,51 @@ describe('plan budgets (G-366)', () => {
     expect(r.requests.filter((request) => request.systemPrompt.startsWith('You research.'))).toHaveLength(1);
     expect(r.lookups).toBe(1);
     expect(r.queue).toHaveLength(0);
+  });
+
+  // A subagent child that pauses on an approval is resumed later on its own
+  // session, outside the runner. When the turn that started it spent from a
+  // shared plan budget, the resumed child spends from the same one.
+
+  /** A plan step that delegates; the child pauses on weather. */
+  async function pausedChild(maxSteps: number): Promise<{ r: Rig; child: Session; id: string }> {
+    const r = delegating(maxSteps);
+    await r.active(1);
+    r.calls([['research', { task: 'Find the weather.' }]]);   // parent
+    r.calls([['weather', { city: 'Paris' }]]);                 // child: pauses
+    r.calls([['plan_complete_step', { summary: 'Asked.' }]]);  // parent
+    r.text('Step done.');                                      // parent
+    await (await r.handle()).advance();
+
+    const child = r.harness.for({ type: 'User', id: 1 }).session('chat::sub::research');
+    const pending = (await child.thread().messages()).map((entry) => entry.message)
+      .flatMap((row) => Array.isArray(row.tool_approval_requests) ? row.tool_approval_requests as JsonObject[] : [])
+      .map((request) => request.approval_id as string);
+    expect(pending).toHaveLength(1);
+    expect((await (await r.handle()).budget())!.steps).toBe(4);
+
+    return { r, child, id: pending[0]! };
+  }
+
+  it('charges a child resumed outside the runner to the shared plan budget it was started under', async () => {
+    const { r, child, id } = await pausedChild(10);
+    r.text('Child answer.');
+    await recordApproval(child, id, true);
+    await r.runtime.send(child, '');
+
+    expect(r.weatherRan).toBe(1);
+    expect((await (await r.handle()).budget())!.steps).toBe(5);
+  });
+
+  it('refuses, recording nothing, an approval for a child whose shared plan budget is spent', async () => {
+    const { r, child, id } = await pausedChild(4);
+    const before = r.requests.length;
+    const results = async () => (await child.thread().messages()).filter((entry) => entry.message.type === 'tool_result').length;
+    const recorded = await results();
+
+    await expect(recordApproval(child, id, true)).rejects.toMatchObject({ code: 'plan_budget_exhausted' });
+    expect(await results()).toBe(recorded);
+    expect(r.weatherRan).toBe(0);
+    expect(r.requests.length).toBe(before);
   });
 });
