@@ -491,6 +491,24 @@ export class AgentRuntime {
     return this.#continueSteps(session, assertDecisions(decisions), context);
   }
 
+  /**
+   * Record a person's decision, as `recordApproval()` does, under the session
+   * lock with this session's agent's `lock_ttl` / `lock_wait`.
+   *
+   * `recordApproval()` and `recordDecisions()` take the same lock with fixed
+   * values (300 s / 30 s). The lock is not re-entrant: a caller already holding
+   * it is refused with `session_locked` once the wait runs out, and nothing is
+   * recorded. Nothing runs until the next `send()`. Authorize before calling.
+   */
+  async decide(session: Session, approvalId: string, approved: boolean, reason: string | null = null): Promise<void> {
+    await writeDecisionsLocked(
+      session,
+      assertDecisions([{ approvalId, approved, reason }]),
+      this.#setting(session, 'lock_ttl') ?? RESOLUTION_LOCK_SECONDS,
+      this.#setting(session, 'lock_wait') ?? RESOLUTION_WAIT_SECONDS,
+    );
+  }
+
   async *#continueSteps(
     session: Session,
     decisions: readonly ApprovalDecision[],
@@ -1343,8 +1361,13 @@ export async function recordDecisions(session: Session, decisions: readonly Appr
  * get the lock gets `session_locked` and nothing is recorded.
  * `streamDecision()` already holds this lock for its whole turn.
  */
-async function writeDecisionsLocked(session: Session, decisions: readonly ApprovalDecision[]): Promise<void> {
-  await session.lock((live) => writeDecisions(live, decisions), RESOLUTION_LOCK_SECONDS, RESOLUTION_WAIT_SECONDS);
+async function writeDecisionsLocked(
+  session: Session,
+  decisions: readonly ApprovalDecision[],
+  ttlSeconds: number = RESOLUTION_LOCK_SECONDS,
+  waitSeconds: number = RESOLUTION_WAIT_SECONDS,
+): Promise<void> {
+  await session.lock((live) => writeDecisions(live, decisions), ttlSeconds, waitSeconds);
 }
 
 /**

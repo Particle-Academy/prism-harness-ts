@@ -50,6 +50,21 @@
   answer for the resume, the tool scope and the plan alike; before, the resume
   acted on the later one, so a denial followed by an approval ran the call.
   The provider replay view is unchanged.
+  **Behaviour change: recording a decision now takes the session lock.** The
+  lock is not re-entrant, so a host that calls `recordApproval()` or
+  `recordDecisions()` from inside its own `session.lock(...)` callback now waits
+  and then fails with `session_locked`, recording nothing. Those two use fixed
+  values (300 s TTL, 30 s wait); the new `runtime.decide(session, approvalId,
+  approved, reason?)` records the same decision with the session's agent
+  `lock_ttl` / `lock_wait`, as `streamDecision()` does.
+- Tool call arguments holding values JSON has no form for are unusable, like
+  unparsable arguments: `undefined` in a list, a function, a symbol, a bigint,
+  or an object that is not a plain object (a `Date`, a `Map`, a class
+  instance). Such a call asks nobody and runs nothing, and the model is told.
+  These are exactly the values its digest cannot represent. Before, a gated call with
+  such a value threw a `TypeError` out of `send()` when its decision event was
+  digested, and a `Date` was digested as `{}` while being sent back as text.
+  An `undefined` property still reads as an absent one.
 - A named agent's `spend_ceiling` now holds across an approval pause. The
   agent's spend so far is stored on the row that asks for the approval
   (`harness_agent_spend`) and counted again when the run resumes, instead of
