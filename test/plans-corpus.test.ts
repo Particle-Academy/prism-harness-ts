@@ -137,7 +137,7 @@ function plansBindingContextOp(op: Op, state: CaseState): unknown {
 function plansTreeOp(op: Op): unknown {
   try {
     if (op.op === 'tree_membership') {
-      return { membership: RunTrees.membership(op.context, op.session, op.run, op.parent, op.saved_tree, op.saved_depth, op.context_depth) };
+      return { membership: RunTrees.membership(op.context, op.session, op.run, op.parent, op.saved_tree, op.saved_depth, op.context_depth, op.resumed_tree ?? null) };
     }
     const refs = RunTrees.keptRefs(op.membership, op.plan_ledger, op.saved_tree, op.saved_plan_ledger, op.saved_tree_cancelled);
 
@@ -338,8 +338,8 @@ describe('the harness-plans corpus (G-360)', () => {
     return;
   }
 
-  it('vendors all 70 cases', () => {
-    expect(corpus.cases).toHaveLength(70);
+  it('vendors all 71 cases', () => {
+    expect(corpus.cases).toHaveLength(71);
   });
 
   it.each(corpus.cases.map((entry) => [entry.id, entry] as const))('%s runs as the reference recorded it', (_id, entry) => {

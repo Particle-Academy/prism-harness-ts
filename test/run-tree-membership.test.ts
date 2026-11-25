@@ -10,6 +10,7 @@ import {
   RunLedger,
   SubagentRunner,
   ToolRegistry,
+  recordApproval,
   type Durability,
   type JsonObject,
   type LlmRequest,
@@ -60,12 +61,20 @@ class Rig {
     const modes = new ModeRegistry({
       default: 'chat',
       modes: {
-        chat: { system_prompt: 'You delegate.', tools: ['research', 'hostcall'], max_steps: 20, subagents: { research: { mode: 'research' } } } as ModeConfig,
+        chat: {
+          system_prompt: 'You delegate.', tools: ['research', 'scout', 'hostcall', 'weather'], requires_approval: ['weather'], max_steps: 20,
+          subagents: { research: { mode: 'research' }, scout: { mode: 'dig' } },
+        } as ModeConfig,
         research: {
           system_prompt: 'Research.', tools: ['weather', 'dig', 'hostcall'], requires_approval: ['weather'], max_steps: 8,
           subagents: { dig: { mode: 'dig' } },
         } as ModeConfig,
         dig: { system_prompt: 'Dig.', tools: [], max_steps: 4 } as ModeConfig,
+        // A delegation a person must approve first.
+        guarded: {
+          system_prompt: 'Guarded.', tools: ['research'], requires_approval: ['research'], max_steps: 3,
+          subagents: { research: { mode: 'research' } },
+        } as ModeConfig,
       },
     });
     const events = new HarnessEvents();
@@ -95,6 +104,9 @@ class Rig {
     });
     this.research = modes.resolve('chat').subagents.research!;
     const dig = modes.resolve('research').subagents.dig!;
+    const scout = modes.resolve('chat').subagents.scout!;
+    tools.registerFactory('scout', (session) => new SubagentRunner(this.harness, this.runtime)
+      .tool(scout, session, RunContext.root('scout', new RunBudget(100)), 'scout_run'));
     // The host wires each subagent tool with a context of its own; called by
     // a turn, the child runs in that turn's tree.
     tools.registerFactory('research', (session) => new SubagentRunner(this.harness, this.runtime)
@@ -113,6 +125,16 @@ class Rig {
 
   text(text = 'Done.'): void {
     this.queue.push({ text, finishReason: 'stop' });
+  }
+
+  /** The approval ids `session` is waiting on. */
+  async pending(session: Session): Promise<string[]> {
+    const rows = (await session.thread().messages()).map((entry) => entry.message);
+    const answered = new Set(rows.flatMap((row) => Array.isArray(row.tool_approval_responses) ? row.tool_approval_responses as JsonObject[] : [])
+      .map((response) => response.approval_id));
+
+    return rows.flatMap((row) => Array.isArray(row.tool_approval_requests) ? row.tool_approval_requests as JsonObject[] : [])
+      .map((request) => request.approval_id as string).filter((id) => !answered.has(id));
   }
 
   /** How many model calls a mode's runs made. */
@@ -300,5 +322,155 @@ describe('the depth a turn the runner did not start runs at', () => {
     await r.runtime.send(child, 'Again', undefined, new RunContext(RunLedger.start('host_deep'), new RunBudget(100), 'host_parent', 2));
 
     expect(r.depths).toEqual([2]);
+  });
+});
+
+describe('a root that resumes its parked run', () => {
+  it('stays in the tree its parked run began in, so a new subagent it starts after the resume saves that tree', async () => {
+    const r = new Rig();
+    const root = r.session(1);
+    r.calls([['research', { task: 'Find the weather.' }]]); // root
+    r.calls([['weather', { city: 'Paris' }]]);              // research child: parks
+    r.calls([['weather', { city: 'Rome' }]]);               // root: parks
+    const first = await r.runtime.send(root, 'Go');
+    const tree = { session: root.key(), run: first.runId };
+    expect((await r.session(1, 'chat::sub::research').childRefs())?.tree).toEqual(tree);
+    const [id] = await r.pending(root);
+    expect(id).toBeDefined();
+
+    r.calls([['scout', { task: 'Scout.' }]]);                // root, resumed
+    r.text('Scout answer.');                                // scout child
+    r.text('Root answer.');                                 // root
+    await recordApproval(root, id!, true);
+    const resumed = await r.runtime.send(root, '');
+
+    expect(resumed.runId).not.toBe(first.runId);
+    expect(r.queue).toHaveLength(0);
+    expect((await r.session(1, 'chat::sub::scout').childRefs())?.tree).toEqual(tree);
+  });
+});
+
+describe('a root that resumes a parked run that started no child', () => {
+  it('opens the parked run\'s tree for the child it starts, so that child can be resumed in it', async () => {
+    const r = new Rig();
+    const root = r.session(1);
+    r.calls([['weather', { city: 'Rome' }]]);               // root: parks, no child yet
+    const first = await r.runtime.send(root, 'Go');
+    const [id] = await r.pending(root);
+
+    r.calls([['research', { task: 'Find the weather.' }]]); // root, resumed
+    r.calls([['weather', { city: 'Paris' }]]);              // research child: parks
+    r.text('Root answer.');
+    await recordApproval(root, id!, true);
+    await r.runtime.send(root, '');
+    const child = r.session(1, 'chat::sub::research');
+    expect((await child.childRefs())?.tree).toEqual({ session: root.key(), run: first.runId });
+    const [childId] = await r.pending(child);
+
+    r.text('Child answer.');
+    await recordApproval(child, childId!, true);
+    await r.runtime.send(child, '');
+
+    expect(r.queue).toHaveLength(0);
+    expect(await r.pending(child)).toEqual([]);
+  });
+});
+
+describe('a top-level session that ran on a binding the host supplied', () => {
+  const hosted = (): RunContext => new RunContext(RunLedger.start('host_root'), new RunBudget(100), null, 0, {}, {
+    session: { provider: null, model: null },
+    declared: { provider: 'custom-cheap', model: 'cheap-model' },
+    parentMode: { provider: null, model: null },
+  });
+
+  it('keeps answering its approvals after a resume that opened a tree of its own parks again', async () => {
+    const r = new Rig();
+    const plain = r.session(1, 'plain');
+    r.calls([['weather', { city: 'Paris' }]]);
+    await r.runtime.send(plain, 'Go', undefined, hosted());
+    const [first] = await r.pending(plain);
+
+    // The resume reuses the row's binding and opens a tree of its own; it parks again.
+    r.calls([['weather', { city: 'Rome' }]]);
+    await recordApproval(plain, first!, true);
+    await r.runtime.send(plain, '');
+    const [second] = await r.pending(plain);
+    expect(second).toBeDefined();
+
+    r.text('Done.');
+    await recordApproval(plain, second!, true);
+    await r.runtime.send(plain, '');
+    r.text('Again.');
+    await r.runtime.send(plain, 'New question');
+
+    expect(r.queue).toHaveLength(0);
+    expect(await r.pending(plain)).toEqual([]);
+  });
+});
+
+// An approved subagent call runs when the session resumes, before the model is
+// called again. It runs inside the turn: in the turn's tree, at the turn's
+// depth and on the turn's budget, never on the context the host wired the
+// subagent tool with.
+describe('an approved subagent call, run on the resume', () => {
+  const drain = async (steps: AsyncGenerator<unknown, unknown, undefined>) => { for await (const _ of steps) { /* drained */ } };
+  const resumes = [['send', 'send'], ['streamDecision', 'streamDecision']] as const;
+
+  async function approve(r: Rig, session: Session, how: 'send' | 'streamDecision'): Promise<void> {
+    const [id] = await r.pending(session);
+    expect(id).toBeDefined();
+    if (how === 'send') {
+      await recordApproval(session, id!, true);
+      await r.runtime.send(session, '').catch(() => undefined);
+    } else {
+      await drain(r.runtime.streamDecision(session, [{ approvalId: id!, approved: true }])).catch(() => undefined);
+    }
+  }
+
+  it.each(resumes)('runs at the turn\'s depth, so it is refused past the ceiling (%s)', async (_label, how) => {
+    const r = new Rig();
+    const child = r.session(1, 'chat::sub::guarded');
+    await child.usingMode('guarded');
+    await child.rememberChildBinding(binding, 3);
+    r.calls([['research', { task: 'Find the weather.' }]]);   // parks on its approval
+    await r.runtime.send(child, 'Go');
+
+    r.text('Child answer.');
+    await approve(r, child, how);
+
+    expect(r.made('Research.')).toBe(0);
+    const refusals = (await child.thread().messages()).map((entry) => JSON.stringify(entry.message)).filter((row) => row.includes('maximum depth'));
+    expect(refusals).toHaveLength(1);
+  });
+
+  it.each(resumes)('spends from the turn\'s budget, never the host\'s (%s)', async (_label, how) => {
+    const r = new Rig();
+    const session = r.session(1, 'guarded');
+    await session.usingMode('guarded');
+    r.calls([['research', { task: 'Find the weather.' }]]);   // step 1 of 3: parks on its approval
+    await r.runtime.send(session, 'Go');
+    const before = r.requests.length;
+
+    // The child would take four steps; the turn has two left.
+    for (let i = 0; i < 3; i++) r.calls([['hostcall', {}]]);
+    r.text('Child answer.');
+    r.text('Answer.');
+    await approve(r, session, how);
+
+    expect(r.requests.length - before).toBe(2);
+  });
+
+  it('runs in the turn\'s tree, so the child saves it', async () => {
+    const r = new Rig();
+    const session = r.session(1, 'guarded');
+    await session.usingMode('guarded');
+    r.calls([['research', { task: 'Find the weather.' }]]);
+    const first = await r.runtime.send(session, 'Go');
+
+    r.text('Child answer.');
+    r.text('Answer.');
+    await approve(r, session, 'send');
+
+    expect((await r.session(1, 'guarded::sub::research').childRefs())?.tree).toEqual({ session: session.key(), run: first.runId });
   });
 });

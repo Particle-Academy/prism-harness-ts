@@ -16,6 +16,7 @@ import {
   unusableStoredCalls,
   ambiguousCalls,
   pendingApprovalIds,
+  pausedApprovalIds,
   ARGUMENTS_AS_SENT,
 } from './thread-rows.js';
 import { usableArguments } from './tool-arguments.js';
@@ -742,7 +743,9 @@ export class AgentRuntime {
     // run's tree, one level deeper; a turn the runner did not start continues
     // the tree its session saved, at least as deep as the runner started it; a
     // host context is in the host's tree whatever run ids it states.
-    const membership = RunTrees.membershipOf(session, runId, context, savedRefs, await session.childDepth());
+    // A root turn resuming its parked run stays in the tree that run began in.
+    const resumedTree = prompt === '' && (contextKind === 'none' || contextKind === 'metadata') ? await resumedRunTree(session) : null;
+    const membership = RunTrees.membershipOf(session, runId, context, savedRefs, await session.childDepth(), resumedTree);
     let run = this.#boundedRun(session, execution === null || execution === undefined
       ? new RunContext(RunLedger.start(runId), new RunBudget(mode.maxSteps), null, 0, {}, binding)
       : (execution.binding === binding ? execution : execution.withBinding(binding)));
@@ -846,28 +849,32 @@ export class AgentRuntime {
       }
       const called: string[] = [];
 
-      // Decisions recorded since the run stopped are acted on FIRST, before a
-      // new prompt is recorded, so the results land after the calls they answer
-      // rather than after the new turn.
-      offered = await this.#resolveApprovals(session, mode, offered, runId, called, scope?.legacy === true, steps, stepping?.locked === true);
-
-      if (prompt !== '') {
-        // With attachments, the shape prism-ts's UserMessage.toObject() writes:
-        // the media parts, then the turn's own text as a trailing text part,
-        // which fromObject() strips back off. Without them, unchanged.
-        const turn: JsonObject =
-          attachments.length === 0
-            ? { type: 'user', content: prompt }
-            : { type: 'user', content: prompt, additional_content: [...attachments, { text: prompt }], additional_attributes: {} };
-
-        await thread.record([turn], runId);
-      }
-
       // The tools this turn calls run inside it: a subagent tool reads the
-      // turn's own run context from here (see activeTurn()).
+      // turn's own run context from here (see activeTurn()). That includes a
+      // call a person approved, run below before the model is called again:
+      // outside this scope an approved subagent would run in no tree, at the
+      // depth and on the budget of the context the host wired its tool with.
       const turn = run;
-      return await activeTurns.run({ sessionKey: session.key(), runId, run: turn },
-        () => this.#loop(session, mode, turn, runId, provider, model, offered, called, systemPrompt, schema, steps));
+      return await activeTurns.run({ sessionKey: session.key(), runId, run: turn }, async () => {
+        // Decisions recorded since the run stopped are acted on FIRST, before a
+        // new prompt is recorded, so the results land after the calls they answer
+        // rather than after the new turn.
+        offered = await this.#resolveApprovals(session, mode, offered, runId, called, scope?.legacy === true, steps, stepping?.locked === true);
+
+        if (prompt !== '') {
+          // With attachments, the shape prism-ts's UserMessage.toObject() writes:
+          // the media parts, then the turn's own text as a trailing text part,
+          // which fromObject() strips back off. Without them, unchanged.
+          const message: JsonObject =
+            attachments.length === 0
+              ? { type: 'user', content: prompt }
+              : { type: 'user', content: prompt, additional_content: [...attachments, { text: prompt }], additional_attributes: {} };
+
+          await thread.record([message], runId);
+        }
+
+        return this.#loop(session, mode, turn, runId, provider, model, offered, called, systemPrompt, schema, steps);
+      });
     } catch (error) {
       // THE MODEL'S OWN WORDS DO NOT BELONG IN A RUN ROW OR AN EVENT. A schema
       // violation names the values that missed, so its message carries pieces
@@ -1027,8 +1034,14 @@ export class AgentRuntime {
             parent_mode: { ...run.binding.parentMode },
           };
           const refs = this.#childRefs.get(runId);
-          const tree = RunTrees.memberOf(runId)?.tree;
-          if (tree !== undefined && typeof tree === 'object') row.harness_tree = { session: tree.session, run: tree.run };
+          // Only for a run in a tree it did not open (a child the runner
+          // started, or a turn continuing a saved tree): read back, a tree a
+          // root opened would be continued as a saved tree that has no record.
+          const member = RunTrees.memberOf(runId);
+          const tree = member?.tree;
+          if (member !== null && member.route !== 'open' && tree !== undefined && typeof tree === 'object') {
+            row.harness_tree = { session: tree.session, run: tree.run };
+          }
           if (refs?.planLedger != null) row.harness_plan_ledger = { ...refs.planLedger };
         }
       }
@@ -1534,6 +1547,26 @@ export function activeTurn(sessionKey: string): { runId: string; run: RunContext
   const turn = activeTurns.getStore();
 
   return turn === undefined || turn.sessionKey !== sessionKey ? null : { runId: turn.runId, run: turn.run };
+}
+
+/**
+ * The durable run tree the run that issued this session's paused approvals
+ * began in (G-381), from the session's run record when it is that run's;
+ * null when nothing is paused, the record is another run's or gone, or the
+ * run was in the host's tree or in none.
+ */
+async function resumedRunTree(session: Session): Promise<RunTreeRef | null> {
+  const entries = await session.thread().messages();
+  const paused = pausedApprovalIds(entries.map((entry) => entry.message));
+  if (paused.length === 0) return null;
+  const issued = entries.find((entry) => Array.isArray(entry.message.tool_approval_requests)
+    && (entry.message.tool_approval_requests as JsonObject[]).some((request) => request.approval_id === paused[0]));
+  const run = await session.run();
+  if (issued?.runId == null || run === null || run.id !== issued.runId) return null;
+  const tree = run.tree;
+
+  return tree !== undefined && typeof tree === 'object' && tree !== null && typeof tree.session === 'string' && typeof tree.run === 'string'
+    ? { session: tree.session, run: tree.run } : null;
 }
 
 /** The context a run EXECUTES under: a metadata-only context states no run tree. */

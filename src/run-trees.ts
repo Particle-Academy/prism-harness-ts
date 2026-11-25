@@ -91,11 +91,13 @@ export const RunTrees = {
    * A run the runner started takes its parent run's tree, one level deeper,
    * and never reads what its session saved; a turn the runner did not start
    * continues the tree its session saved; a host context on a session that
-   * saved none is in the host's tree; any other run opens a tree of its own.
+   * saved none is in the host's tree; any other run opens a tree of its own,
+   * except a root turn resuming its parked run (`resumedTree`), which stays
+   * in the tree that run began in while spending from an entry of its own.
    *
    * @throws RangeError for a kind that is not none, metadata, runner or host
    */
-  membership(kind: string, session: string, run: string, parent: ParentMembership | null, savedTree: RunTreeRef | null, savedDepth: number, contextDepth: number): TreeMembership {
+  membership(kind: string, session: string, run: string, parent: ParentMembership | null, savedTree: RunTreeRef | null, savedDepth: number, contextDepth: number, resumedTree: RunTreeRef | null = null): TreeMembership {
     if (!KINDS.includes(kind)) throw new RangeError('Unknown run context kind.');
     savedDepth = Math.max(0, savedDepth);
     contextDepth = Math.max(0, contextDepth);
@@ -110,7 +112,9 @@ export const RunTrees = {
     }
     if (kind === 'host') return { tree: 'host', spends: null, depth: Math.max(savedDepth, contextDepth), route: 'none' };
 
-    return { tree: { session, run }, spends: run, depth: savedDepth, route: 'open' };
+    const tree = resumedTree === null ? { session, run } : { session: resumedTree.session, run: resumedTree.run };
+
+    return { tree, spends: run, depth: savedDepth, route: 'open' };
   },
 
   /**
@@ -132,7 +136,7 @@ export const RunTrees = {
    * session the runner named AND its ledger is the context's own: proof the
    * context came from that run's turn.
    */
-  membershipOf(session: Session, runId: string, context: RunContext | null | undefined, saved: ChildRefs | null, savedDepth: number): TreeMembership {
+  membershipOf(session: Session, runId: string, context: RunContext | null | undefined, saved: ChildRefs | null, savedDepth: number, resumedTree: RunTreeRef | null = null): TreeMembership {
     const kind = RunTrees.contextKind(context);
     let parent: ParentMembership | null = null;
     if (kind === 'runner' && context != null) {
@@ -144,7 +148,9 @@ export const RunTrees = {
     }
     const contextDepth = context == null || context.metadataOnly ? 0 : context.depth;
 
-    return RunTrees.membership(kind, session.key(), runId, parent, saved?.tree ?? null, savedDepth, contextDepth);
+    const bare = kind === 'none' || kind === 'metadata';
+
+    return RunTrees.membership(kind, session.key(), runId, parent, saved?.tree ?? null, savedDepth, contextDepth, bare ? resumedTree : null);
   },
 
   /** Record a live run's membership, once its run context exists and before any tool runs. */
@@ -249,8 +255,11 @@ export const RunTrees = {
         max_cost_micros: entry.budget.maxCostUsd === null ? null : PlanBudget.micros(Math.max(0, entry.budget.maxCostUsd - entry.cost)),
       };
       const now = Math.floor(Date.now() / 1000);
-      await write(child.planStore(), entry.tree, (state) =>
-        PlanBudget.reserve(state ?? PlanBudget.open(spends, settings), spends, Math.max(1, settings.max_steps), settings.max_cost_micros, now, entry.ttl));
+      // The record is the tree's (planId = its root run); the hold is the
+      // spending run's. They differ for a root resuming its parked run.
+      const tree = membership.tree;
+      await write(child.planStore(), tree, (state) =>
+        PlanBudget.reserve(state ?? PlanBudget.open(tree.run, settings), spends, Math.max(1, settings.max_steps), settings.max_cost_micros, now, entry.ttl));
       entry.held = true;
     }
 
