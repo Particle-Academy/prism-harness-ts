@@ -50,6 +50,10 @@
   before any request. A context the host supplies never replaces the
   binding or run tree a child saved: only the runner's own context writes
   them.
+- `MemorySessionStore.withLock()` no longer unrefs its lock-wait timer while
+  the wait is awaited. A script whose only pending work was a lock wait used
+  to exit with code 13 (unsettled top-level await) instead of getting
+  `session_locked`. The timer is cleared as soon as the lock is acquired.
 
 - Every turn on a subagent child session that the runner did not start
   continues the child's run tree and the shared plan budget it was started
