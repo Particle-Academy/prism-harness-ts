@@ -26,6 +26,17 @@
   The run context the host built the tool with can only narrow the turn's
   limits; before, the child spent from that context's own ledger, outside the
   turn and outside the plan budget.
+- A subagent child that stopped on an approval and is resumed outside the
+  runner continues the run tree it was started in instead of a fresh root
+  budget. The first time a root run starts a child, the tree's allowance is
+  kept in the durable store and the root run settles what the tree spent when
+  it ends; the resumed child holds what is left, settles what it spent, and
+  is refused with `run_not_permitted` once it is spent. A decision on that
+  child's approval is refused the same way before anything is recorded. When
+  the tree spent from a shared plan budget, the resumed child spends from it
+  too, and its decision is refused with `plan_budget_exhausted` once the plan
+  budget is spent. A child started under a host-built context outside a turn
+  keeps the previous behaviour.
 
 - Agent plans (G-360), the port of the reference's: an agent drafts an ordered
   plan with `plan_draft`, a person approves it, and `session.plan().advance()`

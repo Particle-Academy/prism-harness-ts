@@ -14,7 +14,7 @@ import { PlanIds } from './ids.js';
 import { PlanLimits, type PlansConfig } from './limits.js';
 import { PlanMachine, phpTrim, type Plan, type PlanStep } from './machine.js';
 import { PlanRefused, PlansDisabled } from './refusal.js';
-import { pausedApprovalIds } from '../thread-rows.js';
+import { pausedApprovalIds, pausedRunState } from '../thread-rows.js';
 import { approvalDecisions, pendingApprovalCalls } from './thread.js';
 import { planTools } from './tools.js';
 import { PlanView, type PlanCounts } from './view.js';
@@ -67,7 +67,7 @@ export class Plans {
   #reapDispatcher: ((sessionKey: string, planId: string) => void | Promise<void>) | null = null;
   #clock: (() => number) | null = null;
   /** Turns spending from a shared plan budget, by run id, until they settle. */
-  readonly #budgetTurns = new Map<string, { session: string; plan: string; context: RunContext; steps: number; cost: number; unmetered: number }>();
+  readonly #budgetTurns = new Map<string, { session: string; ledger: string; plan: string; context: RunContext; steps: number; cost: number; unmetered: number }>();
   /** Sessions whose advance() is running the turn of the step it claimed, counted per session. */
   readonly #advancing = new Map<string, number>();
 
@@ -352,8 +352,19 @@ export class Plans {
    * The shared budget this turn would spend from, or null.
    * @internal
    */
-  async servingSharedPlan(session: Session, prompt = ''): Promise<PlanBudgetSettings | null> {
-    return (await this.#ledgerFor(session, prompt))?.settings ?? null;
+  async servingSharedPlan(session: Session, prompt = '', context?: RunContext): Promise<PlanBudgetSettings | null> {
+    return (await this.#ledgerFor(session, prompt, context))?.settings ?? null;
+  }
+
+  /**
+   * The shared plan budget a run spends from, as the session key the plan
+   * belongs to and the plan id; null when it spends from none.
+   * @internal Saved with a subagent child the run starts.
+   */
+  ledgerOf(runId: string): { session: string; plan: string } | null {
+    const turn = this.#budgetTurns.get(runId);
+
+    return turn === undefined ? null : { session: turn.ledger, plan: turn.plan };
   }
 
   /**
@@ -385,13 +396,22 @@ export class Plans {
    * @internal Called by every path that records decisions.
    */
   async assertDecisionsFunded(session: Session, approvalIds: readonly string[], context?: RunContext): Promise<void> {
-    if (!this.enabled() || approvalIds.length === 0 || !(await this.enabledFor(session))) return;
-    const plan = await this.load(session);
+    if (!this.enabled() || approvalIds.length === 0) return;
+    let target: { session: string; plan: string } | null = null;
+    const plan = await this.enabledFor(session) ? await this.load(session) : null;
     const step = activeAgentStep(plan);
-    if (plan === null || step === null || !step.approvalIds.some((id) => approvalIds.includes(id))) return;
-    if ((await this.budgetFor(session, plan.id)).mode !== 'shared') return;
+    if (plan !== null && step !== null && step.approvalIds.some((id) => approvalIds.includes(id))) {
+      if ((await this.budgetFor(session, plan.id)).mode !== 'shared') return;
+      target = { session: session.key(), plan: plan.id };
+    } else if (context === undefined || context.metadataOnly) {
+      // A subagent child resumed outside the runner spends from the shared
+      // plan budget of the turn that started it.
+      target = await this.#childLedger(session);
+    }
+    if (target === null) return;
     if (context !== undefined && !context.metadataOnly) throw PlanRefused.because('plan.budget_context');
-    const spent = await this.budgetExhaustion(session, plan.id);
+    const record = await this.#budgetRecordAt(session.planStore(), target.session, target.plan);
+    const spent = record === null ? null : PlanBudget.exhaustion(PlanBudget.expire(record, this.now(), this.#lockTtl));
     if (spent !== null) throw budgetSpent(spent);
   }
 
@@ -412,9 +432,8 @@ export class Plans {
    * @internal Called by the runtime once a run's own budget is known.
    */
   async planTurn(session: Session, runId: string, run: RunContext, context: RunContext | undefined, prompt = ''): Promise<RunContext> {
-    const target = await this.#ledgerFor(session, prompt);
+    const target = await this.#ledgerFor(session, prompt, context);
     if (target === null) return run;
-    const plan = target.plan;
     if (context !== undefined && !context.metadataOnly) throw PlanRefused.because('plan.budget_context');
 
     const { ledger, budget } = run;
@@ -423,7 +442,7 @@ export class Plans {
     const turnCost = budget.maxCostUsd === null ? null : PlanBudget.micros(Math.max(0, budget.maxCostUsd - baseCost));
     const now = this.now();
     const ttl = this.#lockTtl;
-    const [, grant] = await this.#budgetWrite(session, plan.id, this.budgetSettings(),
+    const [, grant] = await this.#budgetWriteAt(session.planStore(), target.session, target.plan, this.budgetSettings(),
       (state) => PlanBudget.reserve(state, runId, Math.max(0, budget.maxSteps - baseSteps), turnCost, now, ttl));
     if (grant === null || 'refused' in grant) throw budgetSpent(grant?.limit ?? 'steps');
     const narrowed = run.withBudget(new RunBudget(
@@ -432,24 +451,50 @@ export class Plans {
       budget.maxSeconds,
       budget.maxOutputTokensPerCall,
     ));
-    this.#budgetTurns.set(runId, { session: session.key(), plan: plan.id, context: narrowed, steps: baseSteps, cost: baseCost, unmetered: ledger.unmeteredRuns });
+    this.#budgetTurns.set(runId, { session: session.key(), ledger: target.session, plan: target.plan, context: narrowed, steps: baseSteps, cost: baseCost, unmetered: ledger.unmeteredRuns });
 
     return narrowed;
   }
 
-  /** The plan and its shared settings when this turn is one of the plan's own and its budget is shared; null otherwise. */
-  async #ledgerFor(session: Session, prompt: string): Promise<{ plan: Plan; settings: PlanBudgetSettings } | null> {
-    if (!(await this.enabledFor(session))) return null;
-    const plan = await this.load(session);
-    const step = activeAgentStep(plan);
-    if (plan === null || step === null) return null;
-    const own = this.#advancing.has(session.key())
-      || (prompt === '' && step.approvalIds.length > 0
-        && pausedApprovalIds((await session.thread().messages()).map((entry) => entry.message)).some((id) => step.approvalIds.includes(id)));
-    if (!own) return null;
-    const settings = await this.budgetFor(session, plan.id);
+  /**
+   * The shared ledger a turn spends from: its own plan's, when the turn is
+   * one of the plan's own; else, for a subagent child resumed outside the
+   * runner, the ledger of the plan turn that started it. Null otherwise.
+   */
+  async #ledgerFor(session: Session, prompt: string, context?: RunContext): Promise<{ session: string; plan: string; settings: PlanBudgetSettings } | null> {
+    if (!this.enabled()) return null;
+    if (await this.enabledFor(session)) {
+      const plan = await this.load(session);
+      const step = activeAgentStep(plan);
+      if (plan !== null && step !== null) {
+        const own = this.#advancing.has(session.key())
+          || (prompt === '' && step.approvalIds.length > 0
+            && pausedApprovalIds((await session.thread().messages()).map((entry) => entry.message)).some((id) => step.approvalIds.includes(id)));
+        if (own) {
+          const settings = await this.budgetFor(session, plan.id);
 
-    return settings.mode === 'shared' ? { plan, settings } : null;
+          return settings.mode === 'shared' ? { session: session.key(), plan: plan.id, settings } : null;
+        }
+      }
+    }
+
+    return prompt === '' && (context === undefined || context.metadataOnly) ? this.#childLedger(session) : null;
+  }
+
+  /** The plan budget saved on a paused subagent child's row, while it is still that plan's shared budget. */
+  async #childLedger(session: Session): Promise<{ session: string; plan: string; settings: PlanBudgetSettings } | null> {
+    const saved = pausedRunState((await session.thread().messages()).map((entry) => entry.message))?.planLedger ?? null;
+    if (saved === null) return null;
+    const record = await this.#budgetRecordAt(session.planStore(), saved.session, saved.plan);
+    if (record === null || record.mode !== 'shared') return null;
+
+    return { ...saved, settings: { mode: 'shared', max_steps: record.max_steps, max_cost_micros: record.max_cost_micros } };
+  }
+
+  async #budgetRecordAt(store: SessionStore, sessionKey: string, planId: string): Promise<PlanBudgetState | null> {
+    const record = await store.get(budgetKey(sessionKey));
+
+    return record !== null && record.planId === planId ? record as unknown as PlanBudgetState : null;
   }
 
   /** Replace a finished turn's hold with what it spent. */
@@ -462,7 +507,7 @@ export class Plans {
     const steps = ledger.steps - turn.steps;
     const cost = ledger.unmeteredRuns > turn.unmetered ? null : PlanBudget.micros(Math.max(0, ledger.costUsd - turn.cost));
     try {
-      await this.#budgetWrite(session, turn.plan, this.budgetSettings(), (state) => [PlanBudget.settle(state, run.id, steps, cost), null]);
+      await this.#budgetWriteAt(session.planStore(), turn.ledger, turn.plan, this.budgetSettings(), (state) => [PlanBudget.settle(state, run.id, steps, cost), null]);
     } catch (error) {
       // The hold stays and is charged in full once it expires.
       reportQuietly(error);
@@ -476,8 +521,18 @@ export class Plans {
     settings: PlanBudgetSettings,
     change: (state: PlanBudgetState) => [PlanBudgetState, T],
   ): Promise<[PlanBudgetState, T]> {
-    const store = session.planStore();
-    const name = budgetKey(session.key());
+    return this.#budgetWriteAt(session.planStore(), session.key(), planId, settings, change);
+  }
+
+  /** The same change to the budget record of the plan kept under another session key, in the same durable store (a subagent child's parent). */
+  async #budgetWriteAt<T>(
+    store: SessionStore,
+    sessionKey: string,
+    planId: string,
+    settings: PlanBudgetSettings,
+    change: (state: PlanBudgetState) => [PlanBudgetState, T],
+  ): Promise<[PlanBudgetState, T]> {
+    const name = budgetKey(sessionKey);
 
     return store.withLock(name, async () => {
       const stored = await store.get(name);

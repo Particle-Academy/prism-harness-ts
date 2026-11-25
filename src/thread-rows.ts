@@ -301,7 +301,12 @@ export type PausedBinding = {
  * again from nothing. A malformed binding is read as none. A row written
  * before these fields existed carries neither.
  */
-export function pausedRunState(rows: readonly JsonObject[]): { agentSpend: PausedAgentSpend | null; binding: PausedBinding | null } | null {
+export function pausedRunState(rows: readonly JsonObject[]): {
+  agentSpend: PausedAgentSpend | null;
+  binding: PausedBinding | null;
+  tree: { session: string; run: string } | null;
+  planLedger: { session: string; plan: string } | null;
+} | null {
   if (approvalToolScope(rows) === null) return null;
   const paused = [...rows].reverse().find((row) => row.type === 'assistant');
   if (paused === undefined) return null;
@@ -317,7 +322,20 @@ export function pausedRunState(rows: readonly JsonObject[]): { agentSpend: Pause
       : { cost_usd: 0, unmetered_runs: 1 };
   }
 
-  return { agentSpend, binding: storedBinding(paused.harness_binding) };
+  return {
+    agentSpend,
+    binding: storedBinding(paused.harness_binding),
+    tree: storedPair(paused.harness_tree, 'session', 'run') as { session: string; run: string } | null,
+    planLedger: storedPair(paused.harness_plan_ledger, 'session', 'plan') as { session: string; plan: string } | null,
+  };
+}
+
+/** A subagent child's run tree or shared plan budget reference, as stored on the row it paused on; null when absent or malformed. */
+function storedPair(value: JsonValue | undefined, first: string, second: string): Record<string, string> | null {
+  if (!isObject(value)) return null;
+  const a = value[first], b = value[second];
+
+  return typeof a === 'string' && a !== '' && typeof b === 'string' && b !== '' ? { [first]: a, [second]: b } : null;
 }
 
 function storedBinding(value: JsonValue | undefined): PausedBinding | null {

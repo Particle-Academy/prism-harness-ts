@@ -230,7 +230,19 @@ for an approval and is resumed (`send(session, '')` or `streamDecision()`) is
 the same run: the agent's spend so far is stored with the approval request and
 counts against the ceiling after the resume, as the step count does. A subagent's
 child run resumed that way, outside the runner, also keeps the provider and model
-it was bound to. Every other `send()` starts a new run tree with the full
+it was bound to, and continues the run tree it was started in rather than getting
+a fresh root budget. The first time a root run starts a child, the tree's step and
+cost allowance is kept in the durable store, and the root run settles what the
+whole tree spent when it ends. The resumed child holds what the tree has left
+before it calls a provider, settles what it spent when it ends, and is refused
+with `run_not_permitted` once the tree's allowance is spent; a decision on the
+child's approval is then refused the same way with nothing recorded, so the
+approval is never consumed by a resume that cannot run. A hold whose run never
+settled is charged in full once the run lock's TTL has passed. When the child was
+started by a turn that spent from a shared plan budget, the resumed child spends
+from that plan budget too (`plan_budget_exhausted`). A child started under a run
+context the host built itself, outside any turn, has no tree record and is
+resumed on its own root budget. Every other `send()` starts a new run tree with the full
 ceiling, and so does each `plan.advance()` called without a context. To hold
 the steps of a plan to one ceiling, pass the same `RunContext` to every
 `advance(context)`; that context's budget then bounds the whole plan, its step

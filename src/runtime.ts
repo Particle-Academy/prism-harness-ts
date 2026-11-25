@@ -27,6 +27,7 @@ import type { AgentMode, ModeRegistry } from './modes.js';
 import type { Session } from './session.js';
 import { schemaName, schemaProblems } from './structured.js';
 import { RunBudget, RunContext, RunLedger, type ModelBinding } from './subagents.js';
+import { RunTrees, type RunTreeRef } from './run-trees.js';
 import type { HarnessTool, ToolAuthorizer, ToolRegistry } from './tools.js';
 import { settleWithRefusalScope } from './refusals.js';
 import { RunStepTagger, StepChannel, type RunStep, type ToolCallOutcome } from './steps.js';
@@ -254,6 +255,8 @@ const RESOLUTION_LOCK_SECONDS = 300;
 const RESOLUTION_WAIT_SECONDS = 30;
 
 export class AgentRuntime {
+  /** A subagent child run's tree and plan budget references, by run id, while it runs. */
+  readonly #childRefs = new Map<string, { tree: RunTreeRef | null; planLedger: { session: string; plan: string } | null }>();
   readonly #client: LlmClient;
 
   readonly #modes: ModeRegistry;
@@ -756,6 +759,17 @@ export class AgentRuntime {
       // allowance. Only for a root run: a child's steps are already on the
       // tree ledger its caller hands back in.
       if (prompt === '' && execution == null) run.ledger.recordSteps(approvalRunSteps(stored) ?? 0);
+      const holdTtl = this.#setting(session, 'lock_ttl') ?? RESOLUTION_LOCK_SECONDS;
+      // A root run, or a child resumed outside the runner, which continues
+      // the run tree it was started in (G-366).
+      if (execution == null) run = await RunTrees.rootRun(session, runId, run, paused?.tree ?? null, holdTtl);
+      // What a subagent child's paused row carries into its resume: the run
+      // tree it belongs to and the shared plan budget that tree spends from.
+      if (run.binding !== null) {
+        this.#childRefs.set(runId, execution?.binding != null
+          ? { tree: await RunTrees.childStarted(session, execution), planLedger: plans?.ledgerOf(execution.rootRunId) ?? null }
+          : { tree: RunTrees.treeOf(runId), planLedger: paused?.planLedger ?? null });
+      }
       // G-366: a turn serving a plan step with a shared budget holds what the
       // plan has left, after the paused steps it continues are counted.
       if (plans !== null) run = await plans.planTurn(session, runId, run, context, prompt);
@@ -817,6 +831,9 @@ export class AgentRuntime {
       throw error;
     } finally {
       unwatchPlan();
+      this.#childRefs.delete(runId);
+      // A root run that holds part of a run tree's budget settles it.
+      await RunTrees.finished(session, runId);
       if (steps !== undefined) await rememberSeq(session, runId, steps);
     }
   }
@@ -943,6 +960,9 @@ export class AgentRuntime {
             declared: { ...run.binding.declared },
             parent_mode: { ...run.binding.parentMode },
           };
+          const refs = this.#childRefs.get(runId);
+          if (refs?.tree != null) row.harness_tree = { ...refs.tree };
+          if (refs?.planLedger != null) row.harness_plan_ledger = { ...refs.planLedger };
         }
       }
       await thread.record([row], runId);
@@ -1386,7 +1406,8 @@ async function writeDecisionsLocked(
  * Call it holding the session lock: the check and the write are one step.
  */
 async function writeDecisions(session: Session, decisions: readonly ApprovalDecision[], context?: RunContext): Promise<void> {
-  const pending = new Set(pendingApprovalIds((await session.thread().messages()).map((entry) => entry.message)));
+  const rows = (await session.thread().messages()).map((entry) => entry.message);
+  const pending = new Set(pendingApprovalIds(rows));
   for (const decision of decisions) {
     if (!pending.delete(decision.approvalId)) throw HarnessError.approvalNotPending(decision.approvalId);
   }
@@ -1394,6 +1415,9 @@ async function writeDecisions(session: Session, decisions: readonly ApprovalDeci
   // nothing recorded, rather than consumed by a resume the budget then
   // refuses (G-366).
   await session.planService()?.assertDecisionsFunded(session, decisions.map((decision) => decision.approvalId), context);
+  // And for a subagent child resumed outside the runner, a run tree with
+  // nothing left.
+  await RunTrees.assertDecisionsFunded(session, pausedRunState(rows)?.tree ?? null, context, RESOLUTION_LOCK_SECONDS);
 
   const run = await session.run();
 
