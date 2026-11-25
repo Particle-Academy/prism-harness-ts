@@ -45,7 +45,22 @@ class DurableMemoryStore extends MemorySessionStore {
   }
 }
 
+/** An ephemeral store a test can empty, as an expired TTL would. */
+class ExpiringStore extends MemorySessionStore {
+  readonly #keys = new Set<string>();
+
+  override async put(key: string, payload: JsonObject, ttlSeconds: number | null = null): Promise<void> {
+    this.#keys.add(key);
+    await super.put(key, payload, ttlSeconds);
+  }
+
+  async expireAll(): Promise<void> {
+    for (const key of this.#keys) await this.forget(key);
+  }
+}
+
 class Rig {
+  readonly ephemeral = new ExpiringStore();
   readonly queue: LlmResponse[] = [];
   readonly requests: LlmRequest[] = [];
   readonly runtime: AgentRuntime;
@@ -96,7 +111,7 @@ class Rig {
         return next;
       },
     });
-    const durable = new DurableMemoryStore(), ephemeral = new MemorySessionStore();
+    const durable = new DurableMemoryStore(), ephemeral = this.ephemeral;
     this.harness = new PrismHarness({
       drivers: { memory: () => ephemeral, durable: () => durable },
       stores: { ephemeral: 'memory', durable: 'durable' },
@@ -347,6 +362,28 @@ describe('a root that resumes its parked run', () => {
     expect(resumed.runId).not.toBe(first.runId);
     expect(r.queue).toHaveLength(0);
     expect((await r.session(1, 'chat::sub::scout').childRefs())?.tree).toEqual(tree);
+  });
+});
+
+describe('a root that resumes its parked run after the ephemeral half expired', () => {
+  it('still stays in the tree its parked run began in', async () => {
+    const r = new Rig();
+    const root = r.session(1);
+    r.calls([['research', { task: 'Find the weather.' }]]); // root
+    r.calls([['weather', { city: 'Paris' }]]);              // research child: parks
+    r.calls([['weather', { city: 'Rome' }]]);               // root: parks
+    const first = await r.runtime.send(root, 'Go');
+    const [id] = await r.pending(root);
+    await r.ephemeral.expireAll();
+
+    r.calls([['scout', { task: 'Scout.' }]]);
+    r.text('Scout answer.');
+    r.text('Root answer.');
+    await recordApproval(r.session(1), id!, true);
+    await r.runtime.send(r.session(1), '');
+
+    expect(r.queue).toHaveLength(0);
+    expect((await r.session(1, 'chat::sub::scout').childRefs())?.tree).toEqual({ session: root.key(), run: first.runId });
   });
 });
 

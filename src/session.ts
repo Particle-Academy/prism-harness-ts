@@ -30,6 +30,9 @@ export interface ChildRefs {
   planLedger: { session: string; plan: string } | null;
 }
 
+/** How many recent runs' trees a session keeps durably (G-381), as the reference does. */
+const RUN_HISTORY = 20;
+
 export interface RunState extends JsonObject {
   id: string;
   status: 'running' | 'completed' | 'failed';
@@ -354,6 +357,23 @@ export class Session {
     return this;
   }
 
+  /**
+   * The durable run tree a recent run of this session began in (G-381), or
+   * null for a run in the host's tree, in none, or not remembered.
+   *
+   * @internal Read by the runtime.
+   */
+  async runTree(runId: string): Promise<{ session: string; run: string } | null> {
+    const stored = (await this.#durable.get(this.#durableKey())) ?? {};
+    const trees = stored.run_trees;
+    const entry = isJsonObject(trees) && Object.prototype.hasOwnProperty.call(trees, runId) ? trees[runId] : undefined;
+    const tree = isJsonObject(entry) ? entry.tree : undefined;
+    if (!isJsonObject(tree)) return null;
+    const { session, run } = tree;
+
+    return typeof session === 'string' && session !== '' && typeof run === 'string' && run !== '' ? { session, run } : null;
+  }
+
   async capability(name: string): Promise<JsonObject | null> {
     const stored = (await this.#durable.get(this.#durableKey())) ?? {};
     const capabilities = isJsonObject(stored.capabilities) ? stored.capabilities : {};
@@ -384,6 +404,19 @@ export class Session {
    * @param depth the depth it runs at, from the same decision
    */
   async beginRun(id: string, mode: string, provider: string, model: string, tree?: { session: string; run: string } | 'host' | 'none', depth?: number): Promise<this> {
+    if (tree !== undefined) {
+      // The run tree the run belongs to, kept DURABLY by run id for the last
+      // RUN_HISTORY runs: a root resuming its parked run reads it after the
+      // ephemeral half has expired (G-381).
+      this.#assertWritable();
+      const stored = (await this.#durable.get(this.#durableKey())) ?? {};
+      const trees: JsonObject = isJsonObject(stored.run_trees) ? { ...stored.run_trees } : {};
+      delete trees[id];
+      trees[id] = { tree: typeof tree === 'object' ? { session: tree.session, run: tree.run } : tree, depth: depth ?? 0 };
+      const kept = Object.keys(trees).slice(-RUN_HISTORY);
+      await this.#durable.put(this.#durableKey(), { ...stored, run_trees: Object.fromEntries(kept.map((key) => [key, trees[key]!])) });
+    }
+
     return this.#write('run', {
       id,
       status: 'running',

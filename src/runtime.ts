@@ -1551,9 +1551,9 @@ export function activeTurn(sessionKey: string): { runId: string; run: RunContext
 
 /**
  * The durable run tree the run that issued this session's paused approvals
- * began in (G-381), from the session's run record when it is that run's;
- * null when nothing is paused, the record is another run's or gone, or the
- * run was in the host's tree or in none.
+ * began in (G-381), from the session's durable record of its recent runs, so
+ * it survives the ephemeral half expiring; null when nothing is paused, the
+ * run is not remembered, or it was in the host's tree or in none.
  */
 async function resumedRunTree(session: Session): Promise<RunTreeRef | null> {
   const entries = await session.thread().messages();
@@ -1561,12 +1561,8 @@ async function resumedRunTree(session: Session): Promise<RunTreeRef | null> {
   if (paused.length === 0) return null;
   const issued = entries.find((entry) => Array.isArray(entry.message.tool_approval_requests)
     && (entry.message.tool_approval_requests as JsonObject[]).some((request) => request.approval_id === paused[0]));
-  const run = await session.run();
-  if (issued?.runId == null || run === null || run.id !== issued.runId) return null;
-  const tree = run.tree;
 
-  return tree !== undefined && typeof tree === 'object' && tree !== null && typeof tree.session === 'string' && typeof tree.run === 'string'
-    ? { session: tree.session, run: tree.run } : null;
+  return issued?.runId == null ? null : session.runTree(issued.runId);
 }
 
 /** The context a run EXECUTES under: a metadata-only context states no run tree. */
