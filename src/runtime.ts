@@ -26,7 +26,7 @@ import { ToolPolicy, argsDigest } from './tool-policy.js';
 import type { AgentMode, ModeRegistry } from './modes.js';
 import type { ChildRefs, Session } from './session.js';
 import { schemaName, schemaProblems } from './structured.js';
-import { RunBudget, RunContext, RunLedger, type ModelBinding } from './subagents.js';
+import { RunBudget, RunContext, RunLedger, bindingRoute, type ModelBinding } from './subagents.js';
 import { RunTrees, type RunTreeRef } from './run-trees.js';
 import type { HarnessTool, ToolAuthorizer, ToolRegistry } from './tools.js';
 import { settleWithRefusalScope } from './refusals.js';
@@ -721,15 +721,17 @@ export class AgentRuntime {
     // as a child (it has saved run tree references) with no binding anywhere
     // is refused rather than run on the root rules, which would send the
     // child's conversation to a provider nobody chose for it.
-    const runnerBinding = contextKind === 'runner' ? execution?.binding ?? null : null;
+    // A host context on a session that was never a child keeps the binding it
+    // states for this turn; it is never saved. The rule is bindingRoute(),
+    // the one the harness-plans corpus pins in every language.
     const legacyBinding = tail?.binding == null ? null
       : { session: tail.binding.session, declared: tail.binding.declared, parentMode: tail.binding.parent_mode };
-    const savedBinding = runnerBinding !== null ? null : (await session.childBinding()) ?? legacyBinding;
-    const isChild = savedBinding !== null || (await session.childRefs()) !== null;
-    if (runnerBinding === null && savedBinding === null && isChild) throw HarnessError.childBindingMissing();
-    // A host context on a session that was never a child keeps the binding it
-    // states for this turn; it is never saved.
-    const binding = runnerBinding ?? savedBinding ?? (isChild ? null : execution?.binding ?? null);
+    const savedBinding = (await session.childBinding()) ?? legacyBinding;
+    const route = bindingRoute(contextKind, execution?.binding != null, savedBinding !== null, (await session.childRefs()) !== null);
+    if (route.binding === 'refused') throw HarnessError.childBindingMissing();
+    const runnerBinding = route.binding === 'runner' ? execution?.binding ?? null : null;
+    const binding = route.binding === 'saved' ? savedBinding
+      : (route.binding === 'runner' || route.binding === 'host' ? execution?.binding ?? null : null);
     const provider = await this.#choose(session, mode, binding, 'provider');
     const model = await this.#choose(session, mode, binding, 'model');
     const runId = stepping?.runId ?? randomUUID();

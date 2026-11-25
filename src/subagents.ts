@@ -410,6 +410,37 @@ export interface ModelBinding {
   parentMode: ModelChoice;
 }
 
+/** Which binding a turn runs on, and whether it is saved; see {@link bindingRoute}. */
+export interface BindingRoute {
+  binding: 'runner' | 'saved' | 'refused' | 'host' | 'root';
+  save: boolean;
+}
+
+/**
+ * Which binding a turn runs on, and whether it is saved with the session. The
+ * one rule every language's runtime asks (the reference's
+ * ChildBinding::route), pinned by the harness-plans corpus.
+ *
+ * - `runner`: the subagent runner's own context starts the child; its binding
+ *   is used and saved with the child's session.
+ * - `saved`: any other turn on a session with a saved binding uses it. A
+ *   binding on a context the host supplied never replaces it.
+ * - `refused`: a session the runner started as a child (`linked`) with no
+ *   saved binding is refused (`child_binding_missing`) before any request.
+ * - `host`: a host context's binding on a session that was never a child is
+ *   used for that turn only; it is never saved.
+ * - `root`: otherwise the root rules.
+ *
+ * @param context none, metadata, runner or host, as RunTrees.contextKind()
+ * @throws RangeError for an unknown context kind
+ */
+export function bindingRoute(context: string, suppliedBinding: boolean, savedBinding: boolean, linked: boolean): BindingRoute {
+  if (!['none', 'metadata', 'runner', 'host'].includes(context)) throw new RangeError('Unknown run context kind.');
+  if (context === 'runner' && suppliedBinding) return { binding: 'runner', save: true };
+
+  return { binding: savedBinding ? 'saved' : (linked ? 'refused' : (suppliedBinding ? 'host' : 'root')), save: false };
+}
+
 /**
  * Where a run sits in its tree, and what the tree has left to spend.
  *

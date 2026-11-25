@@ -29,8 +29,8 @@ export type { AgentHarnessConfig, HarnessOptions } from './harness.js';
 export { AgentMode, ModeRegistry } from './modes.js';
 export type { ModeConfig, ModeRegistryConfig } from './modes.js';
 
-export { MAX_DEPTH, RunBudget, RunContext, RunLedger, Subagent, isAgentId, subagentFromConfig } from './subagents.js';
-export type { ModelBinding, ModelChoice, RunMetadata } from './subagents.js';
+export { MAX_DEPTH, RunBudget, RunContext, RunLedger, Subagent, bindingRoute, isAgentId, subagentFromConfig } from './subagents.js';
+export type { BindingRoute, ModelBinding, ModelChoice, RunMetadata } from './subagents.js';
 
 export { ToolAuthorizer, ToolRegistry, authorizedTool } from './tools.js';
 export type {
