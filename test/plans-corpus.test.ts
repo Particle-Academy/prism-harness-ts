@@ -119,7 +119,9 @@ function plansBindingContextOp(op: Op, state: CaseState): unknown {
   if (context !== null && op.supplied_binding === true) context = context.withBinding(cheapBinding);
   if (context !== null && op.runner_started === true) context = RunTrees.startingChild(context);
   if (context !== null && op.rebound === true) context = context.withBinding(cheapBinding);
-  const kind = RunTrees.bindingContextKind(context);
+  // The budget routes read the same kind: the runner's context is the runner's for both.
+  const kind = RunTrees.contextKind(context);
+  if (RunTrees.bindingContextKind(context) !== kind) throw new Error('binding and budget context kinds differ');
   const route = bindingRoute(kind, context?.binding != null, state.savedBinding, op.linked);
   state.savedBinding = state.savedBinding || route.save;
 
