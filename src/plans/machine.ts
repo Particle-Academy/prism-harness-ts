@@ -408,6 +408,12 @@ export const PlanMachine = {
       if (step.owner === 'human' && step.state === 'todo') {
         step.state = 'waiting_input';
         outcome = ['waiting', step.id];
+      } else if (budgetExhausted && step.owner === 'agent' && step.state === 'held') {
+        // G-366: a step held on an approval whose resume the spent shared
+        // budget could not run stops the plan, once, instead of waiting on a
+        // decision that would be refused.
+        plan = block(plan, PLAN_BUDGET_EXHAUSTED);
+        outcome = ['blocked', PLAN_BUDGET_EXHAUSTED];
       } else if (step.state !== 'todo') {
         outcome = ['waiting', step.id];
       } else if (plan.counters.advances >= limits.maxAdvances) {

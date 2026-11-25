@@ -3,7 +3,6 @@ import { spawn } from 'node:child_process';
 import { mkdtemp, readFile, readdir, rename } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { setTimeout as delay } from 'node:timers/promises';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { FileSessionStore } from '../src/index.js';
 
@@ -44,20 +43,17 @@ for (const sharing of ['ordinary', 'share-delete']) {
     await store.put('k', { revision: 0 });
     const target = join(directory, createHash('sha256').update('k').digest('hex').slice(0, 32) + '.json');
     const close = await heldReader(target, sharing);
-    let blocked!: () => void;
-    const failedAttempt = new Promise<void>(done => { blocked = done; });
     const errors: unknown[] = [];
+    // The reader closes INSIDE the failed attempt, before the store sees the
+    // failure and starts its retry window: how long the reader takes to exit
+    // (PowerShell on a loaded runner can take longer than the window) then
+    // has no bearing on the outcome.
     replace.mockImplementation(async (from, to) => {
-      try { await actual.rename(from, to); } catch (error) { errors.push(error); blocked(); throw error; }
+      try { await actual.rename(from, to); } catch (error) { errors.push(error); await close(); throw error; }
     });
     const payload = { revision: 1, body: '界'.repeat(70000) };
-    const write = store.put('k', payload).then(() => ({ error: undefined }), (error: unknown) => ({ error }));
     try {
-      if (process.platform === 'win32') {
-        await Promise.race([failedAttempt, delay(3000).then(() => { throw Error('Missing real permission failure'); })]);
-        await close();
-      }
-      expect((await write).error).toBeUndefined();
+      expect(await store.put('k', payload).then(() => undefined, (error: unknown) => error)).toBeUndefined();
     } finally { await close(); }
     expect(errors.length > 0).toBe(process.platform === 'win32');
     expect(await store.get('k')).toEqual(payload);
@@ -77,8 +73,11 @@ for (const sharing of ['ordinary', 'share-delete']) {
     try { await store.put('k', { revision: 1 }); } catch (error) { failure = error; }
     try {
       if (process.platform === 'win32') {
+        // Retried for the store's window (750 ms), then given up: bounded, so
+        // well inside the test's own timeout. The upper bound is not a speed
+        // claim; a loaded Windows runner has taken over 4 s for the same work.
         expect(performance.now() - started).toBeGreaterThanOrEqual(700);
-        expect(performance.now() - started).toBeLessThan(2000);
+        expect(performance.now() - started).toBeLessThan(10000);
         expect(errors.length).toBeGreaterThan(1);
         expect(failure).toBe(errors[0]);
         expect(failure).toMatchObject({ code: expect.stringMatching(/^(EPERM|EACCES)$/) });

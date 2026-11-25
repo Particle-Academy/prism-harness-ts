@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { validateAgent } from './address.js';
 import type { JsonObject, JsonValue } from './json.js';
@@ -26,6 +27,7 @@ import type { AgentMode, ModeRegistry } from './modes.js';
 import type { Session } from './session.js';
 import { schemaName, schemaProblems } from './structured.js';
 import { RunBudget, RunContext, RunLedger, type ModelBinding } from './subagents.js';
+import { RunTrees, type RunTreeRef } from './run-trees.js';
 import type { HarnessTool, ToolAuthorizer, ToolRegistry } from './tools.js';
 import { settleWithRefusalScope } from './refusals.js';
 import { RunStepTagger, StepChannel, type RunStep, type ToolCallOutcome } from './steps.js';
@@ -253,6 +255,8 @@ const RESOLUTION_LOCK_SECONDS = 300;
 const RESOLUTION_WAIT_SECONDS = 30;
 
 export class AgentRuntime {
+  /** A subagent child run's tree and plan budget references, by run id, while it runs. */
+  readonly #childRefs = new Map<string, { tree: RunTreeRef | null; planLedger: { session: string; plan: string } | null }>();
   readonly #client: LlmClient;
 
   readonly #modes: ModeRegistry;
@@ -527,7 +531,7 @@ export class AgentRuntime {
       let decidedPlan = false;
       const capture = live.planService()?.watch(live.key(), () => { decidedPlan = true; }) ?? (() => {});
       try {
-        await writeDecisions(live, decisions);
+        await writeDecisions(live, decisions, context);
       } finally {
         capture();
       }
@@ -755,9 +759,20 @@ export class AgentRuntime {
       // allowance. Only for a root run: a child's steps are already on the
       // tree ledger its caller hands back in.
       if (prompt === '' && execution == null) run.ledger.recordSteps(approvalRunSteps(stored) ?? 0);
+      const holdTtl = this.#setting(session, 'lock_ttl') ?? RESOLUTION_LOCK_SECONDS;
+      // A root run, or a child resumed outside the runner, which continues
+      // the run tree it was started in (G-366).
+      if (execution == null) run = await RunTrees.rootRun(session, runId, run, paused?.tree ?? null, holdTtl);
+      // What a subagent child's paused row carries into its resume: the run
+      // tree it belongs to and the shared plan budget that tree spends from.
+      if (run.binding !== null) {
+        this.#childRefs.set(runId, execution?.binding != null
+          ? { tree: await RunTrees.childStarted(session, execution), planLedger: plans?.ledgerOf(execution.rootRunId) ?? null }
+          : { tree: RunTrees.treeOf(runId), planLedger: paused?.planLedger ?? null });
+      }
       // G-366: a turn serving a plan step with a shared budget holds what the
       // plan has left, after the paused steps it continues are counted.
-      if (plans !== null) run = await plans.planTurn(session, runId, run, context);
+      if (plans !== null) run = await plans.planTurn(session, runId, run, context, prompt);
       if (scope !== null) {
         if (scope.legacy) console.warn('Pending approval has no valid stored tool scope; offering approved requests only.');
         offered = offered.filter(tool => scope.names.includes(tool.name)
@@ -782,7 +797,11 @@ export class AgentRuntime {
         await thread.record([turn], runId);
       }
 
-      return await this.#loop(session, mode, run, runId, provider, model, offered, called, systemPrompt, schema, steps);
+      // The tools this turn calls run inside it: a subagent tool reads the
+      // turn's own run context from here (see activeTurn()).
+      const turn = run;
+      return await activeTurns.run({ sessionKey: session.key(), runId, run: turn },
+        () => this.#loop(session, mode, turn, runId, provider, model, offered, called, systemPrompt, schema, steps));
     } catch (error) {
       // THE MODEL'S OWN WORDS DO NOT BELONG IN A RUN ROW OR AN EVENT. A schema
       // violation names the values that missed, so its message carries pieces
@@ -812,6 +831,9 @@ export class AgentRuntime {
       throw error;
     } finally {
       unwatchPlan();
+      this.#childRefs.delete(runId);
+      // A root run that holds part of a run tree's budget settles it.
+      await RunTrees.finished(session, runId);
       if (steps !== undefined) await rememberSeq(session, runId, steps);
     }
   }
@@ -938,6 +960,9 @@ export class AgentRuntime {
             declared: { ...run.binding.declared },
             parent_mode: { ...run.binding.parentMode },
           };
+          const refs = this.#childRefs.get(runId);
+          if (refs?.tree != null) row.harness_tree = { ...refs.tree };
+          if (refs?.planLedger != null) row.harness_plan_ledger = { ...refs.planLedger };
         }
       }
       await thread.record([row], runId);
@@ -1380,11 +1405,19 @@ async function writeDecisionsLocked(
  *
  * Call it holding the session lock: the check and the write are one step.
  */
-async function writeDecisions(session: Session, decisions: readonly ApprovalDecision[]): Promise<void> {
-  const pending = new Set(pendingApprovalIds((await session.thread().messages()).map((entry) => entry.message)));
+async function writeDecisions(session: Session, decisions: readonly ApprovalDecision[], context?: RunContext): Promise<void> {
+  const rows = (await session.thread().messages()).map((entry) => entry.message);
+  const pending = new Set(pendingApprovalIds(rows));
   for (const decision of decisions) {
     if (!pending.delete(decision.approvalId)) throw HarnessError.approvalNotPending(decision.approvalId);
   }
+  // A decision a spent shared plan budget could not run is refused here, with
+  // nothing recorded, rather than consumed by a resume the budget then
+  // refuses (G-366).
+  await session.planService()?.assertDecisionsFunded(session, decisions.map((decision) => decision.approvalId), context);
+  // And for a subagent child resumed outside the runner, a run tree with
+  // nothing left.
+  await RunTrees.assertDecisionsFunded(session, pausedRunState(rows)?.tree ?? null, context, RESOLUTION_LOCK_SECONDS);
 
   const run = await session.run();
 
@@ -1416,6 +1449,23 @@ function assertDecisions(decisions: unknown): ApprovalDecision[] {
 
     return { approvalId: candidate.approvalId, approved: candidate.approved, reason: candidate.reason ?? null };
   });
+}
+
+/** The turn whose tools are running, for the code those tools call. */
+const activeTurns = new AsyncLocalStorage<{ sessionKey: string; runId: string; run: RunContext }>();
+
+/**
+ * The run id and run context of the turn running on this session whose tool
+ * is executing now, or null outside one. A subagent the turn delegates to
+ * spends from this context's ledger, so from whatever the turn spends from:
+ * the run tree and, for a plan step, the plan's shared budget.
+ *
+ * @internal Read by SubagentRunner.
+ */
+export function activeTurn(sessionKey: string): { runId: string; run: RunContext } | null {
+  const turn = activeTurns.getStore();
+
+  return turn === undefined || turn.sessionKey !== sessionKey ? null : { runId: turn.runId, run: turn.run };
 }
 
 /** The context a run EXECUTES under: a metadata-only context states no run tree. */

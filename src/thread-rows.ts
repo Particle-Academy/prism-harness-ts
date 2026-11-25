@@ -241,6 +241,25 @@ export function pendingApprovalIds(rows: readonly JsonObject[]): string[] {
 }
 
 /**
+ * Every approval id the run paused at the transcript tail asked for, answered
+ * or not; empty when the tail is a user turn or an assistant step that asked
+ * nothing. A turn with no new message continues exactly these calls (G-366).
+ */
+export function pausedApprovalIds(rows: readonly JsonObject[]): string[] {
+  for (let index = rows.length - 1; index >= 0; index -= 1) {
+    const row = rows[index]!;
+    if (row.type === 'user') return [];
+    if (row.type !== 'assistant') continue;
+
+    return [...new Set(list(row.tool_approval_requests)
+      .map(request => request.approval_id)
+      .filter((id): id is string => typeof id === 'string' && id !== ''))];
+  }
+
+  return [];
+}
+
+/**
  * The model steps the run paused at the transcript tail has already taken, or
  * null when nothing at the tail is waiting on an approval.
  *
@@ -282,7 +301,12 @@ export type PausedBinding = {
  * again from nothing. A malformed binding is read as none. A row written
  * before these fields existed carries neither.
  */
-export function pausedRunState(rows: readonly JsonObject[]): { agentSpend: PausedAgentSpend | null; binding: PausedBinding | null } | null {
+export function pausedRunState(rows: readonly JsonObject[]): {
+  agentSpend: PausedAgentSpend | null;
+  binding: PausedBinding | null;
+  tree: { session: string; run: string } | null;
+  planLedger: { session: string; plan: string } | null;
+} | null {
   if (approvalToolScope(rows) === null) return null;
   const paused = [...rows].reverse().find((row) => row.type === 'assistant');
   if (paused === undefined) return null;
@@ -298,7 +322,20 @@ export function pausedRunState(rows: readonly JsonObject[]): { agentSpend: Pause
       : { cost_usd: 0, unmetered_runs: 1 };
   }
 
-  return { agentSpend, binding: storedBinding(paused.harness_binding) };
+  return {
+    agentSpend,
+    binding: storedBinding(paused.harness_binding),
+    tree: storedPair(paused.harness_tree, 'session', 'run') as { session: string; run: string } | null,
+    planLedger: storedPair(paused.harness_plan_ledger, 'session', 'plan') as { session: string; plan: string } | null,
+  };
+}
+
+/** A subagent child's run tree or shared plan budget reference, as stored on the row it paused on; null when absent or malformed. */
+function storedPair(value: JsonValue | undefined, first: string, second: string): Record<string, string> | null {
+  if (!isObject(value)) return null;
+  const a = value[first], b = value[second];
+
+  return typeof a === 'string' && a !== '' && typeof b === 'string' && b !== '' ? { [first]: a, [second]: b } : null;
 }
 
 function storedBinding(value: JsonValue | undefined): PausedBinding | null {

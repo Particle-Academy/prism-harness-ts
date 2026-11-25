@@ -1,8 +1,8 @@
 import type { JsonObject } from './json.js';
 import type { PrismHarness } from './harness.js';
-import type { AgentRuntime } from './runtime.js';
+import { activeTurn, type AgentRuntime } from './runtime.js';
 import type { Session } from './session.js';
-import { MAX_DEPTH, RunContext, type ModelBinding, type Subagent } from './subagents.js';
+import { MAX_DEPTH, RunBudget, RunContext, type ModelBinding, type Subagent } from './subagents.js';
 import type { HarnessTool } from './tools.js';
 import { HarnessError } from './errors.js';
 import { markRefused } from './refusals.js';
@@ -48,6 +48,14 @@ export class SubagentRunner {
     private readonly runtime: AgentRuntime,
   ) {}
 
+  /**
+   * Called inside a turn on `parent`, the child runs in THAT TURN's run tree
+   * and spends from its ledger: the turn's budget and, for a plan step, the
+   * plan's shared budget. `context` can then only narrow the turn's limits,
+   * by what it has left; it never widens them and its own ledger is not
+   * charged. Called outside a turn (the host invoking the tool itself),
+   * `context` is the run tree, as before.
+   */
   tool(subagent: Subagent, parent: Session, context: RunContext, parentRunId: string): HarnessTool {
     return {
       name: subagent.name,
@@ -58,7 +66,8 @@ export class SubagentRunner {
         }
         const task = typeof args.task === 'string' ? args.task : '';
 
-        const result = await this.run(subagent, parent, context, parentRunId, task);
+        const turn = activeTurn(parent.key());
+        const result = await this.run(subagent, parent, turn === null ? context : narrowedTo(turn.run, context), turn?.runId ?? parentRunId, task);
 
         // The tree refusing to let a child run is a gate, not the child's
         // failure: said here, so a run step reports it as one.
@@ -205,4 +214,20 @@ function refused(
     text,
     toToolResult: () => text,
   };
+}
+
+/**
+ * The turn's run context, narrowed by what a host-supplied context has left.
+ * The turn's ledger is kept: the child spends from the turn, never from the
+ * host's tree.
+ */
+function narrowedTo(turn: RunContext, host: RunContext): RunContext {
+  if (host.metadataOnly || host === turn) return turn;
+  const lower = (a: number | null, b: number | null): number | null => a === null ? b : b === null ? a : Math.min(a, b);
+  const steps = Math.min(turn.budget.maxSteps, turn.ledger.steps + Math.max(0, host.budget.maxSteps - host.ledger.steps));
+  const cost = host.budget.maxCostUsd === null ? turn.budget.maxCostUsd
+    : lower(turn.budget.maxCostUsd, turn.ledger.costUsd + Math.max(0, host.budget.maxCostUsd - host.ledger.costUsd));
+
+  return turn.withBudget(new RunBudget(steps, cost, lower(turn.budget.maxSeconds, host.budget.maxSeconds),
+    lower(turn.budget.maxOutputTokensPerCall, host.budget.maxOutputTokensPerCall)));
 }

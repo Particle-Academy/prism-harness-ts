@@ -6,12 +6,37 @@
 
 - Plan budgets (G-366): the plans config's `budget.mode` is `per_step` (the
   default, unchanged behaviour), `shared` (one ledger of `max_steps` model
-  steps and optionally `max_cost_usd` across every turn that serves the plan,
-  kept in the plan store) or `none`. Host code can choose it per plan with
+  steps and optionally `max_cost_usd` across the plan's own turns, kept in
+  the plan store) or `none`. Host code can choose it per plan with
   `PlanHandle.useBudget()`; `PlanHandle.budget()` reports it. A spent shared
   budget blocks the plan with `plan_budget_exhausted`, emits
   `plan.budget_exhausted` once, and cannot be resumed. See the README's
   "Plan budgets".
+- A shared plan budget charges only the plan's own turns: the turn
+  `advance()` runs for the step it claimed and the resume of an approval that
+  step asked for. A person chatting while a step is held, or while a claim
+  whose worker died is still live, is no longer charged to the plan or
+  refused once it is spent. A decision on the held step's approval is refused
+  with `plan_budget_exhausted` before anything is recorded when the shared
+  budget is spent, on every decision path, and the next `advance()` blocks
+  the plan once, so an approval is never recorded and then never run.
+- A subagent tool built with `SubagentRunner.tool()` and called by a turn on
+  its parent session now runs its child in that turn's run tree, so the
+  child's spend counts against the turn's budget and a shared plan budget.
+  The run context the host built the tool with can only narrow the turn's
+  limits; before, the child spent from that context's own ledger, outside the
+  turn and outside the plan budget.
+- A subagent child that stopped on an approval and is resumed outside the
+  runner continues the run tree it was started in instead of a fresh root
+  budget. The first time a root run starts a child, the tree's allowance is
+  kept in the durable store and the root run settles what the tree spent when
+  it ends; the resumed child holds what is left, settles what it spent, and
+  is refused with `run_not_permitted` once it is spent. A decision on that
+  child's approval is refused the same way before anything is recorded. When
+  the tree spent from a shared plan budget, the resumed child spends from it
+  too, and its decision is refused with `plan_budget_exhausted` once the plan
+  budget is spent. A child started under a host-built context outside a turn
+  keeps the previous behaviour.
 
 - Agent plans (G-360), the port of the reference's: an agent drafts an ordered
   plan with `plan_draft`, a person approves it, and `session.plan().advance()`

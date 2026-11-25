@@ -10,8 +10,10 @@ import {
   RunBudget,
   RunContext,
   RunLedger,
+  SubagentRunner,
   ToolRegistry,
   recordApproval,
+  recordDecisions,
   type Durability,
   type HarnessEvent,
   type JsonObject,
@@ -38,8 +40,16 @@ afterEach(() => {
 });
 
 class DurableMemoryStore extends MemorySessionStore {
+  /** When set, a write to a plan budget record fails, as a store that is down would. */
+  failBudgetWrites = false;
+
   override durability(): Durability {
     return 'durable';
+  }
+
+  override async put(key: string, payload: JsonObject, ttlSeconds: number | null = null): Promise<void> {
+    if (this.failBudgetWrites && key.endsWith(':plan-budget')) throw new Error('store down');
+    await super.put(key, payload, ttlSeconds);
   }
 }
 
@@ -48,6 +58,8 @@ type Call = [string, JsonObject];
 interface RigOptions {
   config?: PlansConfig;
   mode?: Record<string, unknown>;
+  /** A `research` subagent the host wires with its own run context, as SubagentRunner.tool() takes it. */
+  hostSubagent?: RunContext;
 }
 
 class Rig {
@@ -73,7 +85,10 @@ class Rig {
     const config: PlansConfig = { enabled: true, ...this.options.config };
     const modes = new ModeRegistry({
       default: 'chat',
-      modes: { chat: { system_prompt: 'You are a travel agent.', tools: ['weather', 'lookup'], requires_approval: ['weather'], plans: true, ...this.options.mode } as ModeConfig },
+      modes: {
+        chat: { system_prompt: 'You are a travel agent.', tools: ['weather', 'lookup'], requires_approval: ['weather'], plans: true, ...this.options.mode } as ModeConfig,
+        research: { system_prompt: 'You research.', tools: ['weather', 'lookup'], requires_approval: ['weather'], max_steps: 8 } as ModeConfig,
+      },
     });
     const tools = new ToolRegistry()
       .register({ name: 'weather', handle: () => { this.weatherRan += 1; return 'Sunny'; } })
@@ -99,6 +114,10 @@ class Rig {
       runtime: this.runtime,
       plans: this.plans,
     });
+    if (this.options.hostSubagent !== undefined) {
+      const subagent = modes.resolve('chat').subagents.research!;
+      tools.register(new SubagentRunner(this.harness, this.runtime).tool(subagent, this.session(), this.options.hostSubagent, 'host_run'));
+    }
   }
 
   session(): Session {
@@ -270,10 +289,13 @@ describe('plan budgets (G-366)', () => {
     const plan = (await r.plans.load(session))!;
     await r.plans.write(session, PlanMachine.claim(plan, plan.steps[0]!.id, 'worker', r.plans.now() + 300, r.plans.now()), plan.revision);
     const turn = (id: string) => r.plans.planTurn(session, id, new RunContext(RunLedger.start(id), new RunBudget(8)), undefined);
+    // Each as the step's own turn, as advance() runs it.
+    const serving = r.plans.servingStep(session);
 
     expect((await turn('run_a')).budget.maxSteps).toBe(8);
     expect((await turn('run_b')).budget.maxSteps).toBe(2);
     await expect(turn('run_c')).rejects.toMatchObject({ code: 'plan_budget_exhausted' });
+    serving();
   });
 
   it('ignores budget fields the model sends and refuses a run tree handed to a shared plan step', async () => {
@@ -319,5 +341,198 @@ describe('plan budgets (G-366)', () => {
   ])('refuses an invalid plan budget in config before anything runs: %s', async (_name, budget) => {
     const r = new Rig({ config: { budget: budget as never } });
     await expect(r.session().plan()).rejects.toMatchObject({ name: 'PlanBudgetInvalid' });
+  });
+
+  // Only the plan's own turns spend from a shared budget: the turns advance()
+  // runs, and the resume of an approval its held step asked for. A person
+  // chatting while a step waits is not the plan, and is never refused for it.
+
+  /** A shared plan whose first step paused on a weather approval after one model step. */
+  async function held(maxSteps: number): Promise<{ r: Rig; id: string }> {
+    const r = new Rig({ config: { budget: { mode: 'shared', max_steps: maxSteps } } });
+    await r.active(2);
+    r.calls([['weather', { city: 'Paris' }]]);
+    await (await r.handle()).advance();
+    const step = (await r.plan()).steps[0];
+    expect(step.state).toBe('held');
+    expect((await (await r.handle()).budget())!.steps).toBe(1);
+
+    return { r, id: step.approvalIds[0] };
+  }
+
+  it('does not charge a shared plan for a chat turn while its step is held', async () => {
+    const { r } = await held(10);
+    r.calls([['lookup', { q: 'a' }]]);
+    r.calls([['lookup', { q: 'b' }]]);
+    r.text('Unrelated answer.');
+    await r.runtime.send(r.session(), 'Unrelated question');
+
+    expect(r.lookups).toBe(2);
+    expect((await (await r.handle()).budget())!.steps).toBe(1);
+  });
+
+  it('lets the person chat when a shared budget is spent while a step is held', async () => {
+    const { r } = await held(1);
+    r.text('Unrelated answer.');
+
+    expect((await r.runtime.send(r.session(), 'Unrelated question')).text).toBe('Unrelated answer.');
+    expect((await (await r.handle()).budget())!.steps).toBe(1);
+  });
+
+  it('does not charge a shared plan for a turn while its step is claimed by no running advance', async () => {
+    const r = new Rig({ config: { budget: { mode: 'shared', max_steps: 10 } } });
+    await r.active(1);
+    const session = r.session();
+    // A worker claimed the step and died before its turn ran.
+    const plan = (await r.plans.load(session))!;
+    await r.plans.write(session, PlanMachine.claim(plan, plan.steps[0]!.id, 'worker', r.plans.now() + 300, r.plans.now()), plan.revision);
+    r.calls([['lookup', { q: 'a' }]]);
+    r.text('Unrelated answer.');
+    await r.runtime.send(r.session(), 'Unrelated question');
+
+    expect(r.lookups).toBe(1);
+    expect((await (await r.handle()).budget())!.steps).toBe(0);
+  });
+
+  it('refuses an approval a spent shared budget cannot run, records nothing, and blocks the plan once', async () => {
+    const { r, id } = await held(1);
+    const before = r.requests.length;
+    // How many result rows the thread holds: a recorded decision adds one.
+    const results = async () => (await r.session().thread().messages()).filter((entry) => entry.message.type === 'tool_result').length;
+    const recorded = await results();
+
+    await expect(recordApproval(r.session(), id, true)).rejects.toMatchObject({ code: 'plan_budget_exhausted' });
+    await expect(r.runtime.decide(r.session(), id, true)).rejects.toMatchObject({ code: 'plan_budget_exhausted' });
+    await expect(recordDecisions(r.session(), [{ approvalId: id, approved: true }])).rejects.toMatchObject({ code: 'plan_budget_exhausted' });
+    expect(await results()).toBe(recorded);
+    expect(r.weatherRan).toBe(0);
+    expect(r.requests.length).toBe(before);
+
+    const outcome = await (await r.handle()).advance();
+    expect(outcome.status).toBe('blocked');
+    expect(outcome.reason).toBe('plan_budget_exhausted');
+    expect(r.events.filter((event) => event.type === 'plan.budget_exhausted')).toHaveLength(1);
+    expect((await (await r.handle()).advance()).status).toBe('not_active');
+    expect(r.events.filter((event) => event.type === 'plan.budget_exhausted')).toHaveLength(1);
+
+    // Still refused once the plan is blocked: the call never runs outside the budget.
+    const stream = r.runtime.streamDecision(r.session(), [{ approvalId: id, approved: true }], actor());
+    await expect((async () => { for await (const _ of stream) { /* drain */ } })()).rejects.toMatchObject({ code: 'plan_budget_exhausted' });
+    expect(await results()).toBe(recorded);
+    expect(r.weatherRan).toBe(0);
+    expect(r.requests.length).toBe(before);
+  });
+
+  it('closes the run when a shared plan budget cannot be written', async () => {
+    const r = new Rig({ config: { budget: { mode: 'shared', max_steps: 10 } } });
+    await r.active(1);
+    r.durable.failBudgetWrites = true;
+    r.text('unused');
+
+    await expect((await r.handle()).advance()).rejects.toThrow('store down');
+    expect((await r.session().run())!.status).toBe('failed');
+    expect(r.events.some((event) => event.type === 'run.failed')).toBe(true);
+  });
+
+  // A subagent the step delegates to spends from the step's own turn, so from
+  // the plan's shared budget. The run context the host wired the subagent
+  // tool with may narrow that, never widen it or replace the ledger.
+
+  const delegating = (maxSteps: number) => new Rig({
+    config: { budget: { mode: 'shared', max_steps: maxSteps } },
+    mode: { tools: ['weather', 'lookup', 'research'], subagents: { research: { mode: 'research', max_steps: 8 } } },
+    hostSubagent: RunContext.root('host', new RunBudget(100)),
+  });
+
+  it('charges a subagent a shared plan step delegates to the plan budget', async () => {
+    const r = delegating(10);
+    await r.active(1);
+    r.calls([['research', { task: 'Find the weather.' }]]);   // parent
+    r.text('Child answer.');                                   // child
+    r.calls([['plan_complete_step', { summary: 'Asked.' }]]);  // parent
+    r.text('Step done.');                                      // parent
+    await (await r.handle()).advance();
+
+    expect(r.queue).toHaveLength(0);
+    expect((await (await r.handle()).budget())!.steps).toBe(4);
+  });
+
+  it('never lets the host context a subagent tool was wired with widen a shared plan step', async () => {
+    const r = delegating(3);
+    await r.active(1);
+    r.calls([['research', { task: 'Find the weather.' }]]);   // parent: step 1 of 3
+    for (const q of ['a', 'b', 'c']) r.calls([['lookup', { q }]]);
+    r.text('Child answer.');
+    await (await r.handle()).advance();
+
+    // The child had the two steps the plan had left, not the host's hundred.
+    expect(r.requests.filter((request) => request.systemPrompt.startsWith('You research.'))).toHaveLength(2);
+    expect(r.lookups).toBe(2);
+    expect(r.queue).toHaveLength(2);
+    expect((await (await r.handle()).budget())!.steps).toBe(3);
+  });
+
+  it('lets the host context a subagent tool was wired with narrow a turn', async () => {
+    const r = new Rig({
+      config: { budget: { mode: 'shared', max_steps: 10 } },
+      mode: { tools: ['weather', 'lookup', 'research'], subagents: { research: { mode: 'research', max_steps: 8 } } },
+      hostSubagent: RunContext.root('host', new RunBudget(1)),
+    });
+    await r.active(1);
+    r.calls([['research', { task: 'Find the weather.' }]]);   // parent
+    r.calls([['lookup', { q: 'a' }]]);                         // child: its one step
+    r.text('Step done.');                                      // parent
+    await (await r.handle()).advance();
+
+    // The child stopped after the one step the host context allowed.
+    expect(r.requests.filter((request) => request.systemPrompt.startsWith('You research.'))).toHaveLength(1);
+    expect(r.lookups).toBe(1);
+    expect(r.queue).toHaveLength(0);
+  });
+
+  // A subagent child that pauses on an approval is resumed later on its own
+  // session, outside the runner. When the turn that started it spent from a
+  // shared plan budget, the resumed child spends from the same one.
+
+  /** A plan step that delegates; the child pauses on weather. */
+  async function pausedChild(maxSteps: number): Promise<{ r: Rig; child: Session; id: string }> {
+    const r = delegating(maxSteps);
+    await r.active(1);
+    r.calls([['research', { task: 'Find the weather.' }]]);   // parent
+    r.calls([['weather', { city: 'Paris' }]]);                 // child: pauses
+    r.calls([['plan_complete_step', { summary: 'Asked.' }]]);  // parent
+    r.text('Step done.');                                      // parent
+    await (await r.handle()).advance();
+
+    const child = r.harness.for({ type: 'User', id: 1 }).session('chat::sub::research');
+    const pending = (await child.thread().messages()).map((entry) => entry.message)
+      .flatMap((row) => Array.isArray(row.tool_approval_requests) ? row.tool_approval_requests as JsonObject[] : [])
+      .map((request) => request.approval_id as string);
+    expect(pending).toHaveLength(1);
+    expect((await (await r.handle()).budget())!.steps).toBe(4);
+
+    return { r, child, id: pending[0]! };
+  }
+
+  it('charges a child resumed outside the runner to the shared plan budget it was started under', async () => {
+    const { r, child, id } = await pausedChild(10);
+    r.text('Child answer.');
+    await recordApproval(child, id, true);
+    await r.runtime.send(child, '');
+
+    expect(r.weatherRan).toBe(1);
+    expect((await (await r.handle()).budget())!.steps).toBe(5);
+  });
+
+  it('refuses, recording nothing, an approval for a child whose shared plan budget is spent', async () => {
+    const { r, child, id } = await pausedChild(4);
+    const before = r.requests.length;
+    const results = async () => (await child.thread().messages()).filter((entry) => entry.message.type === 'tool_result').length;
+    const recorded = await results();
+
+    await expect(recordApproval(child, id, true)).rejects.toMatchObject({ code: 'plan_budget_exhausted' });
+    expect(await results()).toBe(recorded);
+    expect(r.weatherRan).toBe(0);
+    expect(r.requests.length).toBe(before);
   });
 });

@@ -230,11 +230,31 @@ for an approval and is resumed (`send(session, '')` or `streamDecision()`) is
 the same run: the agent's spend so far is stored with the approval request and
 counts against the ceiling after the resume, as the step count does. A subagent's
 child run resumed that way, outside the runner, also keeps the provider and model
-it was bound to. Every other `send()` starts a new run tree with the full
+it was bound to, and continues the run tree it was started in rather than getting
+a fresh root budget. The first time a root run starts a child, the tree's step and
+cost allowance is kept in the durable store, and the root run settles what the
+whole tree spent when it ends. The resumed child holds what the tree has left
+before it calls a provider, settles what it spent when it ends, and is refused
+with `run_not_permitted` once the tree's allowance is spent; a decision on the
+child's approval is then refused the same way with nothing recorded, so the
+approval is never consumed by a resume that cannot run. A hold whose run never
+settled is charged in full once the run lock's TTL has passed. When the child was
+started by a turn that spent from a shared plan budget, the resumed child spends
+from that plan budget too (`plan_budget_exhausted`). A child started under a run
+context the host built itself, outside any turn, has no tree record and is
+resumed on its own root budget. Every other `send()` starts a new run tree with the full
 ceiling, and so does each `plan.advance()` called without a context. To hold
 the steps of a plan to one ceiling, pass the same `RunContext` to every
 `advance(context)`; that context's budget then bounds the whole plan, its step
 limit included.
+
+A subagent tool built with `SubagentRunner.tool(subagent, parent, context, parentRunId)`
+and called by a turn on `parent` runs its child in THAT turn's run tree: the
+child spends from the turn's ledger, so from the turn's budget and, for a plan
+step, from the plan's shared budget. The `context` it was built with can then
+only narrow the turn's limits, by what it has left; it never widens them and
+its own ledger is not charged. Called outside a turn, `context` is the run tree,
+as before.
 
 Every run event of a named agent carries `harnessAgent`. Legacy events do not.
 
@@ -630,7 +650,7 @@ options cannot choose it or widen it.
 | mode | what it means |
 |---|---|
 | `per_step` (default) | Each step's turn gets the per-turn budget, as before. |
-| `shared` | Every turn that serves the plan also spends from one ledger: `max_steps` model steps in total (required) and optionally `max_cost_usd`. Per-turn limits still apply to each turn. When the ledger is spent, the plan is blocked with `plan_budget_exhausted` and a `plan.budget_exhausted` event is emitted once. |
+| `shared` | The plan's own turns also spend from one ledger: `max_steps` model steps in total (required) and optionally `max_cost_usd`. Per-turn limits still apply to each turn. When the ledger is spent, the plan is blocked with `plan_budget_exhausted` and a `plan.budget_exhausted` event is emitted once. |
 | `none` | No plan-level budget. Per-turn limits, the plan's own limits and agent spend ceilings still apply. |
 
 ```ts
@@ -652,6 +672,16 @@ handed a run tree of its own is refused (`plan.budget_context`) rather than run
 outside the ledger. An invalid mode or limit throws `PlanBudgetInvalid` when
 plans are used, before anything runs. A turn the ledger refuses fails with
 `plan_budget_exhausted`.
+
+The plan's own turns are the turn `advance()` runs for the step it claimed and
+the resume of an approval that step asked for. Any other turn on the session,
+such as the person chatting while a step waits on their approval, spends
+nothing from the plan's budget and is never refused for it. A decision on an
+approval the step asked for (`recordApproval()`, `recordDecisions()`,
+`runtime.decide()` or `streamDecision()`) is refused with
+`plan_budget_exhausted`, recording nothing, when the shared budget is already
+spent, and the next `advance()` blocks the plan, so an approval is never
+consumed by a resume that cannot run.
 
 ### Hosts with queues
 

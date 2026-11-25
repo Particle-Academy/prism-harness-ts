@@ -261,8 +261,8 @@ describe('the harness-plans corpus (G-360)', () => {
     return;
   }
 
-  it('vendors all 48 cases', () => {
-    expect(corpus.cases).toHaveLength(48);
+  it('vendors all 52 cases', () => {
+    expect(corpus.cases).toHaveLength(52);
   });
 
   it.each(corpus.cases.map((entry) => [entry.id, entry] as const))('%s runs as the reference recorded it', (_id, entry) => {
