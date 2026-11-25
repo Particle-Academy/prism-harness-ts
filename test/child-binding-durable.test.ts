@@ -205,3 +205,74 @@ describe('a subagent child keeps its saved binding outside the runner', () => {
     expect(r.requests).toHaveLength(0);
   });
 });
+
+// The runner starts a child under a run tree the HOST built: the parent's turn
+// was handed a RunContext the host made. The child's context is still the
+// runner's own (it built it with forChild and bound it), so its binding is
+// saved with the child session exactly as under a tree this runtime opened.
+// Without that, the child's next turn would run on the default provider. The
+// PHP reference does this (RunTrees::startingChild); the parity row is
+// harness-plans hpl-0059.
+describe('a child the runner starts under a run tree the host built', () => {
+  async function hostTreeChild(pause: boolean): Promise<{ r: Rig; child: Session }> {
+    const r = new Rig();
+    r.calls([['research', { task: 'Find the weather.' }]]);
+    if (pause) r.calls([['weather', { city: 'Paris' }]]);
+    else r.text('Child answer.');
+    r.text('Parent answer.');
+    await r.runtime.send(r.session(), 'Go', undefined, RunContext.root('host_root', new RunBudget(100)));
+    expect(r.sent(1)[0]).toEqual(cheap);
+
+    return { r, child: r.session('chat::sub::research') };
+  }
+
+  it('saves the binding the runner gave it, so a new message runs on it', async () => {
+    const { r, child } = await hostTreeChild(false);
+    expect(await child.childBinding()).not.toBeNull();
+    const before = r.requests.length;
+
+    r.text('Again.');
+    await r.runtime.send(child, 'New question');
+
+    expect(r.sent(before)).toEqual([cheap]);
+  });
+
+  it('resumes the child paused on an approval on that binding', async () => {
+    const { r, child } = await hostTreeChild(true);
+    const before = r.requests.length;
+
+    r.text('Again.');
+    await r.runtime.send(child, 'New question');
+
+    expect(r.sent(before)).toEqual([cheap]);
+  });
+
+  it('keeps that binding after the ephemeral half of the session is gone', async () => {
+    const { r, child } = await hostTreeChild(false);
+    const before = r.requests.length;
+    await r.ephemeral.expireAll();
+
+    r.text('Again.');
+    await r.runtime.send(child, 'New question');
+
+    expect(r.sent(before)).toEqual([cheap]);
+  });
+
+  it('never saves a binding the host put on a context it built itself', async () => {
+    const r = new Rig();
+    const session = r.session('plain');
+    const hosted = new RunContext(RunLedger.start('host_root'), new RunBudget(100), null, 0, {}, {
+      session: { provider: null, model: null },
+      declared: { provider: 'custom-cheap', model: 'cheap-model' },
+      parentMode: { provider: null, model: null },
+    });
+
+    r.text('Hosted.');
+    await r.runtime.send(session, 'Go', undefined, hosted);
+    r.text('Plain.');
+    await r.runtime.send(session, 'Again');
+
+    expect(r.sent(0)).toEqual([cheap, { provider: 'anthropic', model: 'root-model' }]);
+    expect(await session.childBinding()).toBeNull();
+  });
+});
