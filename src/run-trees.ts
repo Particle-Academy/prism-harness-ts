@@ -27,6 +27,12 @@ interface RootRun {
 const runs = new Map<string, RootRun>();
 
 /**
+ * The child contexts the subagent runner built, held weakly. Only these (and a
+ * context of a live tree here) may save a child's binding.
+ */
+const childContexts = new WeakSet<RunContext>();
+
+/**
  * The durable half of a run tree's budget, for subagent children resumed
  * outside the runner (the port of the reference's RunTrees).
  *
@@ -102,6 +108,29 @@ export const RunTrees = {
     if (context.metadataOnly) return 'metadata';
 
     return runs.get(context.rootRunId)?.ledger === context.ledger ? 'runner' : 'host';
+  },
+
+  /**
+   * The subagent runner is starting a child under `context`, which it built.
+   * Marks it as the runner's own, so the child's binding is saved with its
+   * session even under a run tree the host built.
+   *
+   * @internal Called by the subagent runner only.
+   */
+  startingChild(context: RunContext): RunContext {
+    childContexts.add(context);
+
+    return context;
+  },
+
+  /**
+   * The kind of context a turn was handed, for bindingRoute(): `runner` for
+   * the context the subagent runner built to start a child, even under a run
+   * tree the host built, otherwise contextKind(). A context the host builds
+   * and binds itself is never the runner's.
+   */
+  bindingContextKind(context: RunContext | null | undefined): RunContextKind {
+    return context != null && childContexts.has(context) ? 'runner' : RunTrees.contextKind(context);
   },
 
   /** The tree a run of this process belongs to, or null. */

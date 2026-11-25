@@ -6,6 +6,7 @@ import { MAX_DEPTH, RunBudget, RunContext, type ModelBinding, type Subagent } fr
 import type { HarnessTool } from './tools.js';
 import { HarnessError } from './errors.js';
 import { markRefused } from './refusals.js';
+import { RunTrees } from './run-trees.js';
 
 export type SubagentOutcome =
   /** It ran and returned. */
@@ -110,7 +111,8 @@ export class SubagentRunner {
     } catch (error) {
       return refused(subagent.name, runId, parentRunId, 'failed', error instanceof Error ? error.message : String(error));
     }
-    const childContext = context.forChild(subagent, parentRunId, binding);
+    // Marked as the runner's own: only this context saves the child's binding.
+    const childContext = RunTrees.startingChild(context.forChild(subagent, parentRunId, binding));
 
     // Refused BEFORE the child's address is built. Two modes naming each other
     // as subagents form a cycle budgets would eventually stop — but only after
