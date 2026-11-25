@@ -9,6 +9,8 @@ import {
   PlanMachine,
   PlanRefused,
   PlanView,
+  RunBudget,
+  RunContext,
   ToolPolicy,
   bindingRoute,
   renderPlanText,
@@ -16,6 +18,7 @@ import {
   type PlanBudgetState,
   type PendingCall,
 } from '../src/index.js';
+import { RunTrees } from '../src/run-trees.js';
 
 // The cross-language plans corpus (G-360, prism-parity suites/harness-plans).
 // Each case runs its ops through the pure PlanMachine and PlanView, the same
@@ -56,6 +59,7 @@ function runPlansCase(entry: PlansCase): { results: unknown[]; final: unknown; b
     const now = (op.now ?? entry.now ?? 1767225600) as number;
     try {
       results.push(op.op === 'binding_route' ? plansBindingOp(op, state)
+        : op.op === 'binding_context' ? plansBindingContextOp(op, state)
         : String(op.op).startsWith('budget_') ? plansBudgetOp(op, state, now) : plansOp(op, state, ids, limits, now));
     } catch (error) {
       if (!(error instanceof PlanRefused)) throw error;
@@ -92,6 +96,34 @@ function plansBindingOp(op: Op, state: CaseState): unknown {
   state.savedBinding = saved || route.save;
 
   return { route };
+}
+
+const cheapBinding = {
+  session: { provider: null, model: null },
+  declared: { provider: 'custom-cheap', model: 'cheap-model' },
+  parentMode: { provider: null, model: null },
+};
+
+/**
+ * Which kind of context a turn was handed for its binding
+ * (RunTrees.bindingContextKind on a real RunContext), then the route of that
+ * kind. The host builds the root context; the runner marks the child context
+ * it builds with RunTrees.startingChild; `rebound` binds it again after the
+ * mark, as a host deriving a context from the runner's would.
+ */
+function plansBindingContextOp(op: Op, state: CaseState): unknown {
+  if (!['none', 'host'].includes(op.context) || (op.context === 'none' && (op.runner_started || op.supplied_binding || op.rebound))) {
+    return { invalid: true };
+  }
+  let context: RunContext | null = op.context === 'host' ? RunContext.root('host_root', new RunBudget(10)) : null;
+  if (context !== null && op.supplied_binding === true) context = context.withBinding(cheapBinding);
+  if (context !== null && op.runner_started === true) context = RunTrees.startingChild(context);
+  if (context !== null && op.rebound === true) context = context.withBinding(cheapBinding);
+  const kind = RunTrees.bindingContextKind(context);
+  const route = bindingRoute(kind, context?.binding != null, state.savedBinding, op.linked);
+  state.savedBinding = state.savedBinding || route.save;
+
+  return { kind, route };
 }
 
 /** The plan budget ops (G-366): settings and the shared ledger, pure. */
@@ -284,8 +316,8 @@ describe('the harness-plans corpus (G-360)', () => {
     return;
   }
 
-  it('vendors all 58 cases', () => {
-    expect(corpus.cases).toHaveLength(58);
+  it('vendors all 60 cases', () => {
+    expect(corpus.cases).toHaveLength(60);
   });
 
   it.each(corpus.cases.map((entry) => [entry.id, entry] as const))('%s runs as the reference recorded it', (_id, entry) => {

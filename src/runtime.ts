@@ -714,8 +714,9 @@ export class AgentRuntime {
     const paused = prompt === '' && execution == null ? tail : null;
     const savedRefs: ChildRefs | null = contextKind === 'runner' ? null
       : (await session.childRefs()) ?? { tree: tail?.tree ?? null, planLedger: tail?.planLedger ?? null };
-    // The binding: from the runner's own context when the runner starts the
-    // child; otherwise the one SAVED with the child session, which a context
+    // The binding: from the runner's own context when the runner starts the child,
+    // even under a run tree the host built (RunTrees.bindingContextKind);
+    // otherwise the one SAVED with the child session, which a context
     // the host supplies never replaces. A child paused before the binding was
     // saved there carries it on its paused row. A session the runner started
     // as a child (it has saved run tree references) with no binding anywhere
@@ -727,7 +728,7 @@ export class AgentRuntime {
     const legacyBinding = tail?.binding == null ? null
       : { session: tail.binding.session, declared: tail.binding.declared, parentMode: tail.binding.parent_mode };
     const savedBinding = (await session.childBinding()) ?? legacyBinding;
-    const route = bindingRoute(contextKind, execution?.binding != null, savedBinding !== null, (await session.childRefs()) !== null);
+    const route = bindingRoute(RunTrees.bindingContextKind(execution), execution?.binding != null, savedBinding !== null, (await session.childRefs()) !== null);
     if (route.binding === 'refused') throw HarnessError.childBindingMissing();
     const runnerBinding = route.binding === 'runner' ? execution?.binding ?? null : null;
     const binding = route.binding === 'saved' ? savedBinding
