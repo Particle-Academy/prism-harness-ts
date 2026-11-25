@@ -182,7 +182,8 @@ export interface ApprovalDecision {
 
 /** What the step paths thread through a turn. */
 interface Stepping {
-  tagger: RunStepTagger;
+  /** Absent for a send() that only takes the session lock (a resumed root). */
+  tagger?: RunStepTagger;
   /** The id to run under, when the step path has already claimed one. */
   runId?: string;
   /** True when that id is a parked run's own, continued. */
@@ -433,7 +434,22 @@ export class AgentRuntime {
     context?: RunContext,
     additionalContent: readonly unknown[] = [],
   ): Promise<AgentResponse> {
-    return await this.#turn(session, prompt, toolNames, context, additionalContent, undefined, this.#observerStepping(context));
+    return await this.#resumeLocked(session, prompt, context, (live, stepping) =>
+      this.#turn(live, prompt, toolNames, context, additionalContent, undefined, stepping));
+  }
+
+  /**
+   * A turn that resumes a parked root (an empty prompt, no run tree handed
+   * in, and a run tree the parked run began in) runs under the session lock,
+   * as a decision stream does: two resumes of one parked root never overlap,
+   * so the second is held to the tree record the first opened (G-381). Any
+   * other turn runs as before.
+   */
+  async #resumeLocked<T>(session: Session, prompt: string, context: RunContext | undefined, turn: (live: Session, stepping: Stepping | undefined) => Promise<T>): Promise<T> {
+    const observer = this.#observerStepping(context);
+    if (prompt !== '' || executionContext(context) !== undefined || (await session.resumedRunTree()) === null) return turn(session, observer);
+
+    return this.#holdingTurnLock(session, (live) => turn(live, { ...observer, locked: true }));
   }
 
   /**
@@ -675,7 +691,8 @@ export class AgentRuntime {
     context?: RunContext,
     additionalContent: readonly unknown[] = [],
   ): Promise<StructuredAgentResponse> {
-    const response = await this.#turn(session, prompt, toolNames, context, additionalContent, schema, this.#observerStepping(context));
+    const response = await this.#resumeLocked(session, prompt, context, (live, stepping) =>
+      this.#turn(live, prompt, toolNames, context, additionalContent, schema, stepping));
 
     // Narrowed by #turn: with a schema it always returns the structured shape.
     return response as StructuredAgentResponse;

@@ -327,9 +327,7 @@ export class Session {
 
   /** @internal Written by the runtime when the subagent runner starts a child run. */
   async rememberChildBinding(binding: ModelBinding, depth = 0): Promise<this> {
-    this.#assertWritable();
-    const stored = (await this.#durable.get(this.#durableKey())) ?? {};
-    await this.#durable.put(this.#durableKey(), {
+    return this.#writeDurable((stored) => ({
       ...stored,
       child_binding: {
         session: { ...binding.session },
@@ -337,24 +335,18 @@ export class Session {
         parent_mode: { ...binding.parentMode },
       },
       child_depth: Number.isSafeInteger(depth) && depth > 0 ? depth : 0,
-    });
-
-    return this;
+    }));
   }
 
   /** @internal Written by the runtime when the subagent runner starts a child run. */
   async rememberChildRefs(refs: ChildRefs): Promise<this> {
-    this.#assertWritable();
-    const stored = (await this.#durable.get(this.#durableKey())) ?? {};
-    await this.#durable.put(this.#durableKey(), {
+    return this.#writeDurable((stored) => ({
       ...stored,
       child_refs: {
         tree: refs.tree === null ? null : { ...refs.tree },
         plan_ledger: refs.planLedger === null ? null : { ...refs.planLedger },
       },
-    });
-
-    return this;
+    }));
   }
 
   /**
@@ -408,33 +400,40 @@ export class Session {
    * Keep a run's tree under its OWN durable key (G-381), so starting a run
    * never rewrites the session's durable record (child refs, binding,
    * capabilities a host may change from another process). Written in
-   * beginRun, under the session lock the run begins in. The newest
+   * beginRun under a store lock on its own key, since send() holds no
+   * session lock and two turns may begin on one session at once. The newest
    * RUN_HISTORY runs are kept, by an explicit sequence rather than key
    * order, and a run whose approvals the thread is still parked on is never
    * dropped: a resume that keeps failing must not forget the tree it resumes.
    */
   async #rememberRunTree(id: string, tree: { session: string; run: string } | 'host' | 'none', depth: number): Promise<void> {
     this.#assertWritable();
-    const stored = (await this.#durable.get(this.#runTreesKey())) ?? {};
-    const runs: JsonObject = isJsonObject(stored.runs) ? { ...stored.runs } : {};
-    const seq = typeof stored.seq === 'number' && Number.isSafeInteger(stored.seq) ? stored.seq + 1 : 1;
-    runs[id] = { tree, depth, seq };
+    // Read before the lock: stale, it can only keep an extra entry or miss
+    // pinning a run that parked a moment ago, which has the newest seq.
     const parked = new Set(await this.#parkedRunIds());
-    const order = Object.keys(runs).map((runId) => {
-      const entry = runs[runId];
-      const at = isJsonObject(entry) && typeof entry.seq === 'number' ? entry.seq : 0;
+    const name = this.#runTreesKey();
+    // Under a lock on that key: send() holds no session lock, and two turns
+    // beginning together on one session must both be kept.
+    await this.#durable.withLock(name, async () => {
+      const stored = (await this.#durable.get(name)) ?? {};
+      const runs: JsonObject = isJsonObject(stored.runs) ? { ...stored.runs } : {};
+      const seq = typeof stored.seq === 'number' && Number.isSafeInteger(stored.seq) ? stored.seq + 1 : 1;
+      runs[id] = { tree, depth, seq };
+      const order = Object.keys(runs).map((runId) => {
+        const entry = runs[runId];
 
-      return { runId, at };
-    }).sort((a, b) => b.at - a.at);
-    const kept: JsonObject = {};
-    let count = 0;
-    for (const { runId } of order) {
-      if (count < RUN_HISTORY || parked.has(runId)) {
-        kept[runId] = runs[runId]!;
-        count += 1;
+        return { runId, at: isJsonObject(entry) && typeof entry.seq === 'number' ? entry.seq : 0 };
+      }).sort((a, b) => b.at - a.at);
+      const kept: JsonObject = {};
+      let count = 0;
+      for (const { runId } of order) {
+        if (count < RUN_HISTORY || parked.has(runId)) {
+          kept[runId] = runs[runId]!;
+          count += 1;
+        }
       }
-    }
-    await this.#durable.put(this.#runTreesKey(), { seq, runs: kept });
+      await this.#durable.put(name, { seq, runs: kept });
+    }, 10, 5);
   }
 
   #runTreesKey(): string {
@@ -586,10 +585,25 @@ export class Session {
   async #writeCapabilities(
     mutate: (capabilities: JsonObject) => JsonObject,
   ): Promise<this> {
+    return this.#writeDurable((stored) => ({
+      ...stored,
+      capabilities: mutate(isJsonObject(stored.capabilities) ? stored.capabilities : {}),
+    }));
+  }
+
+  /**
+   * Every read-modify-write of the session's durable record (capabilities
+   * the host keeps, a child's binding and refs the runner saves) under one
+   * lock on that record's key, so a write from one worker never undoes a
+   * write from another: a capability revoked while a parent delegates stays
+   * revoked.
+   */
+  async #writeDurable(change: (stored: JsonObject) => JsonObject): Promise<this> {
     this.#assertWritable();
-    const stored = (await this.#durable.get(this.#durableKey())) ?? {};
-    const capabilities = isJsonObject(stored.capabilities) ? stored.capabilities : {};
-    await this.#durable.put(this.#durableKey(), { ...stored, capabilities: mutate(capabilities) });
+    const name = this.#durableKey();
+    await this.#durable.withLock(name, async () => {
+      await this.#durable.put(name, change((await this.#durable.get(name)) ?? {}));
+    }, 10, 5);
 
     return this;
   }

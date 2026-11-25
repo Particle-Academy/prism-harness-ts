@@ -177,12 +177,21 @@ export const RunTrees = {
   async rootRun(session: Session, runId: string, run: RunContext, membership: TreeMembership, ttl: number): Promise<RunContext> {
     if (membership.route === 'none' || typeof membership.tree !== 'object') return run;
     const tree = membership.tree;
-    // A root resuming its parked run is in the tree that run began. When
-    // that run delegated, the tree has a record, and the resumed root holds
-    // what it has left and is narrowed to it, as any other turn continuing
-    // the tree: the tree's allowance holds across the pause.
+    // A run whose own step budget is already spent is left to its own
+    // ceiling, checked first: it still runs the approved calls it resumes,
+    // then stops with budget_exhausted, as it always has. There is nothing of
+    // the tree's for it to hold.
+    const ownLeft = run.budget.maxSteps - run.ledger.steps > 0;
+    // An open run whose tree already has a record is held to it, whatever
+    // its run id: a root resumed on the stream path continues under the
+    // parked run's own id, and the tree's allowance holds across the pause
+    // there exactly as on a resume under a new id.
     let route = membership.route;
-    if (route === 'open' && tree.run !== runId && record(await session.planStore().get(key(tree)), tree) !== null) route = 'continue';
+    if (route === 'open' && ownLeft && record(await session.planStore().get(key(tree)), tree) !== null) route = 'continue';
+    // A resumed root whose tree has no record yet stays open: it opens the
+    // record when it first delegates (childStarted). Two resumes of one
+    // parked root never overlap: the runtime starts a resumed root under the
+    // session lock, so the second sees the first's record.
     const entry: RootRun = {
       session: session.key(), tree,
       budget: run.budget, ledger: run.ledger, steps: run.ledger.steps, cost: run.ledger.costUsd,
@@ -195,12 +204,13 @@ export const RunTrees = {
     }
 
     const budget = run.budget;
+    const turnSteps = Math.max(0, budget.maxSteps - entry.steps);
     const turnCost = budget.maxCostUsd === null ? null : PlanBudget.micros(Math.max(0, budget.maxCostUsd - entry.cost));
     const now = Math.floor(Date.now() / 1000);
     const grant = await write(session.planStore(), tree, (state) => state === null
       // The tree's record is gone: closed, never a fresh budget.
       ? [null, { refused: PlanBudget.EXHAUSTED, limit: 'steps' } as PlanBudgetGrant]
-      : PlanBudget.reserve(state, runId, Math.max(0, budget.maxSteps - entry.steps), turnCost, now, ttl));
+      : PlanBudget.reserve(state, runId, turnSteps, turnCost, now, ttl));
     if ('refused' in grant) throw spent(grant.limit);
 
     const narrowed = run.withBudget(new RunBudget(
@@ -264,9 +274,11 @@ export const RunTrees = {
       // Named by the tree's root run; held under the run that spends (a
       // root resuming a parked run that never delegated opens its tree's
       // record here; one whose parked run did continues it in rootRun).
+      // The grant is never discarded: a refused one refuses the delegation.
       const tree = membership.tree;
-      await write(child.planStore(), tree, (state) =>
+      const grant = await write(child.planStore(), tree, (state) =>
         PlanBudget.reserve(state ?? PlanBudget.open(tree.run, settings), spends, Math.max(1, settings.max_steps), settings.max_cost_micros, now, entry.ttl));
+      if ('refused' in grant) throw spent(grant.limit);
       entry.held = true;
     }
 

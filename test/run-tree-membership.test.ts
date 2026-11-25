@@ -9,6 +9,7 @@ import {
   RunContext,
   RunLedger,
   SubagentRunner,
+  Session,
   ToolRegistry,
   recordApproval,
   type Durability,
@@ -17,7 +18,6 @@ import {
   type LlmResponse,
   type ModeConfig,
   type ModelBinding,
-  type Session,
   type Subagent,
 } from '../src/index.js';
 
@@ -78,6 +78,8 @@ class Rig {
   readonly research: Subagent;
   /** The depth of every run.started, in order. */
   readonly depths: number[] = [];
+  /** Run once before the next model call is answered (a second worker, say). */
+  beforeRequest: (() => Promise<void>) | null = null;
   /** What host code does inside the `hostcall` tool. */
   onHost: () => Promise<string> = async () => 'ok';
   #call = 0;
@@ -110,11 +112,16 @@ class Rig {
       .register({ name: 'weather', handle: () => { this.weatherRan += 1; return 'Sunny'; } })
       .register({ name: 'hostcall', handle: () => this.onHost() });
     this.runtime = new AgentRuntime({
+      // A second worker waiting on the session lock gives up quickly here.
+      config: { lock_wait: 1 },
       modes,
       tools,
       events,
       client: async (request) => {
         this.requests.push(request);
+        const hook = this.beforeRequest;
+        this.beforeRequest = null;
+        if (hook !== null) await hook();
         const next = this.queue.shift();
         if (next === undefined) throw new Error('The scripted model has no response left.');
 
@@ -606,5 +613,125 @@ describe('an approved subagent call, run on the resume', () => {
     await approve(r, session, 'send');
 
     expect((await r.session(1, 'guarded::sub::research').childRefs())?.tree).toEqual({ session: session.key(), run: first.runId });
+  });
+});
+
+// W-1: streamDecision resumes a parked root under the parked run's OWN id.
+// Its tree's record holds the steps the tree spent while it was parked, and
+// the resumed root is held to it there exactly as on a resume under a new id.
+describe('a root resumed on the stream path under its own run id', () => {
+  const drain = async (steps: AsyncGenerator<unknown, unknown, undefined>) => { for await (const _ of steps) { /* drained */ } };
+
+  it('is charged to its tree record', async () => {
+    const r = new Rig();
+    const root = r.session(1);
+    r.calls([['research', { task: 'Find the weather.' }]]); // root
+    r.calls([['weather', { city: 'Paris' }]]);              // research child: parks
+    r.calls([['weather', { city: 'Rome' }]]);               // root: parks
+    const first = (await r.runtime.send(root, 'Go')).runId;
+    const [rootId] = await r.pending(root);
+
+    // The child is answered first, and spends from the tree.
+    const child = r.session(1, 'chat::sub::research');
+    const [childId] = await r.pending(child);
+    r.text('Child done.');
+    await recordApproval(child, childId!, true);
+    await r.runtime.send(child, '');
+    const before = (await treeRecord(root, first))!.steps as number;
+
+    r.text('Root done.');                                   // one step
+    await drain(r.runtime.streamDecision(r.session(1), [{ approvalId: rootId!, approved: true }]));
+
+    const record = (await treeRecord(root, first))!;
+    expect(r.queue).toHaveLength(0);
+    expect(record.steps).toBe(before + 1);
+    expect(record.steps as number).toBeLessThanOrEqual(record.max_steps as number);
+  });
+});
+
+// Two resumes of one parked root that never delegated: the first opens the
+// tree's record when it starts, so the second is held to it, and the tree
+// never spends past its allowance.
+describe('two concurrent resumes of a parked root that never delegated', () => {
+  it('never spend the tree past its allowance', async () => {
+    const r = new Rig(6);
+    const root = r.session(1);
+    r.calls([['weather', { city: 'Rome' }]]);               // root: parks, no child
+    const first = (await r.runtime.send(root, 'Go')).runId;
+    const [id] = await r.pending(root);
+    await recordApproval(root, id!, true);
+
+    // A second worker resumes the same session while the first is in its model call.
+    r.beforeRequest = async () => {
+      await r.runtime.send(r.session(1), '').catch(() => undefined);
+    };
+    r.calls([['research', { task: 'A.' }]]);                // the second resume
+    r.text('Child A.');
+    r.text('Second done.');
+    r.calls([['research', { task: 'B.' }]]);                // the first resume
+    r.text('Child B.');
+    for (let i = 0; i < 5; i++) r.calls([['hostcall', {}]]);
+    r.text('First done.');
+    await r.runtime.send(root, '').catch(() => undefined);
+
+    const record = await treeRecord(root, first);
+    expect(record).not.toBeNull();
+    expect(record!.steps as number).toBeLessThanOrEqual(record!.max_steps as number);
+  });
+});
+
+// W-2: send() takes no session lock, so two overlapping turns on one session
+// begin together; neither may lose the other's run tree.
+describe('overlapping turns on one session', () => {
+  it('keep both runs in the session\'s run trees', async () => {
+    const r = new Rig();
+    const session = r.session(1, 'plain');
+    r.text('One.');
+    r.text('Two.');
+    const [one, two] = await Promise.all([r.runtime.send(session, 'one'), r.runtime.send(r.session(1, 'plain'), 'two')]);
+
+    const stored = await r.durable.get(`${session.key()}:run-trees`);
+    expect(Object.keys((stored?.runs ?? {}) as JsonObject).sort()).toEqual([one.runId, two.runId].sort());
+  });
+});
+
+// Py round-3 F2: the runner saves a child's refs into the child session's
+// durable record, which also holds the host's capabilities. A capability the
+// host revokes while the parent delegates must stay revoked.
+describe('a host revoke on a child session while the parent delegates', () => {
+  it('is never undone by the runner saving the child\'s refs', async () => {
+    const r = new Rig();
+    await r.delegated(1);
+    const child = r.session(1, 'chat::sub::research');
+    await child.usingCapability('grant', { on: true });
+
+    // Inside the refs save, right after its read, another worker revokes.
+    const original = Session.prototype.rememberChildRefs;
+    const get = r.durable.get.bind(r.durable);
+    let armed = false, revoked: Promise<unknown> | null = null;
+    const spyRefs = vi.spyOn(Session.prototype, 'rememberChildRefs').mockImplementation(async function (this: Session, refs) {
+      armed = true;
+      return original.call(this, refs);
+    });
+    const spyGet = vi.spyOn(r.durable, 'get').mockImplementation(async (key: string) => {
+      const value = await get(key);
+      if (armed && key === `${child.key()}:durable`) {
+        armed = false;
+        revoked = r.session(1, 'chat::sub::research').forgetCapability('grant');
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+
+      return value;
+    });
+    try {
+      await r.delegated(1);
+      await revoked;
+    } finally {
+      spyRefs.mockRestore();
+      spyGet.mockRestore();
+    }
+
+    expect(revoked).not.toBeNull();
+    expect(await r.session(1, 'chat::sub::research').capability('grant')).toBeNull();
   });
 });
