@@ -42,7 +42,7 @@ async function rig(call: LlmToolCall): Promise<{ session: Session; agent: AgentR
   });
   const session = harness.for({ type: 'User', id: 1 }).session('support');
   await session.usingProvider('anthropic');
-  await session.usingModel('claude-sonnet-4-5');
+  await session.usingModel('claude-sonnet-5-5');
   let runs = 0;
   let turn = 0;
   const tools = new ToolRegistry().register({ name: 'echo', handle: () => { runs += 1; return 'echoed'; } });

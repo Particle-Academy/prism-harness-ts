@@ -50,7 +50,7 @@ describe('addressing', () => {
     const user = harnessed.for({ type: 'User', id: 7 }).session('s');
     const team = harnessed.for({ type: 'Team', id: 7 }).session('s');
 
-    await user.usingModel('claude-sonnet-4-5');
+    await user.usingModel('claude-sonnet-5-5');
 
     expect(await team.model()).toBeNull();
     expect(user.key()).not.toBe(team.key());
@@ -61,11 +61,11 @@ describe('the ephemeral half', () => {
   it('round-trips mode, model and provider', async () => {
     const live = await session();
     await live.usingMode('plan');
-    await live.usingModel('claude-sonnet-4-5');
+    await live.usingModel('claude-sonnet-5-5');
     await live.usingProvider('anthropic');
 
     expect(await live.mode()).toBe('plan');
-    expect(await live.model()).toBe('claude-sonnet-4-5');
+    expect(await live.model()).toBe('claude-sonnet-5-5');
     expect(await live.provider()).toBe('anthropic');
   });
 
@@ -115,7 +115,7 @@ describe('the durable half', () => {
 describe('runs', () => {
   it('records a run through its lifecycle', async () => {
     const live = await session();
-    await live.beginRun('run-1', 'plan', 'anthropic', 'claude-sonnet-4-5');
+    await live.beginRun('run-1', 'plan', 'anthropic', 'claude-sonnet-5-5');
 
     expect(await live.run()).toMatchObject({ id: 'run-1', status: 'running', mode: 'plan' });
 

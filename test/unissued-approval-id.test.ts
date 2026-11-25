@@ -54,7 +54,7 @@ async function rig(toolCalls = [{ id: 'c1', name: 'echo', arguments: { value: 'x
   });
   const session = harness.for({ type: 'User', id: 1 }).session('support');
   await session.usingProvider('anthropic');
-  await session.usingModel('claude-sonnet-4-5');
+  await session.usingModel('claude-sonnet-5-5');
   const requests: LlmRequest[] = [];
   const counts: Record<string, number> = {};
   const tools = new ToolRegistry()
