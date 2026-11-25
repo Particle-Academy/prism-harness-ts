@@ -697,7 +697,7 @@ export class AgentRuntime {
     const model = await this.#choose(session, mode, binding, 'model');
     const runId = stepping?.runId ?? randomUUID();
     const tag = session.agent === null ? {} : { harnessAgent: session.agent };
-    const run = this.#boundedRun(session, execution
+    let run = this.#boundedRun(session, execution
       ?? new RunContext(RunLedger.start(runId), new RunBudget(mode.maxSteps), null, 0, {}, binding));
     if (session.agent !== null && paused?.agentSpend != null) {
       run.ledger.carryAgentSpend(session.agent, paused.agentSpend.cost_usd, paused.agentSpend.unmetered_runs);
@@ -755,6 +755,9 @@ export class AgentRuntime {
       // allowance. Only for a root run: a child's steps are already on the
       // tree ledger its caller hands back in.
       if (prompt === '' && execution == null) run.ledger.recordSteps(approvalRunSteps(stored) ?? 0);
+      // G-366: a turn serving a plan step with a shared budget holds what the
+      // plan has left, after the paused steps it continues are counted.
+      if (plans !== null) run = await plans.planTurn(session, runId, run, context);
       if (scope !== null) {
         if (scope.legacy) console.warn('Pending approval has no valid stored tool scope; offering approved requests only.');
         offered = offered.filter(tool => scope.names.includes(tool.name)

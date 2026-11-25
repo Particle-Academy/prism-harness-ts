@@ -1,3 +1,4 @@
+import { PLAN_BUDGET_EXHAUSTED } from './budget.js';
 import { PlanIds } from './ids.js';
 import { PlanLimits } from './limits.js';
 import { PlanRefused } from './refusal.js';
@@ -391,7 +392,7 @@ export const PlanMachine = {
    * Settle the previous head from persisted state, check the limits, and
    * choose what happens next.
    */
-  prepare(original: Plan, runFailed: boolean, limits: PlanLimits, now: number, runId: string | null): [Plan, PrepareOutcome] {
+  prepare(original: Plan, runFailed: boolean, limits: PlanLimits, now: number, runId: string | null, budgetExhausted = false): [Plan, PrepareOutcome] {
     if (original.status !== 'active') return [original, ['not_active', original.status]];
     let plan = settle(copy(original), runFailed, limits);
 
@@ -412,6 +413,11 @@ export const PlanMachine = {
       } else if (plan.counters.advances >= limits.maxAdvances) {
         plan = block(plan, 'budget');
         outcome = ['blocked', 'budget'];
+      } else if (budgetExhausted) {
+        // G-366: the plan's shared budget is spent. It is only ever lowered,
+        // so resume() refuses this as it refuses 'budget'.
+        plan = block(plan, PLAN_BUDGET_EXHAUSTED);
+        outcome = ['blocked', PLAN_BUDGET_EXHAUSTED];
       } else {
         outcome = ['run', step.id];
       }
@@ -653,7 +659,9 @@ export const PlanMachine = {
    * is not replayed; a plan that ran out of advances stays blocked.
    */
   resume(original: Plan, ids: PlanIds, limits: PlanLimits, now: number): Plan {
-    if (original.status !== 'blocked' || original.blockedReason === 'budget') throw PlanRefused.because('plan.not_resumable');
+    if (original.status !== 'blocked' || original.blockedReason === 'budget' || original.blockedReason === PLAN_BUDGET_EXHAUSTED) {
+      throw PlanRefused.because('plan.not_resumable');
+    }
     const plan = copy(original);
     const reason = plan.blockedReason;
     if (reason !== null && ['attempts_exhausted', 'no_completion', 'approval_withdrawn'].includes(reason)) {

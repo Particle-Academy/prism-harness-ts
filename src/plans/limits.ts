@@ -1,3 +1,5 @@
+import type { PlanBudgetConfig } from './budget.js';
+
 /**
  * The bounds a plan runs inside (G-360).
  *
@@ -34,6 +36,12 @@ export interface PlansConfig {
   /** `run_steps`: mix `plan_updated` steps (contract g282.3) into streamed runs. Off by default. */
   events?: { run_steps?: boolean; max_bytes?: number };
   reaper?: { stale_after?: number };
+  /**
+   * How a plan's steps are budgeted (G-366): `per_step` (default), `shared`
+   * with `max_steps` (required) and optional `max_cost_usd`, or `none`. See
+   * `PlanBudget`. Invalid values throw `PlanBudgetInvalid` when plans are used.
+   */
+  budget?: PlanBudgetConfig | null;
 }
 
 export class PlanLimits {

@@ -2,6 +2,8 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import {
   HarnessError,
+  PlanBudget,
+  PlanBudgetInvalid,
   PlanIds,
   PlanLimits,
   PlanMachine,
@@ -10,6 +12,7 @@ import {
   ToolPolicy,
   renderPlanText,
   type Plan,
+  type PlanBudgetState,
   type PendingCall,
 } from '../src/index.js';
 
@@ -32,7 +35,7 @@ interface PlansCase {
 
 const corpus = JSON.parse(readFileSync(new URL('./fixtures/harness-plans.json', import.meta.url), 'utf8')) as { cases: PlansCase[] };
 
-function runPlansCase(entry: PlansCase): { results: unknown[]; final: unknown } {
+function runPlansCase(entry: PlansCase): { results: unknown[]; final: unknown; budget?: unknown } {
   const given = entry.limits ?? {};
   const limits = new PlanLimits({
     maxSteps: given.max_steps ?? 20,
@@ -46,22 +49,77 @@ function runPlansCase(entry: PlansCase): { results: unknown[]; final: unknown } 
   });
   let counter = 0;
   const ids = new PlanIds((prefix) => `${prefix}_${String(++counter).padStart(26, '0')}`);
-  const state: { plan: Plan | null; marked?: ReturnType<typeof PlanView.steps> | null } = { plan: null, marked: null };
+  const state: CaseState = { plan: null, marked: null, ledger: null };
   const results: unknown[] = [];
   for (const op of entry.ops) {
     const now = (op.now ?? entry.now ?? 1767225600) as number;
     try {
-      results.push(plansOp(op, state, ids, limits, now));
+      results.push(String(op.op).startsWith('budget_') ? plansBudgetOp(op, state, now) : plansOp(op, state, ids, limits, now));
     } catch (error) {
       if (!(error instanceof PlanRefused)) throw error;
       results.push({ refused: error.code });
     }
   }
 
-  return { results, final: state.plan === null ? null : plansFinal(state.plan, limits) };
+  const out: { results: unknown[]; final: unknown; budget?: unknown } = { results, final: state.plan === null ? null : plansFinal(state.plan, limits) };
+  if (state.ledger !== null) out.budget = plansBudgetFinal(state.ledger);
+
+  return out;
 }
 
-function plansOp(op: Op, state: { plan: Plan | null; marked?: ReturnType<typeof PlanView.steps> | null }, ids: PlanIds, limits: PlanLimits, now: number): unknown {
+interface CaseState {
+  plan: Plan | null;
+  marked?: ReturnType<typeof PlanView.steps> | null;
+  ledger: PlanBudgetState | null;
+}
+
+/** The plan budget ops (G-366): settings and the shared ledger, pure. */
+function plansBudgetOp(op: Op, state: CaseState, now: number): unknown {
+  try {
+    switch (op.op) {
+      case 'budget_settings':
+        return { settings: PlanBudget.settings(op.config) };
+      case 'budget_for_plan':
+        return { settings: PlanBudget.forPlan(PlanBudget.settings(op.configured), op.requested) };
+      case 'budget_open':
+        state.ledger = PlanBudget.open('plan', PlanBudget.settings(op.config));
+
+        return { ok: true };
+      case 'budget_narrow':
+        state.ledger = PlanBudget.narrow(state.ledger!, PlanBudget.forPlan(PlanBudget.settings(null), op.requested));
+
+        return { ok: true };
+      case 'budget_reserve': {
+        const [ledger, grant] = PlanBudget.reserve(state.ledger!, op.hold, op.steps, op.cost_micros, now, op.ttl ?? 300);
+        state.ledger = ledger;
+
+        return 'refused' in grant ? grant : { grant };
+      }
+      case 'budget_settle':
+        state.ledger = PlanBudget.settle(state.ledger!, op.hold, op.steps, op.cost_micros);
+
+        return { ok: true };
+      case 'budget_exhaustion':
+        return { exhaustion: PlanBudget.exhaustion(state.ledger!) };
+      default:
+        throw new Error(`Unknown op ${String(op.op)}`);
+    }
+  } catch (error) {
+    if (error instanceof PlanBudgetInvalid) return { invalid: true };
+    throw error;
+  }
+}
+
+function plansBudgetFinal(ledger: PlanBudgetState): unknown {
+  return {
+    mode: ledger.mode, max_steps: ledger.max_steps, max_cost_micros: ledger.max_cost_micros,
+    steps: ledger.steps, cost_micros: ledger.cost_micros, unmetered: ledger.unmetered,
+    holds: Object.entries(ledger.holds).map(([id, hold]) => ({ id, steps: hold.steps, cost_micros: hold.cost_micros, at: hold.at })),
+    exhaustion: PlanBudget.exhaustion(ledger),
+  };
+}
+
+function plansOp(op: Op, state: CaseState, ids: PlanIds, limits: PlanLimits, now: number): unknown {
   const run = 'run_case';
   const needs = (): Plan => {
     if (state.plan === null) throw PlanRefused.because('plan.no_plan');
@@ -87,7 +145,8 @@ function plansOp(op: Op, state: { plan: Plan | null; marked?: ReturnType<typeof 
       return { ok: true };
     }
     case 'prepare': {
-      const [plan, outcome] = PlanMachine.prepare(needs(), op.run_failed, limits, now, null);
+      const [plan, outcome] = PlanMachine.prepare(needs(), op.run_failed, limits, now, null,
+        state.ledger !== null && PlanBudget.exhaustion(state.ledger) !== null);
       state.plan = plan;
 
       return { outcome };
@@ -202,8 +261,8 @@ describe('the harness-plans corpus (G-360)', () => {
     return;
   }
 
-  it('vendors all 39 cases', () => {
-    expect(corpus.cases).toHaveLength(39);
+  it('vendors all 48 cases', () => {
+    expect(corpus.cases).toHaveLength(48);
   });
 
   it.each(corpus.cases.map((entry) => [entry.id, entry] as const))('%s runs as the reference recorded it', (_id, entry) => {

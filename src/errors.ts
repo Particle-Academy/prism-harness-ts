@@ -18,6 +18,8 @@ export type HarnessErrorCode =
   | 'tool_not_available'
   /** A run was refused — by budget, by depth, or by a cancelled ledger. */
   | 'run_not_permitted'
+  /** A plan's shared budget is spent (G-366). The same code in the PHP reference and the Python port. */
+  | 'plan_budget_exhausted'
   /** A model returned a terminal error/unknown finish; its tools must not run. */
   | 'model_step_failed'
   /** A stored payload could not be mapped back into a value object. */
