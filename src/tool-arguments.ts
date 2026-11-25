@@ -1,4 +1,5 @@
 import type { JsonObject } from './json.js';
+import { canonicalJson } from './tool-policy.js';
 
 /**
  * The deepest nesting accepted. A provider wraps the arguments in its own
@@ -42,7 +43,21 @@ export function usableArguments(value: unknown): JsonObject | null {
 
   const map = decoded as JsonObject;
 
-  return Object.keys(map).some(isIntegerKey) || !canBeSentBack(map) ? null : map;
+  return Object.keys(map).some(isIntegerKey) || !canBeSentBack(map) || !digestible(map) ? null : map;
+}
+
+/**
+ * Every decision about a call carries the digest of its arguments, so
+ * arguments the digest cannot be computed for are unusable: otherwise the
+ * call's first decision event would throw out of the run instead.
+ */
+function digestible(map: JsonObject): boolean {
+  try {
+    canonicalJson(map);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function decode(text: string): unknown {
@@ -63,7 +78,7 @@ function canBeSentBack(root: JsonObject): boolean {
     for (const value of level) {
       if (Array.isArray(value)) {
         for (const item of value) {
-          if (!admitsValue(item, depth, next)) return false;
+          if (!admitsValue(item, depth, next, true)) return false;
         }
 
         continue;
@@ -73,7 +88,7 @@ function canBeSentBack(root: JsonObject): boolean {
 
       for (const key of Object.keys(map)) {
         if (key.startsWith('\u0000') || LONE_SURROGATE.test(key)) return false;
-        if (!admitsValue(map[key], depth, next)) return false;
+        if (!admitsValue(map[key], depth, next, false)) return false;
       }
     }
 
@@ -88,10 +103,21 @@ function canBeSentBack(root: JsonObject): boolean {
 }
 
 /** Checks a scalar in place and holds only a nested value for the next level. */
-function admitsValue(item: unknown, depth: number, next: object[]): boolean {
+function admitsValue(item: unknown, depth: number, next: object[], inList: boolean): boolean {
   if (typeof item === 'number') return Number.isFinite(item);
   if (typeof item === 'string') return !LONE_SURROGATE.test(item);
-  if (typeof item !== 'object' || item === null) return true;
+  if (item === null || typeof item === 'boolean') return true;
+  // An undefined property is an absent one, in JSON and in the digest alike. In
+  // a list it would be sent back as null and has no digest. A function, symbol
+  // or bigint has no JSON form at all.
+  if (item === undefined) return !inList;
+  if (typeof item !== 'object') return false;
+  // Only a list or a plain object: anything else (a Date, a Map, a class
+  // instance) is sent back as one value and digested as another.
+  if (!Array.isArray(item)) {
+    const prototype: unknown = Object.getPrototypeOf(item);
+    if (prototype !== Object.prototype && prototype !== null) return false;
+  }
   if (depth >= MAX_ARGUMENT_DEPTH) return false;
 
   next.push(item);

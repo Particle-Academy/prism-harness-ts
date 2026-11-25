@@ -367,6 +367,13 @@ A call that has a result never runs again. Who may approve is your application's
 decision: authorize before calling `recordApproval()`. `recordDecisions(session,
 [{ approvalId, approved, reason }])` records several decisions as one row.
 
+Recording a decision takes the session lock, which is not re-entrant: do not
+call these from inside your own `session.lock(...)` callback. `recordApproval()`
+and `recordDecisions()` wait up to 30 s for the lock; `runtime.decide(session,
+approvalId, approved, reason?)` records the same decision using the session's
+agent `lock_ttl` / `lock_wait`. A caller that cannot get the lock gets
+`session_locked`, and nothing is recorded.
+
 A decision must answer an approval the session is waiting on. `recordApproval()`,
 `recordDecisions()` and `streamDecision()` reject with a `HarnessError` coded
 `approval_not_pending` for an approval id the run never issued, or one already
