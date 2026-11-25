@@ -60,6 +60,8 @@ interface RigOptions {
   mode?: Record<string, unknown>;
   /** A `research` subagent the host wires with its own run context, as SubagentRunner.tool() takes it. */
   hostSubagent?: RunContext;
+  /** The research child delegates to a `dig` subagent of its own. */
+  nested?: boolean;
 }
 
 class Rig {
@@ -87,7 +89,11 @@ class Rig {
       default: 'chat',
       modes: {
         chat: { system_prompt: 'You are a travel agent.', tools: ['weather', 'lookup'], requires_approval: ['weather'], plans: true, ...this.options.mode } as ModeConfig,
-        research: { system_prompt: 'You research.', tools: ['weather', 'lookup'], requires_approval: ['weather'], max_steps: 8 } as ModeConfig,
+        research: {
+          system_prompt: 'You research.', tools: this.options.nested === true ? ['weather', 'lookup', 'dig'] : ['weather', 'lookup'], requires_approval: ['weather'], max_steps: 8,
+          ...(this.options.nested === true ? { subagents: { dig: { mode: 'dig' } } } : {}),
+        } as ModeConfig,
+        dig: { system_prompt: 'You dig.', tools: [], max_steps: 4 } as ModeConfig,
       },
     });
     const tools = new ToolRegistry()
@@ -117,6 +123,10 @@ class Rig {
     if (this.options.hostSubagent !== undefined) {
       const subagent = modes.resolve('chat').subagents.research!;
       tools.register(new SubagentRunner(this.harness, this.runtime).tool(subagent, this.session(), this.options.hostSubagent, 'host_run'));
+    }
+    if (this.options.nested === true) {
+      const dig = modes.resolve('research').subagents.dig!;
+      tools.registerFactory('dig', (session) => new SubagentRunner(this.harness, this.runtime).tool(dig, session, RunContext.root('dig', new RunBudget(100)), 'dig_run'));
     }
   }
 
@@ -438,10 +448,11 @@ describe('plan budgets (G-366)', () => {
   // the plan's shared budget. The run context the host wired the subagent
   // tool with may narrow that, never widen it or replace the ledger.
 
-  const delegating = (maxSteps: number) => new Rig({
+  const delegating = (maxSteps: number, nested = false) => new Rig({
     config: { budget: { mode: 'shared', max_steps: maxSteps } },
     mode: { tools: ['weather', 'lookup', 'research'], subagents: { research: { mode: 'research', max_steps: 8 } } },
     hostSubagent: RunContext.root('host', new RunBudget(100)),
+    nested,
   });
 
   it('charges a subagent a shared plan step delegates to the plan budget', async () => {
@@ -495,8 +506,8 @@ describe('plan budgets (G-366)', () => {
   // shared plan budget, the resumed child spends from the same one.
 
   /** A plan step that delegates; the child pauses on weather. */
-  async function pausedChild(maxSteps: number): Promise<{ r: Rig; child: Session; id: string }> {
-    const r = delegating(maxSteps);
+  async function pausedChild(maxSteps: number, nested = false): Promise<{ r: Rig; child: Session; id: string }> {
+    const r = delegating(maxSteps, nested);
     await r.active(1);
     r.calls([['research', { task: 'Find the weather.' }]]);   // parent
     r.calls([['weather', { city: 'Paris' }]]);                 // child: pauses
@@ -567,5 +578,24 @@ describe('plan budgets (G-366)', () => {
     await r.runtime.send(child, 'New question');
 
     expect((await (await r.handle()).budget())!.steps).toBe(5);
+  });
+
+  // G-381: the grandchild takes the CHILD's recorded membership through its
+  // parent run, so it saves the tree the child continues and the plan budget
+  // the child spends from, never one found through the host's ledger.
+  it("saves the child's run tree and shared plan budget on a grandchild of a child resumed under a host context", async () => {
+    const { r, child } = await pausedChild(20, true);
+    const saved = await child.childRefs();
+    expect(saved?.tree).not.toBeNull();
+    expect(saved?.planLedger).not.toBeNull();
+
+    r.calls([['dig', { task: 'Dig.' }]]);
+    r.text('Grandchild answer.');
+    r.text('Child answer.');
+    await r.runtime.send(child, 'Dig deeper', undefined, hostRoot());
+
+    expect(r.queue).toHaveLength(0);
+    const grandchild = r.harness.for({ type: 'User', id: 1 }).session('chat::sub::research::sub::dig');
+    expect(await grandchild.childRefs()).toEqual(saved);
   });
 });

@@ -60,6 +60,7 @@ function runPlansCase(entry: PlansCase): { results: unknown[]; final: unknown; b
     try {
       results.push(op.op === 'binding_route' ? plansBindingOp(op, state)
         : op.op === 'binding_context' ? plansBindingContextOp(op, state)
+        : op.op === 'tree_membership' || op.op === 'kept_refs' ? plansTreeOp(op)
         : String(op.op).startsWith('budget_') ? plansBudgetOp(op, state, now) : plansOp(op, state, ids, limits, now));
     } catch (error) {
       if (!(error instanceof PlanRefused)) throw error;
@@ -117,7 +118,7 @@ function plansBindingContextOp(op: Op, state: CaseState): unknown {
   }
   let context: RunContext | null = op.context === 'host' ? RunContext.root('host_root', new RunBudget(10)) : null;
   if (context !== null && op.supplied_binding === true) context = context.withBinding(cheapBinding);
-  if (context !== null && op.runner_started === true) context = RunTrees.startingChild(context);
+  if (context !== null && op.runner_started === true) context = RunTrees.startingChild(context, null, 'corpus');
   if (context !== null && op.rebound === true) context = context.withBinding(cheapBinding);
   // The budget routes read the same kind: the runner's context is the runner's for both.
   const kind = RunTrees.contextKind(context);
@@ -126,6 +127,25 @@ function plansBindingContextOp(op: Op, state: CaseState): unknown {
   state.savedBinding = state.savedBinding || route.save;
 
   return { kind, route };
+}
+
+/**
+ * Which run tree a run belongs to, and which tree a child saves (G-381):
+ * RunTrees.membership and RunTrees.keptRefs, pure. The refs come back in the
+ * corpus's key names (plan_ledger).
+ */
+function plansTreeOp(op: Op): unknown {
+  try {
+    if (op.op === 'tree_membership') {
+      return { membership: RunTrees.membership(op.context, op.session, op.run, op.parent, op.saved_tree, op.saved_depth, op.context_depth) };
+    }
+    const refs = RunTrees.keptRefs(op.membership, op.plan_ledger, op.saved_tree, op.saved_plan_ledger, op.saved_tree_cancelled);
+
+    return { refs: { tree: refs.tree, plan_ledger: refs.planLedger } };
+  } catch (error) {
+    if (error instanceof RangeError) return { invalid: true };
+    throw error;
+  }
 }
 
 /** The plan budget ops (G-366): settings and the shared ledger, pure. */
@@ -318,8 +338,8 @@ describe('the harness-plans corpus (G-360)', () => {
     return;
   }
 
-  it('vendors all 60 cases', () => {
-    expect(corpus.cases).toHaveLength(60);
+  it('vendors all 70 cases', () => {
+    expect(corpus.cases).toHaveLength(70);
   });
 
   it.each(corpus.cases.map((entry) => [entry.id, entry] as const))('%s runs as the reference recorded it', (_id, entry) => {

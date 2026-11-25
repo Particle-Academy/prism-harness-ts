@@ -37,6 +37,10 @@ export interface RunState extends JsonObject {
   provider?: string;
   model?: string;
   started_at?: string;
+  /** The run tree the run belongs to (G-381): a tree of this runtime, `host` or `none`. */
+  tree?: { session: string; run: string } | 'host' | 'none';
+  /** The depth the run runs at, decided with its tree. */
+  depth?: number;
   /** The last run step `seq` this run emitted, so a resumed stream continues it. */
   last_seq?: number;
 }
@@ -374,7 +378,12 @@ export class Session {
     return isJsonObject(run) && typeof run.id === 'string' ? (run as RunState) : null;
   }
 
-  async beginRun(id: string, mode: string, provider: string, model: string): Promise<this> {
+  /**
+   * @param tree the run tree the run belongs to, decided once when it begins
+   *   (RunTrees.membership): a tree of this runtime, `host` or `none` (G-381)
+   * @param depth the depth it runs at, from the same decision
+   */
+  async beginRun(id: string, mode: string, provider: string, model: string, tree?: { session: string; run: string } | 'host' | 'none', depth?: number): Promise<this> {
     return this.#write('run', {
       id,
       status: 'running',
@@ -382,6 +391,8 @@ export class Session {
       provider,
       model,
       started_at: new Date().toISOString(),
+      ...(tree === undefined ? {} : { tree: typeof tree === 'object' ? { session: tree.session, run: tree.run } : tree }),
+      ...(depth === undefined ? {} : { depth }),
     });
   }
 
