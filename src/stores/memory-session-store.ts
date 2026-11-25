@@ -93,13 +93,24 @@ export class MemorySessionStore implements SessionStore {
     // The wait is bounded. A callback that never returns would otherwise hold
     // every later caller forever, and "the lock timed out" is a far better
     // failure than a request that hangs until something upstream gives up.
-    const acquired = await Promise.race([
-      previous.then(
-        () => true,
-        () => true,
-      ),
-      sleep(waitSeconds * 1000).then(() => false),
-    ]);
+    //
+    // The wait's timer keeps the process alive while it is awaited: a script
+    // whose only pending work is this wait must get `session_locked` back,
+    // not exit mid-await. It is cleared as soon as the lock is acquired, so an
+    // acquired lock does not hold the process open for the rest of the wait.
+    const wait = sleep(waitSeconds * 1000);
+    let acquired: boolean;
+    try {
+      acquired = await Promise.race([
+        previous.then(
+          () => true,
+          () => true,
+        ),
+        wait.done.then(() => false),
+      ]);
+    } finally {
+      wait.cancel();
+    }
 
     if (!acquired) {
       // Release before throwing, or everyone queued behind this caller waits on
@@ -128,10 +139,11 @@ export class MemorySessionStore implements SessionStore {
   }
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => {
-    const timer = setTimeout(resolve, ms);
-    // Do not hold the event loop open just to fail a lock later.
-    timer.unref?.();
+function sleep(ms: number): { done: Promise<void>; cancel: () => void } {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const done = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, ms);
   });
+
+  return { done, cancel: () => clearTimeout(timer) };
 }
