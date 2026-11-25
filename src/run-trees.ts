@@ -177,12 +177,18 @@ export const RunTrees = {
   async rootRun(session: Session, runId: string, run: RunContext, membership: TreeMembership, ttl: number): Promise<RunContext> {
     if (membership.route === 'none' || typeof membership.tree !== 'object') return run;
     const tree = membership.tree;
+    // A root resuming its parked run is in the tree that run began. When
+    // that run delegated, the tree has a record, and the resumed root holds
+    // what it has left and is narrowed to it, as any other turn continuing
+    // the tree: the tree's allowance holds across the pause.
+    let route = membership.route;
+    if (route === 'open' && tree.run !== runId && record(await session.planStore().get(key(tree)), tree) !== null) route = 'continue';
     const entry: RootRun = {
       session: session.key(), tree,
       budget: run.budget, ledger: run.ledger, steps: run.ledger.steps, cost: run.ledger.costUsd,
       unmetered: run.ledger.unmeteredRuns, held: false, ttl,
     };
-    if (membership.route === 'open') {
+    if (route === 'open') {
       runs.set(runId, entry);
 
       return run;
@@ -255,17 +261,12 @@ export const RunTrees = {
         max_cost_micros: entry.budget.maxCostUsd === null ? null : PlanBudget.micros(Math.max(0, entry.budget.maxCostUsd - entry.cost)),
       };
       const now = Math.floor(Date.now() / 1000);
-      // A root resuming its parked run is in the tree that run began, but
-      // spends from its own budget: when that tree's record already exists
-      // (the parked run delegated before), it is left alone, so the resumed
-      // root never takes from what the subagents parked in it have left.
-      // Otherwise it is opened here, named by the tree's root run, and held
-      // under the run that spends. Either way it is not tried again; settling
-      // a hold that was never taken changes nothing.
+      // Named by the tree's root run; held under the run that spends (a
+      // root resuming a parked run that never delegated opens its tree's
+      // record here; one whose parked run did continues it in rootRun).
       const tree = membership.tree;
-      await write(child.planStore(), tree, (state) => state !== null && spends !== tree.run
-        ? [null, null]
-        : PlanBudget.reserve(state ?? PlanBudget.open(tree.run, settings), spends, Math.max(1, settings.max_steps), settings.max_cost_micros, now, entry.ttl));
+      await write(child.planStore(), tree, (state) =>
+        PlanBudget.reserve(state ?? PlanBudget.open(tree.run, settings), spends, Math.max(1, settings.max_steps), settings.max_cost_micros, now, entry.ttl));
       entry.held = true;
     }
 
@@ -280,10 +281,18 @@ export const RunTrees = {
    *
    * @throws HarnessError `run_not_permitted`
    */
-  async assertDecisionsFunded(session: Session, saved: ChildRefs | null, context: RunContext | undefined, ttl: number): Promise<void> {
-    const membership = RunTrees.membership(RunTrees.contextKind(context), session.key(), 'decision', null, saved?.tree ?? null, 0, 0);
-    if (membership.route !== 'continue' || typeof membership.tree !== 'object') return;
-    const state = record(await session.planStore().get(key(membership.tree)), membership.tree);
+  async assertDecisionsFunded(session: Session, saved: ChildRefs | null, context: RunContext | undefined, ttl: number, resumedTree: RunTreeRef | null = null): Promise<void> {
+    const kind = RunTrees.contextKind(context);
+    const bare = kind === 'none' || kind === 'metadata';
+    const membership = RunTrees.membership(kind, session.key(), 'decision', null, saved?.tree ?? null, 0, 0, bare ? resumedTree : null);
+    const tree = membership.tree;
+    if (typeof tree !== 'object') return;
+    const state = record(await session.planStore().get(key(tree)), tree);
+    if (membership.route === 'open') {
+      // A root resuming its parked run is held to its tree's record only
+      // when the parked run delegated and opened one.
+      if (tree.run === 'decision' || state === null) return;
+    } else if (membership.route !== 'continue') return;
     if (state === null) throw spent('steps');
     const [, grant] = PlanBudget.reserve(state, 'decision', 1, null, Math.floor(Date.now() / 1000), ttl);
     if ('refused' in grant) throw spent(grant.limit);

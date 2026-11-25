@@ -40,8 +40,16 @@ afterEach(() => {
 });
 
 class DurableMemoryStore extends MemorySessionStore {
+  /** Every key written, in order. */
+  readonly puts: string[] = [];
+
   override durability(): Durability {
     return 'durable';
+  }
+
+  override async put(key: string, payload: JsonObject, ttlSeconds: number | null = null): Promise<void> {
+    this.puts.push(key);
+    await super.put(key, payload, ttlSeconds);
   }
 }
 
@@ -61,6 +69,8 @@ class ExpiringStore extends MemorySessionStore {
 
 class Rig {
   readonly ephemeral = new ExpiringStore();
+  readonly durable = new DurableMemoryStore();
+  weatherRan = 0;
   readonly queue: LlmResponse[] = [];
   readonly requests: LlmRequest[] = [];
   readonly runtime: AgentRuntime;
@@ -97,7 +107,7 @@ class Rig {
       if (event.type === 'run.started') this.depths.push(event.depth);
     });
     const tools = new ToolRegistry()
-      .register({ name: 'weather', handle: () => 'Sunny' })
+      .register({ name: 'weather', handle: () => { this.weatherRan += 1; return 'Sunny'; } })
       .register({ name: 'hostcall', handle: () => this.onHost() });
     this.runtime = new AgentRuntime({
       modes,
@@ -111,7 +121,7 @@ class Rig {
         return next;
       },
     });
-    const durable = new DurableMemoryStore(), ephemeral = this.ephemeral;
+    const durable = this.durable, ephemeral = this.ephemeral;
     this.harness = new PrismHarness({
       drivers: { memory: () => ephemeral, durable: () => durable },
       stores: { ephemeral: 'memory', durable: 'durable' },
@@ -387,33 +397,90 @@ describe('a root that resumes its parked run after the ephemeral half expired', 
   });
 });
 
+/**
+ * The root delegates a child (it parks), then parks on its own approval; the
+ * root is approved, resumes under a new run id, delegates a second subagent
+ * (it completes) and parks again.
+ */
+async function resumedRootDelegatesAgain(chatSteps: number): Promise<{ r: Rig; child: Session; pending: string; firstRun: string }> {
+  const r = new Rig(chatSteps);
+  const root = r.session(1);
+  r.calls([['research', { task: 'Find the weather.' }]]); // root
+  r.calls([['weather', { city: 'Paris' }]]);              // research child: parks
+  r.calls([['weather', { city: 'Rome' }]]);               // root: parks
+  const firstRun = (await r.runtime.send(root, 'Go')).runId;
+  const [first] = await r.pending(root);
+
+  r.calls([['scout', { task: 'Scout.' }]]);               // root, resumed
+  r.text('Scouted.');                                     // scout child
+  r.calls([['weather', { city: 'Oslo' }]]);               // root: parks again
+  await recordApproval(root, first!, true);
+  await r.runtime.send(root, '');
+  expect(await r.pending(root)).toHaveLength(1);
+
+  const child = r.session(1, 'chat::sub::research');
+  const [pending] = await r.pending(child);
+  expect(pending).toBeDefined();
+
+  return { r, child, pending: pending!, firstRun };
+}
+
 describe('a root that resumes its parked run and delegates again', () => {
-  it('leaves a parked subagent its tree budget after the root resumed, delegated and parked again', async () => {
-    const r = new Rig(6);
-    const root = r.session(1);
-    r.calls([['research', { task: 'Find the weather.' }]]); // root
-    r.calls([['weather', { city: 'Paris' }]]);              // research child: parks
-    r.calls([['weather', { city: 'Rome' }]]);               // root: parks
-    await r.runtime.send(root, 'Go');
-    const [first] = await r.pending(root);
+  it('leaves a parked subagent what its tree has left after the root resumed, delegated and parked again', async () => {
+    const { r, child, pending } = await resumedRootDelegatesAgain(20);
+    const ran = r.weatherRan;
 
-    r.calls([['scout', { task: 'Scout.' }]]);               // root, resumed
-    r.text('Scouted.');                                     // scout child
-    r.calls([['weather', { city: 'Oslo' }]]);               // root: parks again
-    await recordApproval(root, first!, true);
-    await r.runtime.send(root, '');
-    expect(await r.pending(root)).toHaveLength(1);
-
-    const child = r.session(1, 'chat::sub::research');
-    const [pending] = await r.pending(child);
-    expect(pending).toBeDefined();
     r.text('Child done.');
-    const answered = await recordApproval(child, pending!, true).then(() => true, () => false);
-    if (answered) await r.runtime.send(child, '').catch(() => undefined);
+    await recordApproval(child, pending, true);
+    await r.runtime.send(child, '');
 
-    expect(answered).toBe(true);
+    expect(r.weatherRan).toBe(ran + 1);
     expect(await r.pending(child)).toEqual([]);
     expect((await child.run())?.status).toBe('completed');
+  });
+
+  it('holds a resumed root to its tree record, so the tree never spends past its allowance', async () => {
+    const { r, child, pending, firstRun } = await resumedRootDelegatesAgain(6);
+    const record = await treeRecord(r.session(1), firstRun);
+    expect(record).not.toBeNull();
+    expect(record!.steps).toBe(record!.max_steps);
+    const ran = r.weatherRan, requests = r.requests.length;
+    const rows = (await child.thread().messages()).length;
+
+    // Spent, the tree refuses the parked child before anything is recorded.
+    await expect(recordApproval(child, pending, true)).rejects.toMatchObject({ code: 'run_not_permitted' });
+    expect(await r.pending(child)).toEqual([pending]);
+    expect((await child.thread().messages()).length).toBe(rows);
+    expect(r.weatherRan).toBe(ran);
+    expect(r.requests.length).toBe(requests);
+  });
+
+  it('keeps refusing a resume of a spent tree however often it is retried', async () => {
+    const { r } = await resumedRootDelegatesAgain(6);
+    const ran = r.weatherRan, requests = r.requests.length;
+    r.text('Should not run.');
+    let refusals = 0;
+    for (let attempt = 0; attempt < 23; attempt++) {
+      await r.runtime.send(r.session(1), '').then(() => undefined, (error: unknown) => {
+        if ((error as { code?: string }).code === 'run_not_permitted') refusals += 1;
+      });
+    }
+
+    expect(refusals).toBe(23);
+    expect(r.weatherRan).toBe(ran);
+    expect(r.requests.length).toBe(requests);
+  });
+});
+
+describe('where a run keeps its tree', () => {
+  it('never rewrites the session durable record when a run starts', async () => {
+    const r = new Rig();
+    const session = r.session(1, 'plain');
+    r.text('Done.');
+    await r.runtime.send(session, 'go');
+
+    expect(r.durable.puts.filter((key) => key === `${session.key()}:durable`)).toEqual([]);
+    expect(r.durable.puts.filter((key) => key === `${session.key()}:run-trees`)).not.toEqual([]);
   });
 });
 

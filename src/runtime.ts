@@ -16,7 +16,6 @@ import {
   unusableStoredCalls,
   ambiguousCalls,
   pendingApprovalIds,
-  pausedApprovalIds,
   ARGUMENTS_AS_SENT,
 } from './thread-rows.js';
 import { usableArguments } from './tool-arguments.js';
@@ -744,7 +743,7 @@ export class AgentRuntime {
     // the tree its session saved, at least as deep as the runner started it; a
     // host context is in the host's tree whatever run ids it states.
     // A root turn resuming its parked run stays in the tree that run began in.
-    const resumedTree = prompt === '' && (contextKind === 'none' || contextKind === 'metadata') ? await resumedRunTree(session) : null;
+    const resumedTree = prompt === '' && (contextKind === 'none' || contextKind === 'metadata') ? await session.resumedRunTree() : null;
     const membership = RunTrees.membershipOf(session, runId, context, savedRefs, await session.childDepth(), resumedTree);
     let run = this.#boundedRun(session, execution === null || execution === undefined
       ? new RunContext(RunLedger.start(runId), new RunBudget(mode.maxSteps), null, 0, {}, binding)
@@ -1498,7 +1497,7 @@ async function writeDecisions(session: Session, decisions: readonly ApprovalDeci
   // And for a subagent child resumed outside the runner, a run tree with
   // nothing left: the tree it was saved with, a host context included.
   const kept = (await session.childRefs()) ?? { tree: pausedRunState(rows)?.tree ?? null, planLedger: null };
-  await RunTrees.assertDecisionsFunded(session, kept, context, session.planRuntime()?.holdTtl(session) ?? RESOLUTION_LOCK_SECONDS);
+  await RunTrees.assertDecisionsFunded(session, kept, context, session.planRuntime()?.holdTtl(session) ?? RESOLUTION_LOCK_SECONDS, await session.resumedRunTree());
 
   const run = await session.run();
 
@@ -1547,22 +1546,6 @@ export function activeTurn(sessionKey: string): { runId: string; run: RunContext
   const turn = activeTurns.getStore();
 
   return turn === undefined || turn.sessionKey !== sessionKey ? null : { runId: turn.runId, run: turn.run };
-}
-
-/**
- * The durable run tree the run that issued this session's paused approvals
- * began in (G-381), from the session's durable record of its recent runs, so
- * it survives the ephemeral half expiring; null when nothing is paused, the
- * run is not remembered, or it was in the host's tree or in none.
- */
-async function resumedRunTree(session: Session): Promise<RunTreeRef | null> {
-  const entries = await session.thread().messages();
-  const paused = pausedApprovalIds(entries.map((entry) => entry.message));
-  if (paused.length === 0) return null;
-  const issued = entries.find((entry) => Array.isArray(entry.message.tool_approval_requests)
-    && (entry.message.tool_approval_requests as JsonObject[]).some((request) => request.approval_id === paused[0]));
-
-  return issued?.runId == null ? null : session.runTree(issued.runId);
 }
 
 /** The context a run EXECUTES under: a metadata-only context states no run tree. */
