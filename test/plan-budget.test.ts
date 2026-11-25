@@ -10,6 +10,7 @@ import {
   RunBudget,
   RunContext,
   RunLedger,
+  SubagentRunner,
   ToolRegistry,
   recordApproval,
   recordDecisions,
@@ -57,6 +58,8 @@ type Call = [string, JsonObject];
 interface RigOptions {
   config?: PlansConfig;
   mode?: Record<string, unknown>;
+  /** A `research` subagent the host wires with its own run context, as SubagentRunner.tool() takes it. */
+  hostSubagent?: RunContext;
 }
 
 class Rig {
@@ -82,7 +85,10 @@ class Rig {
     const config: PlansConfig = { enabled: true, ...this.options.config };
     const modes = new ModeRegistry({
       default: 'chat',
-      modes: { chat: { system_prompt: 'You are a travel agent.', tools: ['weather', 'lookup'], requires_approval: ['weather'], plans: true, ...this.options.mode } as ModeConfig },
+      modes: {
+        chat: { system_prompt: 'You are a travel agent.', tools: ['weather', 'lookup'], requires_approval: ['weather'], plans: true, ...this.options.mode } as ModeConfig,
+        research: { system_prompt: 'You research.', tools: ['lookup'], max_steps: 8 } as ModeConfig,
+      },
     });
     const tools = new ToolRegistry()
       .register({ name: 'weather', handle: () => { this.weatherRan += 1; return 'Sunny'; } })
@@ -108,6 +114,10 @@ class Rig {
       runtime: this.runtime,
       plans: this.plans,
     });
+    if (this.options.hostSubagent !== undefined) {
+      const subagent = modes.resolve('chat').subagents.research!;
+      tools.register(new SubagentRunner(this.harness, this.runtime).tool(subagent, this.session(), this.options.hostSubagent, 'host_run'));
+    }
   }
 
   session(): Session {
@@ -422,5 +432,58 @@ describe('plan budgets (G-366)', () => {
     await expect((await r.handle()).advance()).rejects.toThrow('store down');
     expect((await r.session().run())!.status).toBe('failed');
     expect(r.events.some((event) => event.type === 'run.failed')).toBe(true);
+  });
+
+  // A subagent the step delegates to spends from the step's own turn, so from
+  // the plan's shared budget. The run context the host wired the subagent
+  // tool with may narrow that, never widen it or replace the ledger.
+
+  const delegating = (maxSteps: number) => new Rig({
+    config: { budget: { mode: 'shared', max_steps: maxSteps } },
+    mode: { tools: ['weather', 'lookup', 'research'], subagents: { research: { mode: 'research', max_steps: 8 } } },
+    hostSubagent: RunContext.root('host', new RunBudget(100)),
+  });
+
+  it('charges a subagent a shared plan step delegates to the plan budget', async () => {
+    const r = delegating(10);
+    await r.active(1);
+    r.calls([['research', { task: 'Find the weather.' }]]);   // parent
+    r.text('Child answer.');                                   // child
+    r.calls([['plan_complete_step', { summary: 'Asked.' }]]);  // parent
+    r.text('Step done.');                                      // parent
+    await (await r.handle()).advance();
+
+    expect(r.queue).toHaveLength(0);
+    expect((await (await r.handle()).budget())!.steps).toBe(4);
+  });
+
+  it('never lets the host context a subagent tool was wired with widen a shared plan step', async () => {
+    const r = delegating(3);
+    await r.active(1);
+    r.calls([['research', { task: 'Find the weather.' }]]);   // parent: step 1 of 3
+    for (const q of ['a', 'b', 'c']) r.calls([['lookup', { q }]]);
+    r.text('Child answer.');
+    await (await r.handle()).advance();
+
+    // The child had the two steps the plan had left, not the host's hundred.
+    expect(r.lookups).toBe(2);
+    expect(r.queue).toHaveLength(2);
+    expect((await (await r.handle()).budget())!.steps).toBe(3);
+  });
+
+  it('lets the host context a subagent tool was wired with narrow a turn', async () => {
+    const r = new Rig({
+      config: { budget: { mode: 'shared', max_steps: 10 } },
+      mode: { tools: ['weather', 'lookup', 'research'], subagents: { research: { mode: 'research', max_steps: 8 } } },
+      hostSubagent: RunContext.root('host', new RunBudget(1)),
+    });
+    await r.active(1);
+    r.calls([['research', { task: 'Find the weather.' }]]);
+    for (const q of ['a', 'b', 'c']) r.calls([['lookup', { q }]]);
+    r.text('Child answer.');
+    r.text('Step done.');
+    await (await r.handle()).advance();
+
+    expect(r.lookups).toBe(1);
   });
 });
