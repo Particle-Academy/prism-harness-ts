@@ -22,11 +22,11 @@ const harness = new PrismHarness({
 
 const session = harness.for({ type: 'User', id: 7 }).session('support');
 
-await session.usingMode('plan').then((s) => s.usingModel('claude-sonnet-4-5'));
+await session.usingMode('plan').then((s) => s.usingModel('claude-sonnet-5-5'));
 
 await session.lock(async (live) => {
   // whatever must not happen twice
-  await live.beginRun('run-1', 'plan', 'anthropic', 'claude-sonnet-4-5');
+  await live.beginRun('run-1', 'plan', 'anthropic', 'claude-sonnet-5-5');
 });
 ```
 
