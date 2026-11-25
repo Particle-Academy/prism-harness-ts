@@ -59,6 +59,7 @@ export type {
   ToolAutoAllowed,
   ToolDecisionEvent,
   ToolDenied,
+  PlanBudgetExhausted,
   PlanUpdated,
 } from './events.js';
 
@@ -160,6 +161,8 @@ export { admitAttachments } from './attachments.js';
 export { RegistrationCollision } from './registration.js';
 export type { Attachment, MediaLike } from './attachments.js';
 
+export { PLAN_BUDGET_EXHAUSTED, PlanBudget, PlanBudgetInvalid } from './plans/budget.js';
+export type { PlanBudgetConfig, PlanBudgetGrant, PlanBudgetHold, PlanBudgetLimit, PlanBudgetMode, PlanBudgetSettings, PlanBudgetState } from './plans/budget.js';
 export { PlanIds } from './plans/ids.js';
 export { PlanLimits } from './plans/limits.js';
 export type { PlanLimitsInit, PlansConfig } from './plans/limits.js';

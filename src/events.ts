@@ -31,7 +31,8 @@ export type HarnessEvent =
   | ToolApproved
   | ToolDenied
   | ToolApprovalExpired
-  | PlanUpdated;
+  | PlanUpdated
+  | PlanBudgetExhausted;
 
 /**
  * One decision about a call to a tool that needs approval (G-326).
@@ -183,6 +184,24 @@ export interface PlanUpdated extends HarnessAgentTag {
   status: string;
   holdingApprovalId: string | null;
   counts: { total: number; todo: number; running: number; held: number; waiting: number; done: number; failed: number; skipped: number };
+}
+
+/**
+ * A plan stopped because its shared budget is spent (G-366). Emitted once,
+ * when `advance()` blocks the plan for it; `resume()` refuses such a plan.
+ * Counts only; no plan text.
+ */
+export interface PlanBudgetExhausted extends HarnessAgentTag {
+  type: 'plan.budget_exhausted';
+  sessionKey: string;
+  planId: string;
+  /** Always `plan_budget_exhausted`, the code all three languages use. */
+  code: 'plan_budget_exhausted';
+  /** Which limit: `steps`, `cost` or `cost_unmetered`. */
+  limit: string;
+  steps: number;
+  costUsd: number;
+  at: string;
 }
 
 export type HarnessListener = (event: HarnessEvent) => void;

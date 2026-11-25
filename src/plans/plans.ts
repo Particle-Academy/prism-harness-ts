@@ -7,8 +7,9 @@ import type { AgentResponse, AgentRuntime } from '../runtime.js';
 import type { Session } from '../session.js';
 import { StepChannel, type RunStep } from '../steps.js';
 import type { SessionStore } from '../stores/session-store.js';
-import type { RunContext } from '../subagents.js';
+import { RunBudget, type RunContext } from '../subagents.js';
 import type { HarnessTool } from '../tools.js';
+import { PLAN_BUDGET_EXHAUSTED, PlanBudget, type PlanBudgetConfig, type PlanBudgetSettings, type PlanBudgetState } from './budget.js';
 import { PlanIds } from './ids.js';
 import { PlanLimits, type PlansConfig } from './limits.js';
 import { PlanMachine, phpTrim, type Plan, type PlanStep } from './machine.js';
@@ -64,6 +65,8 @@ export class Plans {
   #watcherSeq = 0;
   #reapDispatcher: ((sessionKey: string, planId: string) => void | Promise<void>) | null = null;
   #clock: (() => number) | null = null;
+  /** Turns spending from a shared plan budget, by run id, until they settle. */
+  readonly #budgetTurns = new Map<string, { session: string; plan: string; context: RunContext; steps: number; cost: number; unmetered: number }>();
 
   constructor(options: PlansOptions) {
     this.config = options.config ?? {};
@@ -84,6 +87,11 @@ export class Plans {
     return PlanLimits.fromConfig(this.config);
   }
 
+  /** The configured plan budget (G-366), validated: an invalid mode or limit throws `PlanBudgetInvalid`. */
+  budgetSettings(): PlanBudgetSettings {
+    return PlanBudget.settings(this.config.budget ?? null);
+  }
+
   /** Whether this session's current mode runs with plans. */
   async enabledFor(session: Session, mode?: string | null): Promise<boolean> {
     if (!this.enabled()) return false;
@@ -96,6 +104,8 @@ export class Plans {
 
   async handle(session: Session): Promise<PlanHandle> {
     if (!(await this.enabledFor(session))) throw new PlansDisabled();
+    // An invalid plan budget fails here, before anything can run under it.
+    this.budgetSettings();
 
     return new PlanHandle(session, this);
   }
@@ -228,6 +238,7 @@ export class Plans {
 
   /** After a run ends: bind the approvals the turn staged, and notice the ones a new message superseded. */
   async afterTurn(session: Session): Promise<void> {
+    await this.#settleTurn(session);
     if (!this.enabled()) return;
     try {
       await this.reconciled(session);
@@ -271,6 +282,8 @@ export class Plans {
   /** The plan tools for a run in this session, or none when plans are off. */
   async tools(session: Session, mode: string | null): Promise<HarnessTool[]> {
     if (!(await this.enabledFor(session, mode))) return [];
+    // No plan can be drafted under an invalid plan budget (G-366).
+    this.budgetSettings();
 
     return planTools(this, session);
   }
@@ -280,6 +293,143 @@ export class Plans {
     const run = await session.run();
 
     return run !== null && run.status === 'running' ? run.id : null;
+  }
+
+  // -- Plan budget (G-366) -----------------------------------------------------------
+
+  /** The budget record of this plan, or null when none was fixed yet. */
+  async budgetRecord(session: Session, planId: string): Promise<PlanBudgetState | null> {
+    const record = await session.planStore().get(budgetKey(session.key()));
+
+    return record !== null && record.planId === planId ? record as unknown as PlanBudgetState : null;
+  }
+
+  /** The mode and limits this plan runs under: the fixed record, else config. */
+  async budgetFor(session: Session, planId: string): Promise<PlanBudgetSettings> {
+    const record = await this.budgetRecord(session, planId);
+
+    return record === null ? this.budgetSettings() : { mode: record.mode, max_steps: record.max_steps, max_cost_micros: record.max_cost_micros };
+  }
+
+  /** Host code chooses this plan's budget. The first choice fixes it; after that the mode cannot change and a limit can only be lowered. */
+  async useBudget(session: Session, planId: string, requested: unknown): Promise<PlanBudgetState> {
+    const chosen = PlanBudget.forPlan(this.budgetSettings(), requested);
+
+    return (await this.#budgetWrite(session, planId, chosen, (state) => [PlanBudget.narrow(state, chosen), null]))[0];
+  }
+
+  /** Which shared limit this plan has spent, or null. */
+  async budgetExhaustion(session: Session, planId: string): Promise<string | null> {
+    const record = await this.budgetRecord(session, planId);
+
+    return record === null ? null : PlanBudget.exhaustion(PlanBudget.expire(record, this.now(), this.#lockTtl));
+  }
+
+  /** Announce that a plan stopped on its shared budget. */
+  async announceBudgetExhausted(session: Session, planId: string, limit: string): Promise<void> {
+    const record = await this.budgetRecord(session, planId) ?? PlanBudget.open(planId, await this.budgetFor(session, planId));
+    try {
+      this.#events?.emit({
+        type: 'plan.budget_exhausted',
+        sessionKey: session.key(),
+        planId,
+        code: PLAN_BUDGET_EXHAUSTED,
+        limit,
+        steps: record.steps,
+        costUsd: record.cost_micros / 1_000_000,
+        at: new Date().toISOString(),
+        ...(session.agent === null ? {} : { harnessAgent: session.agent }),
+      });
+    } catch (error) {
+      reportQuietly(error);
+    }
+  }
+
+  /**
+   * The shared budget a turn on this session would spend from now, or null.
+   * @internal
+   */
+  async servingSharedPlan(session: Session): Promise<PlanBudgetSettings | null> {
+    if (!(await this.enabledFor(session))) return null;
+    const plan = await this.load(session);
+    if (!serving(plan)) return null;
+    const settings = await this.budgetFor(session, plan!.id);
+
+    return settings.mode === 'shared' ? settings : null;
+  }
+
+  /**
+   * The run a turn executes under, when the turn serves a plan step whose
+   * budget is shared: the per-turn budget, narrowed to what the plan's ledger
+   * holds for it. Any other run is returned unchanged. A run handed a run tree
+   * of its own cannot also spend from the plan's ledger, so it is refused.
+   *
+   * @internal Called by the runtime once a run's own budget is known.
+   */
+  async planTurn(session: Session, runId: string, run: RunContext, context: RunContext | undefined): Promise<RunContext> {
+    if (!(await this.enabledFor(session))) return run;
+    const plan = await this.load(session);
+    if (!serving(plan) || (await this.budgetFor(session, plan!.id)).mode !== 'shared') return run;
+    if (context !== undefined && !context.metadataOnly) throw PlanRefused.because('plan.budget_context');
+
+    const { ledger, budget } = run;
+    const baseSteps = ledger.steps;
+    const baseCost = ledger.costUsd;
+    const turnCost = budget.maxCostUsd === null ? null : PlanBudget.micros(Math.max(0, budget.maxCostUsd - baseCost));
+    const now = this.now();
+    const ttl = this.#lockTtl;
+    const [, grant] = await this.#budgetWrite(session, plan!.id, this.budgetSettings(),
+      (state) => PlanBudget.reserve(state, runId, Math.max(0, budget.maxSteps - baseSteps), turnCost, now, ttl));
+    if (grant === null || 'refused' in grant) {
+      throw new HarnessError(PLAN_BUDGET_EXHAUSTED,
+        `This plan step may not proceed (plan_budget_exhausted): the plan's shared ${grant?.limit ?? 'steps'} budget is spent.`);
+    }
+    const narrowed = run.withBudget(new RunBudget(
+      baseSteps + grant.steps,
+      grant.cost_micros === null ? budget.maxCostUsd : baseCost + grant.cost_micros / 1_000_000,
+      budget.maxSeconds,
+      budget.maxOutputTokensPerCall,
+    ));
+    this.#budgetTurns.set(runId, { session: session.key(), plan: plan!.id, context: narrowed, steps: baseSteps, cost: baseCost, unmetered: ledger.unmeteredRuns });
+
+    return narrowed;
+  }
+
+  /** Replace a finished turn's hold with what it spent. */
+  async #settleTurn(session: Session): Promise<void> {
+    const run = await session.run();
+    const turn = run === null ? undefined : this.#budgetTurns.get(run.id);
+    if (run === null || turn === undefined || turn.session !== session.key()) return;
+    this.#budgetTurns.delete(run.id);
+    const ledger = turn.context.ledger;
+    const steps = ledger.steps - turn.steps;
+    const cost = ledger.unmeteredRuns > turn.unmetered ? null : PlanBudget.micros(Math.max(0, ledger.costUsd - turn.cost));
+    try {
+      await this.#budgetWrite(session, turn.plan, this.budgetSettings(), (state) => [PlanBudget.settle(state, run.id, steps, cost), null]);
+    } catch (error) {
+      // The hold stays and is charged in full once it expires.
+      reportQuietly(error);
+    }
+  }
+
+  /** One locked change to this plan's budget record, opening it from `settings` when it is absent or belongs to an earlier plan. */
+  async #budgetWrite<T>(
+    session: Session,
+    planId: string,
+    settings: PlanBudgetSettings,
+    change: (state: PlanBudgetState) => [PlanBudgetState, T],
+  ): Promise<[PlanBudgetState, T]> {
+    const store = session.planStore();
+    const name = budgetKey(session.key());
+
+    return store.withLock(name, async () => {
+      const stored = await store.get(name);
+      const state = stored !== null && stored.planId === planId ? stored as unknown as PlanBudgetState : PlanBudget.open(planId, settings);
+      const [next, result] = change(state);
+      await store.put(name, next as unknown as JsonObject);
+
+      return [next, result] as [PlanBudgetState, T];
+    }, 10, 5);
   }
 
   // -- Reaper ----------------------------------------------------------------------
@@ -475,7 +625,16 @@ export class PlanHandle {
     return this.session.holdPlanLock(async () => {
       const [outcome, step] = await this.#prepare();
       if (step === null) return outcome;
-      const response = await runtime.send(this.session, prompt(step), undefined, context);
+      let response: AgentResponse;
+      try {
+        response = await runtime.send(this.session, prompt(step), undefined, context);
+      } catch (error) {
+        const stopped = error instanceof HarnessError && error.code === 'run_not_permitted' || error instanceof HarnessError && error.code === PLAN_BUDGET_EXHAUSTED
+          ? await this.#stoppedOnBudget() : null;
+        if (stopped === null) throw error;
+
+        return stopped;
+      }
 
       return new AdvanceOutcome('ran', 'active', step.id, response.runId, null, response);
     }, this.plans.lockTtl());
@@ -498,7 +657,16 @@ export class PlanHandle {
       let runId: string | null = null;
       let response: AgentResponse | null = null;
       for (;;) {
-        const next = await stream.next();
+        let next: IteratorResult<RunStep, AgentResponse>;
+        try {
+          next = await stream.next();
+        } catch (error) {
+          const stopped = error instanceof HarnessError && (error.code === 'run_not_permitted' || error.code === PLAN_BUDGET_EXHAUSTED)
+            ? await this.#stoppedOnBudget() : null;
+          if (stopped === null) throw error;
+
+          return stopped;
+        }
         if (next.done === true) {
           runId ??= next.value.runId;
           response = next.value;
@@ -510,6 +678,36 @@ export class PlanHandle {
 
       return new AdvanceOutcome('ran', 'active', step.id, runId, null, response);
     }, this.plans.lockTtl()));
+  }
+
+  /**
+   * Choose this plan's budget (G-366), in host code: `shared` with
+   * `max_steps` and optionally `max_cost_usd`, `per_step`, or `none`. Each
+   * limit is the lower of this and the configured one. The first choice, or
+   * the plan's first shared turn, fixes the budget: after that the mode cannot
+   * change (`plan.budget_fixed`) and a limit can only be lowered. Never
+   * reachable from a tool or the model.
+   */
+  async useBudget(budget: PlanBudgetConfig): Promise<void> {
+    const plan = await this.plans.load(this.session);
+    if (!PlanMachine.isLive(plan)) throw PlanRefused.because('plan.no_plan');
+    await this.plans.useBudget(this.session, plan!.id, budget);
+  }
+
+  /** The plan's budget as it stands: mode, limits and what a shared budget has spent. Null when there is no plan. */
+  async budget(): Promise<{ mode: string; max_steps: number | null; max_cost_usd: number | null; steps: number; cost_usd: number } | null> {
+    const plan = await this.plans.load(this.session);
+    if (plan === null) return null;
+    const settings = await this.plans.budgetFor(this.session, plan.id);
+    const record = await this.plans.budgetRecord(this.session, plan.id);
+
+    return {
+      mode: settings.mode,
+      max_steps: settings.max_steps,
+      max_cost_usd: settings.max_cost_micros === null ? null : settings.max_cost_micros / 1_000_000,
+      steps: record?.steps ?? 0,
+      cost_usd: (record?.cost_micros ?? 0) / 1_000_000,
+    };
   }
 
   /**
@@ -550,6 +748,14 @@ export class PlanHandle {
     return runtime;
   }
 
+  /** A turn refused because the plan's shared budget is spent stops the plan cleanly; null when the budget is not what stopped it. */
+  async #stoppedOnBudget(): Promise<AdvanceOutcome | null> {
+    const plan = await this.plans.load(this.session);
+    if (plan === null || plan.status !== 'active' || await this.plans.budgetExhaustion(this.session, plan.id) === null) return null;
+
+    return (await this.#prepare())[0];
+  }
+
   /** Settle, check limits, choose, and claim, under the plan lock. */
   async #prepare(): Promise<[AdvanceOutcome, PlanStep | null]> {
     const plan = await this.plans.reconciled(this.session);
@@ -557,8 +763,10 @@ export class PlanHandle {
     const run = await this.session.run();
     const runFailed = run !== null && run.status === 'failed';
     const now = this.plans.now();
-    const [next, [kind, value]] = PlanMachine.prepare(plan, runFailed, this.plans.limits(), now, null);
+    const spent = plan.status === 'active' ? await this.plans.budgetExhaustion(this.session, plan.id) : null;
+    const [next, [kind, value]] = PlanMachine.prepare(plan, runFailed, this.plans.limits(), now, null, spent !== null);
     if (JSON.stringify(next) !== JSON.stringify(plan)) await this.plans.write(this.session, next, plan.revision);
+    if (kind === 'blocked' && value === PLAN_BUDGET_EXHAUSTED) await this.plans.announceBudgetExhausted(this.session, plan.id, String(spent));
     if (kind !== 'run') {
       switch (kind) {
         case 'waiting': return [new AdvanceOutcome('waiting', next.status, value), null];
@@ -574,6 +782,18 @@ export class PlanHandle {
 
     return [new AdvanceOutcome('ran', 'active', step.id), step];
   }
+}
+
+/** A turn serves the plan while the plan's head step is claimed for a turn or held on an approval that turn asked for. */
+function serving(plan: Plan | null): boolean {
+  if (plan === null || !['active', 'waiting'].includes(plan.status)) return false;
+  const head = PlanMachine.headIndex(plan);
+
+  return head !== null && ['running', 'held'].includes(plan.steps[head]!.state);
+}
+
+function budgetKey(sessionKey: string): string {
+  return `${sessionKey}:plan-budget`;
 }
 
 /** The host's fixed words. The step's own instruction reaches the model only through the fenced plan context, never as the user turn. */
