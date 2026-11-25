@@ -324,4 +324,22 @@ describe('a child started again under a host-built run tree, and its depth', () 
 
     expect(r.depths.slice(from)).toEqual([1, 1]);
   });
+
+  it('starts a child again at the depth the runner gives it, never an older deeper one', async () => {
+    const r = new Rig();
+    const child = r.session('chat::sub::research');
+    await child.rememberChildBinding({
+      session: { provider: null, model: null },
+      declared: { provider: 'custom-cheap', model: 'cheap-model' },
+      parentMode: { provider: null, model: null },
+    }, 3);
+
+    r.calls([['research', { task: 'Find the weather.' }]]);
+    r.text('Child answer.');
+    r.text('Parent answer.');
+    await r.runtime.send(r.session(), 'Go');
+
+    expect(r.depths).toEqual([0, 1]);
+    expect(await child.childDepth()).toBe(1);
+  });
 });

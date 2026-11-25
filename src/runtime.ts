@@ -744,8 +744,10 @@ export class AgentRuntime {
     // the child, as in the reference (atSavedChildDepth): a resumed child, or
     // one handed a host context, delegates under the same depth ceiling as it
     // would inside its tree. A context may put it deeper, never shallower.
+    // The runner's own context is at the depth it starts the child at, and
+    // that is the depth it saves: it is never raised to an older one.
     const savedDepth = await session.childDepth();
-    if (savedDepth > run.depth) run = run.atDepth(savedDepth);
+    if (runnerBinding === null && savedDepth > run.depth) run = run.atDepth(savedDepth);
     if (session.agent !== null && paused?.agentSpend != null) {
       run.ledger.carryAgentSpend(session.agent, paused.agentSpend.cost_usd, paused.agentSpend.unmetered_runs);
     }
