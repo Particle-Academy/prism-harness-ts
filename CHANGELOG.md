@@ -52,7 +52,7 @@
   unparsable arguments: `undefined` in a list, a function, a symbol, a bigint,
   or an object that is not a plain object (a `Date`, a `Map`, a class
   instance). Such a call asks nobody and runs nothing, and the model is told.
-  So is any call whose arguments cannot be digested. Before, a gated call with
+  These are exactly the values its digest cannot represent. Before, a gated call with
   such a value threw a `TypeError` out of `send()` when its decision event was
   digested, and a `Date` was digested as `{}` while being sent back as text.
   An `undefined` property still reads as an absent one.

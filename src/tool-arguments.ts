@@ -1,5 +1,4 @@
 import type { JsonObject } from './json.js';
-import { canonicalJson } from './tool-policy.js';
 
 /**
  * The deepest nesting accepted. A provider wraps the arguments in its own
@@ -43,21 +42,7 @@ export function usableArguments(value: unknown): JsonObject | null {
 
   const map = decoded as JsonObject;
 
-  return Object.keys(map).some(isIntegerKey) || !canBeSentBack(map) || !digestible(map) ? null : map;
-}
-
-/**
- * Every decision about a call carries the digest of its arguments, so
- * arguments the digest cannot be computed for are unusable: otherwise the
- * call's first decision event would throw out of the run instead.
- */
-function digestible(map: JsonObject): boolean {
-  try {
-    canonicalJson(map);
-    return true;
-  } catch {
-    return false;
-  }
+  return Object.keys(map).some(isIntegerKey) || !canBeSentBack(map) ? null : map;
 }
 
 function decode(text: string): unknown {
@@ -102,7 +87,13 @@ function canBeSentBack(root: JsonObject): boolean {
   }
 }
 
-/** Checks a scalar in place and holds only a nested value for the next level. */
+/**
+ * Checks a scalar in place and holds only a nested value for the next level.
+ *
+ * Admits exactly what `canonicalJson()` can represent, so every usable call can
+ * be digested for its decision events without serialising it a second time.
+ * Widen one, widen both.
+ */
 function admitsValue(item: unknown, depth: number, next: object[], inList: boolean): boolean {
   if (typeof item === 'number') return Number.isFinite(item);
   if (typeof item === 'string') return !LONE_SURROGATE.test(item);
