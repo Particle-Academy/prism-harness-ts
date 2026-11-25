@@ -10,6 +10,7 @@ import {
   PlanRefused,
   PlanView,
   ToolPolicy,
+  bindingRoute,
   renderPlanText,
   type Plan,
   type PlanBudgetState,
@@ -49,12 +50,13 @@ function runPlansCase(entry: PlansCase): { results: unknown[]; final: unknown; b
   });
   let counter = 0;
   const ids = new PlanIds((prefix) => `${prefix}_${String(++counter).padStart(26, '0')}`);
-  const state: CaseState = { plan: null, marked: null, ledger: null };
+  const state: CaseState = { plan: null, marked: null, ledger: null, savedBinding: false };
   const results: unknown[] = [];
   for (const op of entry.ops) {
     const now = (op.now ?? entry.now ?? 1767225600) as number;
     try {
-      results.push(String(op.op).startsWith('budget_') ? plansBudgetOp(op, state, now) : plansOp(op, state, ids, limits, now));
+      results.push(op.op === 'binding_route' ? plansBindingOp(op, state)
+        : String(op.op).startsWith('budget_') ? plansBudgetOp(op, state, now) : plansOp(op, state, ids, limits, now));
     } catch (error) {
       if (!(error instanceof PlanRefused)) throw error;
       results.push({ refused: error.code });
@@ -71,6 +73,25 @@ interface CaseState {
   plan: Plan | null;
   marked?: ReturnType<typeof PlanView.steps> | null;
   ledger: PlanBudgetState | null;
+  savedBinding: boolean;
+}
+
+/**
+ * Which binding a turn runs on, and whether it is saved (bindingRoute).
+ * Whether a binding is saved carries from op to op, as it does on a session.
+ */
+function plansBindingOp(op: Op, state: CaseState): unknown {
+  const saved = (op.saved_binding ?? state.savedBinding) as boolean;
+  let route;
+  try {
+    route = bindingRoute(op.context, op.supplied_binding, saved, op.linked);
+  } catch (error) {
+    if (error instanceof RangeError) return { invalid: true };
+    throw error;
+  }
+  state.savedBinding = saved || route.save;
+
+  return { route };
 }
 
 /** The plan budget ops (G-366): settings and the shared ledger, pure. */
@@ -263,8 +284,8 @@ describe('the harness-plans corpus (G-360)', () => {
     return;
   }
 
-  it('vendors all 55 cases', () => {
-    expect(corpus.cases).toHaveLength(55);
+  it('vendors all 58 cases', () => {
+    expect(corpus.cases).toHaveLength(58);
   });
 
   it.each(corpus.cases.map((entry) => [entry.id, entry] as const))('%s runs as the reference recorded it', (_id, entry) => {
