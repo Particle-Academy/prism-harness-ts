@@ -466,6 +466,7 @@ describe('plan budgets (G-366)', () => {
     await (await r.handle()).advance();
 
     // The child had the two steps the plan had left, not the host's hundred.
+    expect(r.requests.filter((request) => request.systemPrompt.startsWith('You research.'))).toHaveLength(2);
     expect(r.lookups).toBe(2);
     expect(r.queue).toHaveLength(2);
     expect((await (await r.handle()).budget())!.steps).toBe(3);
@@ -478,12 +479,14 @@ describe('plan budgets (G-366)', () => {
       hostSubagent: RunContext.root('host', new RunBudget(1)),
     });
     await r.active(1);
-    r.calls([['research', { task: 'Find the weather.' }]]);
-    for (const q of ['a', 'b', 'c']) r.calls([['lookup', { q }]]);
-    r.text('Child answer.');
-    r.text('Step done.');
+    r.calls([['research', { task: 'Find the weather.' }]]);   // parent
+    r.calls([['lookup', { q: 'a' }]]);                         // child: its one step
+    r.text('Step done.');                                      // parent
     await (await r.handle()).advance();
 
+    // The child stopped after the one step the host context allowed.
+    expect(r.requests.filter((request) => request.systemPrompt.startsWith('You research.'))).toHaveLength(1);
     expect(r.lookups).toBe(1);
+    expect(r.queue).toHaveLength(0);
   });
 });
