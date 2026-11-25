@@ -531,6 +531,11 @@ export class RunContext {
     return new RunContext(this.ledger, this.budget, this.parentRunId, this.depth, { turnId: this.turnId, actor: this.actor, metadataOnly: this.metadataOnly }, binding);
   }
 
+  /** The same run at another nesting depth, keeping its tree, budget, metadata and binding. */
+  atDepth(depth: number): RunContext {
+    return new RunContext(this.ledger, this.budget, this.parentRunId, depth, { turnId: this.turnId, actor: this.actor, metadataOnly: this.metadataOnly }, this.binding);
+  }
+
   get rootRunId(): string {
     return this.ledger.rootRunId;
   }

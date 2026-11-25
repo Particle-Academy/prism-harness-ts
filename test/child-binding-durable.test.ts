@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   AgentRuntime,
+  HarnessEvents,
   MemorySessionStore,
   ModeRegistry,
   PrismHarness,
@@ -62,14 +63,20 @@ class Rig {
   readonly runtime: AgentRuntime;
   readonly harness: PrismHarness;
   readonly ephemeral = new ExpiringStore();
+  readonly events = new HarnessEvents();
+  /** The depth of every run.started, in order. */
+  readonly depths: number[] = [];
   #call = 0;
 
-  constructor() {
+  constructor(chatSteps = 20) {
+    this.events.listen((event) => {
+      if (event.type === 'run.started') this.depths.push(event.depth);
+    });
     const modes = new ModeRegistry({
       default: 'chat',
       modes: {
         chat: {
-          system_prompt: 'You delegate.', tools: ['research'], max_steps: 20,
+          system_prompt: 'You delegate.', tools: ['research'], max_steps: chatSteps,
           subagents: { research: { mode: 'research', provider: 'custom-cheap', model: 'cheap-model' } },
         } as ModeConfig,
         research: { system_prompt: 'Research.', tools: ['weather'], requires_approval: ['weather'], max_steps: 8 } as ModeConfig,
@@ -80,6 +87,7 @@ class Rig {
       config: { provider: 'anthropic', model: 'root-model' },
       modes,
       tools,
+      events: this.events,
       client: async (request) => {
         this.requests.push(request);
         const next = this.queue.shift();
@@ -274,5 +282,46 @@ describe('a child the runner starts under a run tree the host built', () => {
 
     expect(r.sent(0)).toEqual([cheap, { provider: 'anthropic', model: 'root-model' }]);
     expect(await session.childBinding()).toBeNull();
+  });
+});
+
+// A child the runner starts again, now under a run tree the host built, keeps
+// the run tree reference it saved under an earlier tree: the runner's own
+// context spends from the host's tree and is never held against the saved one,
+// and the saved one is never replaced with nothing, so a later turn the runner
+// does not start still continues it rather than a fresh root budget. A child's
+// depth is saved with it, so a later turn on the child cannot reset its nesting.
+describe('a child started again under a host-built run tree, and its depth', () => {
+  it('runs the child on the host tree even when the tree it saved before is spent', async () => {
+    const r = new Rig(3);
+    r.calls([['research', { task: 'Find the weather.' }]]);
+    r.calls([['weather', { city: 'Paris' }]]);
+    r.text('Parent answer.');
+    await r.runtime.send(r.session(), 'Go');
+    const child = r.session('chat::sub::research');
+    const refs = await child.childRefs();
+    expect(refs?.tree).not.toBeNull();
+    const before = r.requests.length;
+
+    r.calls([['research', { task: 'Again.' }]]);
+    r.text('Child again.');
+    r.text('Parent again.');
+    await r.runtime.send(r.session(), 'Again', undefined, RunContext.root('host_root', new RunBudget(100)));
+
+    expect(r.sent(before)).toContainEqual(cheap);
+    expect(await child.childRefs()).toEqual(refs);
+  });
+
+  it('saves the depth the runner started the child at, and later turns run at least that deep', async () => {
+    const { r, child } = await startedChild(false);
+    expect(await child.childDepth()).toBe(1);
+    const from = r.depths.length;
+
+    r.text('Again.');
+    await r.runtime.send(child, 'New question');
+    r.text('Hosted.');
+    await r.runtime.send(child, 'Hosted question', undefined, RunContext.root('host_root', new RunBudget(100)));
+
+    expect(r.depths.slice(from)).toEqual([1, 1]);
   });
 });

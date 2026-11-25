@@ -740,6 +740,12 @@ export class AgentRuntime {
     let run = this.#boundedRun(session, execution === null || execution === undefined
       ? new RunContext(RunLedger.start(runId), new RunBudget(mode.maxSteps), null, 0, {}, binding)
       : (execution.binding === binding ? execution : execution.withBinding(binding)));
+    // A turn on a child session runs at least as deep as the runner started
+    // the child, as in the reference (atSavedChildDepth): a resumed child, or
+    // one handed a host context, delegates under the same depth ceiling as it
+    // would inside its tree. A context may put it deeper, never shallower.
+    const savedDepth = await session.childDepth();
+    if (savedDepth > run.depth) run = run.atDepth(savedDepth);
     if (session.agent !== null && paused?.agentSpend != null) {
       run.ledger.carryAgentSpend(session.agent, paused.agentSpend.cost_usd, paused.agentSpend.unmetered_runs);
     }
@@ -807,12 +813,20 @@ export class AgentRuntime {
       if (run.binding !== null) {
         // Only the runner's own context writes them: a context the host
         // supplies never replaces the tree or the binding the child saved.
+        // Under a run tree the host built there is no durable tree to name:
+        // the references the child saved before are kept, never replaced
+        // with nothing, so a later turn the runner does not start still
+        // continues the tree it last had rather than a fresh root budget.
+        const started = runnerBinding !== null && execution != null ? await RunTrees.childStarted(session, execution) : null;
         const refs: ChildRefs = runnerBinding !== null && execution != null
-          ? { tree: await RunTrees.childStarted(session, execution), planLedger: plans?.ledgerOf(execution.rootRunId) ?? null }
+          ? (started !== null
+            ? { tree: started, planLedger: plans?.ledgerOf(execution.rootRunId) ?? null }
+            : (await session.childRefs()) ?? { tree: null, planLedger: null })
           : { tree: RunTrees.treeOf(runId), planLedger: savedRefs?.planLedger ?? null };
         this.#childRefs.set(runId, refs);
-        if (runnerBinding !== null) {
-          if (JSON.stringify(await session.childBinding()) !== JSON.stringify(runnerBinding)) await session.rememberChildBinding(runnerBinding);
+        if (runnerBinding !== null && execution != null) {
+          if (JSON.stringify(await session.childBinding()) !== JSON.stringify(runnerBinding)
+            || await session.childDepth() !== execution.depth) await session.rememberChildBinding(runnerBinding, execution.depth);
           if (JSON.stringify(await session.childRefs()) !== JSON.stringify(refs)) await session.rememberChildRefs(refs);
         }
       }

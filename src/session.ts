@@ -304,8 +304,22 @@ export class Session {
     return binding === null ? null : { session: binding.session, declared: binding.declared, parentMode: binding.parent_mode };
   }
 
+  /**
+   * The depth the subagent runner started this session's child run at, or 0
+   * for a session the runner never started. Every later turn on the child
+   * runs at least this deep, so a resumed child cannot reset its nesting.
+   *
+   * @internal Read by the runtime.
+   */
+  async childDepth(): Promise<number> {
+    const stored = (await this.#durable.get(this.#durableKey())) ?? {};
+    const depth = stored.child_depth;
+
+    return typeof depth === 'number' && Number.isSafeInteger(depth) && depth > 0 ? depth : 0;
+  }
+
   /** @internal Written by the runtime when the subagent runner starts a child run. */
-  async rememberChildBinding(binding: ModelBinding): Promise<this> {
+  async rememberChildBinding(binding: ModelBinding, depth = 0): Promise<this> {
     this.#assertWritable();
     const stored = (await this.#durable.get(this.#durableKey())) ?? {};
     await this.#durable.put(this.#durableKey(), {
@@ -315,6 +329,7 @@ export class Session {
         declared: { ...binding.declared },
         parent_mode: { ...binding.parentMode },
       },
+      child_depth: Number.isSafeInteger(depth) && depth > 0 ? depth : 0,
     });
 
     return this;
