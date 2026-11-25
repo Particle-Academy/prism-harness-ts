@@ -63,7 +63,7 @@ function canBeSentBack(root: JsonObject): boolean {
     for (const value of level) {
       if (Array.isArray(value)) {
         for (const item of value) {
-          if (!admitsValue(item, depth, next)) return false;
+          if (!admitsValue(item, depth, next, true)) return false;
         }
 
         continue;
@@ -73,7 +73,7 @@ function canBeSentBack(root: JsonObject): boolean {
 
       for (const key of Object.keys(map)) {
         if (key.startsWith('\u0000') || LONE_SURROGATE.test(key)) return false;
-        if (!admitsValue(map[key], depth, next)) return false;
+        if (!admitsValue(map[key], depth, next, false)) return false;
       }
     }
 
@@ -87,11 +87,28 @@ function canBeSentBack(root: JsonObject): boolean {
   }
 }
 
-/** Checks a scalar in place and holds only a nested value for the next level. */
-function admitsValue(item: unknown, depth: number, next: object[]): boolean {
+/**
+ * Checks a scalar in place and holds only a nested value for the next level.
+ *
+ * Admits exactly what `canonicalJson()` can represent, so every usable call can
+ * be digested for its decision events without serialising it a second time.
+ * Widen one, widen both.
+ */
+function admitsValue(item: unknown, depth: number, next: object[], inList: boolean): boolean {
   if (typeof item === 'number') return Number.isFinite(item);
   if (typeof item === 'string') return !LONE_SURROGATE.test(item);
-  if (typeof item !== 'object' || item === null) return true;
+  if (item === null || typeof item === 'boolean') return true;
+  // An undefined property is an absent one, in JSON and in the digest alike. In
+  // a list it would be sent back as null and has no digest. A function, symbol
+  // or bigint has no JSON form at all.
+  if (item === undefined) return !inList;
+  if (typeof item !== 'object') return false;
+  // Only a list or a plain object: anything else (a Date, a Map, a class
+  // instance) is sent back as one value and digested as another.
+  if (!Array.isArray(item)) {
+    const prototype: unknown = Object.getPrototypeOf(item);
+    if (prototype !== Object.prototype && prototype !== null) return false;
+  }
   if (depth >= MAX_ARGUMENT_DEPTH) return false;
 
   next.push(item);
