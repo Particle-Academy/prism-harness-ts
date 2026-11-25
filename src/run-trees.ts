@@ -149,7 +149,7 @@ export const RunTrees = {
    */
   async childStarted(child: Session, context: RunContext): Promise<RunTreeRef | null> {
     const rootRunId = context.rootRunId;
-    const entry = runs.get(rootRunId);
+    const entry = entryOf(context);
     if (entry === undefined) return null;
     if (!entry.held) {
       const settings = {
@@ -197,6 +197,20 @@ export const RunTrees = {
     }
   },
 };
+
+/**
+ * The live run of this process a context spends from: the root run its ledger
+ * names, or the run that holds that ledger. A child resumed under a context the
+ * host built continues its saved tree under its OWN run id while its ledger is
+ * the host's, so the children it starts are found by the ledger.
+ */
+function entryOf(context: RunContext): RootRun | undefined {
+  const named = runs.get(context.rootRunId);
+  if (named !== undefined) return named;
+  for (const entry of runs.values()) if (entry.ledger === context.ledger) return entry;
+
+  return undefined;
+}
 
 /** One locked change to a tree's record. */
 async function write<T>(store: SessionStore, tree: RunTreeRef, change: (state: PlanBudgetState | null) => [PlanBudgetState | null, T]): Promise<T> {

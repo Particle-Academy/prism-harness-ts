@@ -68,7 +68,7 @@ class Rig {
   readonly depths: number[] = [];
   #call = 0;
 
-  constructor(chatSteps = 20) {
+  constructor(chatSteps = 20, nested = false) {
     this.events.listen((event) => {
       if (event.type === 'run.started') this.depths.push(event.depth);
     });
@@ -79,7 +79,11 @@ class Rig {
           system_prompt: 'You delegate.', tools: ['research'], max_steps: chatSteps,
           subagents: { research: { mode: 'research', provider: 'custom-cheap', model: 'cheap-model' } },
         } as ModeConfig,
-        research: { system_prompt: 'Research.', tools: ['weather'], requires_approval: ['weather'], max_steps: 8 } as ModeConfig,
+        research: {
+          system_prompt: 'Research.', tools: nested ? ['weather', 'dig'] : ['weather'], requires_approval: ['weather'], max_steps: 8,
+          ...(nested ? { subagents: { dig: { mode: 'dig' } } } : {}),
+        } as ModeConfig,
+        dig: { system_prompt: 'Dig.', tools: [], max_steps: 4 } as ModeConfig,
       },
     });
     const tools = new ToolRegistry().register({ name: 'weather', handle: () => 'Sunny' });
@@ -104,6 +108,10 @@ class Rig {
     });
     tools.register(new SubagentRunner(this.harness, this.runtime)
       .tool(modes.resolve('chat').subagents.research!, this.session(), RunContext.root('host', new RunBudget(100)), 'host_run'));
+    if (nested) {
+      tools.registerFactory('dig', (session) => new SubagentRunner(this.harness, this.runtime)
+        .tool(modes.resolve('research').subagents.dig!, session, RunContext.root('dig', new RunBudget(100)), 'dig_run'));
+    }
   }
 
   session(scope = 'chat'): Session {
@@ -341,5 +349,29 @@ describe('a child started again under a host-built run tree, and its depth', () 
 
     expect(r.depths).toEqual([0, 1]);
     expect(await child.childDepth()).toBe(1);
+  });
+});
+
+// A child resumed under a run context the host built continues the run tree it
+// saved, and a grandchild it starts belongs to that tree too: the grandchild
+// saves the same tree, so its own later turns continue it.
+describe('a grandchild of a child resumed under a host context', () => {
+  it('saves the run tree the child continues', async () => {
+    const r = new Rig(20, true);
+    r.calls([['research', { task: 'Find the weather.' }]]);
+    r.calls([['weather', { city: 'Paris' }]]);
+    r.text('Parent answer.');
+    await r.runtime.send(r.session(), 'Go');
+    const child = r.session('chat::sub::research');
+    const refs = await child.childRefs();
+    expect(refs?.tree).not.toBeNull();
+
+    r.calls([['dig', { task: 'Dig.' }]]);
+    r.text('Grandchild answer.');
+    r.text('Child answer.');
+    await r.runtime.send(child, 'Dig deeper', undefined, RunContext.root('host_answer', new RunBudget(100)));
+
+    const grandchild = r.session('chat::sub::research::sub::dig');
+    expect((await grandchild.childRefs())?.tree).toEqual(refs?.tree);
   });
 });
