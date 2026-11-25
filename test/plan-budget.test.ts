@@ -279,10 +279,13 @@ describe('plan budgets (G-366)', () => {
     const plan = (await r.plans.load(session))!;
     await r.plans.write(session, PlanMachine.claim(plan, plan.steps[0]!.id, 'worker', r.plans.now() + 300, r.plans.now()), plan.revision);
     const turn = (id: string) => r.plans.planTurn(session, id, new RunContext(RunLedger.start(id), new RunBudget(8)), undefined);
+    // Each as the step's own turn, as advance() runs it.
+    const serving = r.plans.servingStep(session);
 
     expect((await turn('run_a')).budget.maxSteps).toBe(8);
     expect((await turn('run_b')).budget.maxSteps).toBe(2);
     await expect(turn('run_c')).rejects.toMatchObject({ code: 'plan_budget_exhausted' });
+    serving();
   });
 
   it('ignores budget fields the model sends and refuses a run tree handed to a shared plan step', async () => {

@@ -14,6 +14,7 @@ import { PlanIds } from './ids.js';
 import { PlanLimits, type PlansConfig } from './limits.js';
 import { PlanMachine, phpTrim, type Plan, type PlanStep } from './machine.js';
 import { PlanRefused, PlansDisabled } from './refusal.js';
+import { pausedApprovalIds } from '../thread-rows.js';
 import { approvalDecisions, pendingApprovalCalls } from './thread.js';
 import { planTools } from './tools.js';
 import { PlanView, type PlanCounts } from './view.js';
@@ -67,6 +68,8 @@ export class Plans {
   #clock: (() => number) | null = null;
   /** Turns spending from a shared plan budget, by run id, until they settle. */
   readonly #budgetTurns = new Map<string, { session: string; plan: string; context: RunContext; steps: number; cost: number; unmetered: number }>();
+  /** Sessions whose advance() is running the turn of the step it claimed, counted per session. */
+  readonly #advancing = new Map<string, number>();
 
   constructor(options: PlansOptions) {
     this.config = options.config ?? {};
@@ -346,30 +349,72 @@ export class Plans {
   }
 
   /**
-   * The shared budget a turn on this session would spend from now, or null.
+   * The shared budget this turn would spend from, or null.
    * @internal
    */
-  async servingSharedPlan(session: Session): Promise<PlanBudgetSettings | null> {
-    if (!(await this.enabledFor(session))) return null;
-    const plan = await this.load(session);
-    if (!serving(plan)) return null;
-    const settings = await this.budgetFor(session, plan!.id);
-
-    return settings.mode === 'shared' ? settings : null;
+  async servingSharedPlan(session: Session, prompt = ''): Promise<PlanBudgetSettings | null> {
+    return (await this.#ledgerFor(session, prompt))?.settings ?? null;
   }
 
   /**
-   * The run a turn executes under, when the turn serves a plan step whose
-   * budget is shared: the per-turn budget, narrowed to what the plan's ledger
-   * holds for it. Any other run is returned unchanged. A run handed a run tree
-   * of its own cannot also spend from the plan's ledger, so it is refused.
+   * Mark the turn advance() runs for the step it claimed as the plan's own
+   * until the returned release is called.
+   * @internal
+   */
+  servingStep(session: Session): () => void {
+    const name = session.key();
+    this.#advancing.set(name, (this.#advancing.get(name) ?? 0) + 1);
+    let released = false;
+
+    return () => {
+      if (released) return;
+      released = true;
+      const left = (this.#advancing.get(name) ?? 1) - 1;
+      if (left <= 0) this.#advancing.delete(name);
+      else this.#advancing.set(name, left);
+    };
+  }
+
+  /**
+   * Refuse, before anything is recorded, a decision on an approval the plan's
+   * held step asked for when the shared budget its resume would spend from is
+   * already spent, or when it is handed a run tree of its own. Recorded, it
+   * would be consumed by a resume the budget then refuses, and the approved
+   * call would never run.
+   *
+   * @internal Called by every path that records decisions.
+   */
+  async assertDecisionsFunded(session: Session, approvalIds: readonly string[], context?: RunContext): Promise<void> {
+    if (!this.enabled() || approvalIds.length === 0 || !(await this.enabledFor(session))) return;
+    const plan = await this.load(session);
+    const step = activeAgentStep(plan);
+    if (plan === null || step === null || !step.approvalIds.some((id) => approvalIds.includes(id))) return;
+    if ((await this.budgetFor(session, plan.id)).mode !== 'shared') return;
+    if (context !== undefined && !context.metadataOnly) throw PlanRefused.because('plan.budget_context');
+    const spent = await this.budgetExhaustion(session, plan.id);
+    if (spent !== null) throw budgetSpent(spent);
+  }
+
+  /**
+   * The run a turn executes under, when the turn is one of the plan's own and
+   * its budget is shared: the per-turn budget, narrowed to what the plan's
+   * ledger holds for it. Any other run is returned unchanged.
+   *
+   * The plan's own turns are the one advance() runs for the step it claimed
+   * and the resume of an approval that step asked for. Any other turn on the
+   * session (a person chatting while a step waits on them, or while a claim
+   * whose worker died is still live) is not the plan's: it spends nothing
+   * from the plan's budget and is never refused for it.
+   *
+   * A run handed a run tree of its own cannot also spend from the plan's
+   * ledger, so it is refused.
    *
    * @internal Called by the runtime once a run's own budget is known.
    */
-  async planTurn(session: Session, runId: string, run: RunContext, context: RunContext | undefined): Promise<RunContext> {
-    if (!(await this.enabledFor(session))) return run;
-    const plan = await this.load(session);
-    if (!serving(plan) || (await this.budgetFor(session, plan!.id)).mode !== 'shared') return run;
+  async planTurn(session: Session, runId: string, run: RunContext, context: RunContext | undefined, prompt = ''): Promise<RunContext> {
+    const target = await this.#ledgerFor(session, prompt);
+    if (target === null) return run;
+    const plan = target.plan;
     if (context !== undefined && !context.metadataOnly) throw PlanRefused.because('plan.budget_context');
 
     const { ledger, budget } = run;
@@ -378,21 +423,33 @@ export class Plans {
     const turnCost = budget.maxCostUsd === null ? null : PlanBudget.micros(Math.max(0, budget.maxCostUsd - baseCost));
     const now = this.now();
     const ttl = this.#lockTtl;
-    const [, grant] = await this.#budgetWrite(session, plan!.id, this.budgetSettings(),
+    const [, grant] = await this.#budgetWrite(session, plan.id, this.budgetSettings(),
       (state) => PlanBudget.reserve(state, runId, Math.max(0, budget.maxSteps - baseSteps), turnCost, now, ttl));
-    if (grant === null || 'refused' in grant) {
-      throw new HarnessError(PLAN_BUDGET_EXHAUSTED,
-        `This plan step may not proceed (plan_budget_exhausted): the plan's shared ${grant?.limit ?? 'steps'} budget is spent.`);
-    }
+    if (grant === null || 'refused' in grant) throw budgetSpent(grant?.limit ?? 'steps');
     const narrowed = run.withBudget(new RunBudget(
       baseSteps + grant.steps,
       grant.cost_micros === null ? budget.maxCostUsd : baseCost + grant.cost_micros / 1_000_000,
       budget.maxSeconds,
       budget.maxOutputTokensPerCall,
     ));
-    this.#budgetTurns.set(runId, { session: session.key(), plan: plan!.id, context: narrowed, steps: baseSteps, cost: baseCost, unmetered: ledger.unmeteredRuns });
+    this.#budgetTurns.set(runId, { session: session.key(), plan: plan.id, context: narrowed, steps: baseSteps, cost: baseCost, unmetered: ledger.unmeteredRuns });
 
     return narrowed;
+  }
+
+  /** The plan and its shared settings when this turn is one of the plan's own and its budget is shared; null otherwise. */
+  async #ledgerFor(session: Session, prompt: string): Promise<{ plan: Plan; settings: PlanBudgetSettings } | null> {
+    if (!(await this.enabledFor(session))) return null;
+    const plan = await this.load(session);
+    const step = activeAgentStep(plan);
+    if (plan === null || step === null) return null;
+    const own = this.#advancing.has(session.key())
+      || (prompt === '' && step.approvalIds.length > 0
+        && pausedApprovalIds((await session.thread().messages()).map((entry) => entry.message)).some((id) => step.approvalIds.includes(id)));
+    if (!own) return null;
+    const settings = await this.budgetFor(session, plan.id);
+
+    return settings.mode === 'shared' ? { plan, settings } : null;
   }
 
   /** Replace a finished turn's hold with what it spent. */
@@ -626,6 +683,8 @@ export class PlanHandle {
       const [outcome, step] = await this.#prepare();
       if (step === null) return outcome;
       let response: AgentResponse;
+      // This turn, and only this one, is the step's own (G-366).
+      const serving = this.plans.servingStep(this.session);
       try {
         response = await runtime.send(this.session, prompt(step), undefined, context);
       } catch (error) {
@@ -634,6 +693,8 @@ export class PlanHandle {
         if (stopped === null) throw error;
 
         return stopped;
+      } finally {
+        serving();
       }
 
       return new AdvanceOutcome('ran', 'active', step.id, response.runId, null, response);
@@ -656,24 +717,29 @@ export class PlanHandle {
       const stream = runtime.streamSteps(this.session, prompt(step), undefined, context);
       let runId: string | null = null;
       let response: AgentResponse | null = null;
-      for (;;) {
-        let next: IteratorResult<RunStep, AgentResponse>;
-        try {
-          next = await stream.next();
-        } catch (error) {
-          const stopped = error instanceof HarnessError && (error.code === 'run_not_permitted' || error.code === PLAN_BUDGET_EXHAUSTED)
-            ? await this.#stoppedOnBudget() : null;
-          if (stopped === null) throw error;
+      const serving = this.plans.servingStep(this.session);
+      try {
+        for (;;) {
+          let next: IteratorResult<RunStep, AgentResponse>;
+          try {
+            next = await stream.next();
+          } catch (error) {
+            const stopped = error instanceof HarnessError && (error.code === 'run_not_permitted' || error.code === PLAN_BUDGET_EXHAUSTED)
+              ? await this.#stoppedOnBudget() : null;
+            if (stopped === null) throw error;
 
-          return stopped;
-        }
-        if (next.done === true) {
+            return stopped;
+          }
+          if (next.done === true) {
+            runId ??= next.value.runId;
+            response = next.value;
+            break;
+          }
           runId ??= next.value.runId;
-          response = next.value;
-          break;
+          channel.push(next.value);
         }
-        runId ??= next.value.runId;
-        channel.push(next.value);
+      } finally {
+        serving();
       }
 
       return new AdvanceOutcome('ran', 'active', step.id, runId, null, response);
@@ -784,12 +850,19 @@ export class PlanHandle {
   }
 }
 
-/** A turn serves the plan while the plan's head step is claimed for a turn or held on an approval that turn asked for. */
-function serving(plan: Plan | null): boolean {
-  if (plan === null || !['active', 'waiting'].includes(plan.status)) return false;
+/** The plan's head step when it is the agent's and claimed for a turn or held on an approval that turn asked for; null otherwise. */
+function activeAgentStep(plan: Plan | null): PlanStep | null {
+  if (plan === null || !['active', 'waiting', 'blocked'].includes(plan.status)) return null;
   const head = PlanMachine.headIndex(plan);
+  if (head === null) return null;
+  const step = plan.steps[head]!;
 
-  return head !== null && ['running', 'held'].includes(plan.steps[head]!.state);
+  return step.owner === 'agent' && ['running', 'held'].includes(step.state) ? step : null;
+}
+
+function budgetSpent(limit: string): HarnessError {
+  return new HarnessError(PLAN_BUDGET_EXHAUSTED,
+    `This plan step may not proceed (plan_budget_exhausted): the plan's shared ${limit} budget is spent.`);
 }
 
 function budgetKey(sessionKey: string): string {

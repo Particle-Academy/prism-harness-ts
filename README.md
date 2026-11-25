@@ -630,7 +630,7 @@ options cannot choose it or widen it.
 | mode | what it means |
 |---|---|
 | `per_step` (default) | Each step's turn gets the per-turn budget, as before. |
-| `shared` | Every turn that serves the plan also spends from one ledger: `max_steps` model steps in total (required) and optionally `max_cost_usd`. Per-turn limits still apply to each turn. When the ledger is spent, the plan is blocked with `plan_budget_exhausted` and a `plan.budget_exhausted` event is emitted once. |
+| `shared` | The plan's own turns also spend from one ledger: `max_steps` model steps in total (required) and optionally `max_cost_usd`. Per-turn limits still apply to each turn. When the ledger is spent, the plan is blocked with `plan_budget_exhausted` and a `plan.budget_exhausted` event is emitted once. |
 | `none` | No plan-level budget. Per-turn limits, the plan's own limits and agent spend ceilings still apply. |
 
 ```ts
@@ -652,6 +652,16 @@ handed a run tree of its own is refused (`plan.budget_context`) rather than run
 outside the ledger. An invalid mode or limit throws `PlanBudgetInvalid` when
 plans are used, before anything runs. A turn the ledger refuses fails with
 `plan_budget_exhausted`.
+
+The plan's own turns are the turn `advance()` runs for the step it claimed and
+the resume of an approval that step asked for. Any other turn on the session,
+such as the person chatting while a step waits on their approval, spends
+nothing from the plan's budget and is never refused for it. A decision on an
+approval the step asked for (`recordApproval()`, `recordDecisions()`,
+`runtime.decide()` or `streamDecision()`) is refused with
+`plan_budget_exhausted`, recording nothing, when the shared budget is already
+spent, and the next `advance()` blocks the plan, so an approval is never
+consumed by a resume that cannot run.
 
 ### Hosts with queues
 

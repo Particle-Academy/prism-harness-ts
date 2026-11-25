@@ -241,6 +241,25 @@ export function pendingApprovalIds(rows: readonly JsonObject[]): string[] {
 }
 
 /**
+ * Every approval id the run paused at the transcript tail asked for, answered
+ * or not; empty when the tail is a user turn or an assistant step that asked
+ * nothing. A turn with no new message continues exactly these calls (G-366).
+ */
+export function pausedApprovalIds(rows: readonly JsonObject[]): string[] {
+  for (let index = rows.length - 1; index >= 0; index -= 1) {
+    const row = rows[index]!;
+    if (row.type === 'user') return [];
+    if (row.type !== 'assistant') continue;
+
+    return [...new Set(list(row.tool_approval_requests)
+      .map(request => request.approval_id)
+      .filter((id): id is string => typeof id === 'string' && id !== ''))];
+  }
+
+  return [];
+}
+
+/**
  * The model steps the run paused at the transcript tail has already taken, or
  * null when nothing at the tail is waiting on an approval.
  *

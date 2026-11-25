@@ -527,7 +527,7 @@ export class AgentRuntime {
       let decidedPlan = false;
       const capture = live.planService()?.watch(live.key(), () => { decidedPlan = true; }) ?? (() => {});
       try {
-        await writeDecisions(live, decisions);
+        await writeDecisions(live, decisions, context);
       } finally {
         capture();
       }
@@ -757,7 +757,7 @@ export class AgentRuntime {
       if (prompt === '' && execution == null) run.ledger.recordSteps(approvalRunSteps(stored) ?? 0);
       // G-366: a turn serving a plan step with a shared budget holds what the
       // plan has left, after the paused steps it continues are counted.
-      if (plans !== null) run = await plans.planTurn(session, runId, run, context);
+      if (plans !== null) run = await plans.planTurn(session, runId, run, context, prompt);
       if (scope !== null) {
         if (scope.legacy) console.warn('Pending approval has no valid stored tool scope; offering approved requests only.');
         offered = offered.filter(tool => scope.names.includes(tool.name)
@@ -1380,11 +1380,15 @@ async function writeDecisionsLocked(
  *
  * Call it holding the session lock: the check and the write are one step.
  */
-async function writeDecisions(session: Session, decisions: readonly ApprovalDecision[]): Promise<void> {
+async function writeDecisions(session: Session, decisions: readonly ApprovalDecision[], context?: RunContext): Promise<void> {
   const pending = new Set(pendingApprovalIds((await session.thread().messages()).map((entry) => entry.message)));
   for (const decision of decisions) {
     if (!pending.delete(decision.approvalId)) throw HarnessError.approvalNotPending(decision.approvalId);
   }
+  // A decision a spent shared plan budget could not run is refused here, with
+  // nothing recorded, rather than consumed by a resume the budget then
+  // refuses (G-366).
+  await session.planService()?.assertDecisionsFunded(session, decisions.map((decision) => decision.approvalId), context);
 
   const run = await session.run();
 
