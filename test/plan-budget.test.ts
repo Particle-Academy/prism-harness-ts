@@ -12,6 +12,7 @@ import {
   RunLedger,
   ToolRegistry,
   recordApproval,
+  recordDecisions,
   type Durability,
   type HarnessEvent,
   type JsonObject,
@@ -38,8 +39,16 @@ afterEach(() => {
 });
 
 class DurableMemoryStore extends MemorySessionStore {
+  /** When set, a write to a plan budget record fails, as a store that is down would. */
+  failBudgetWrites = false;
+
   override durability(): Durability {
     return 'durable';
+  }
+
+  override async put(key: string, payload: JsonObject, ttlSeconds: number | null = null): Promise<void> {
+    if (this.failBudgetWrites && key.endsWith(':plan-budget')) throw new Error('store down');
+    await super.put(key, payload, ttlSeconds);
   }
 }
 
@@ -319,5 +328,96 @@ describe('plan budgets (G-366)', () => {
   ])('refuses an invalid plan budget in config before anything runs: %s', async (_name, budget) => {
     const r = new Rig({ config: { budget: budget as never } });
     await expect(r.session().plan()).rejects.toMatchObject({ name: 'PlanBudgetInvalid' });
+  });
+
+  // Only the plan's own turns spend from a shared budget: the turns advance()
+  // runs, and the resume of an approval its held step asked for. A person
+  // chatting while a step waits is not the plan, and is never refused for it.
+
+  /** A shared plan whose first step paused on a weather approval after one model step. */
+  async function held(maxSteps: number): Promise<{ r: Rig; id: string }> {
+    const r = new Rig({ config: { budget: { mode: 'shared', max_steps: maxSteps } } });
+    await r.active(2);
+    r.calls([['weather', { city: 'Paris' }]]);
+    await (await r.handle()).advance();
+    const step = (await r.plan()).steps[0];
+    expect(step.state).toBe('held');
+    expect((await (await r.handle()).budget())!.steps).toBe(1);
+
+    return { r, id: step.approvalIds[0] };
+  }
+
+  it('does not charge a shared plan for a chat turn while its step is held', async () => {
+    const { r } = await held(10);
+    r.calls([['lookup', { q: 'a' }]]);
+    r.calls([['lookup', { q: 'b' }]]);
+    r.text('Unrelated answer.');
+    await r.runtime.send(r.session(), 'Unrelated question');
+
+    expect(r.lookups).toBe(2);
+    expect((await (await r.handle()).budget())!.steps).toBe(1);
+  });
+
+  it('lets the person chat when a shared budget is spent while a step is held', async () => {
+    const { r } = await held(1);
+    r.text('Unrelated answer.');
+
+    expect((await r.runtime.send(r.session(), 'Unrelated question')).text).toBe('Unrelated answer.');
+    expect((await (await r.handle()).budget())!.steps).toBe(1);
+  });
+
+  it('does not charge a shared plan for a turn while its step is claimed by no running advance', async () => {
+    const r = new Rig({ config: { budget: { mode: 'shared', max_steps: 10 } } });
+    await r.active(1);
+    const session = r.session();
+    // A worker claimed the step and died before its turn ran.
+    const plan = (await r.plans.load(session))!;
+    await r.plans.write(session, PlanMachine.claim(plan, plan.steps[0]!.id, 'worker', r.plans.now() + 300, r.plans.now()), plan.revision);
+    r.calls([['lookup', { q: 'a' }]]);
+    r.text('Unrelated answer.');
+    await r.runtime.send(r.session(), 'Unrelated question');
+
+    expect(r.lookups).toBe(1);
+    expect((await (await r.handle()).budget())!.steps).toBe(0);
+  });
+
+  it('refuses an approval a spent shared budget cannot run, records nothing, and blocks the plan once', async () => {
+    const { r, id } = await held(1);
+    const before = r.requests.length;
+    // How many result rows the thread holds: a recorded decision adds one.
+    const results = async () => (await r.session().thread().messages()).filter((entry) => entry.message.type === 'tool_result').length;
+    const recorded = await results();
+
+    await expect(recordApproval(r.session(), id, true)).rejects.toMatchObject({ code: 'plan_budget_exhausted' });
+    await expect(r.runtime.decide(r.session(), id, true)).rejects.toMatchObject({ code: 'plan_budget_exhausted' });
+    await expect(recordDecisions(r.session(), [{ approvalId: id, approved: true }])).rejects.toMatchObject({ code: 'plan_budget_exhausted' });
+    expect(await results()).toBe(recorded);
+    expect(r.weatherRan).toBe(0);
+    expect(r.requests.length).toBe(before);
+
+    const outcome = await (await r.handle()).advance();
+    expect(outcome.status).toBe('blocked');
+    expect(outcome.reason).toBe('plan_budget_exhausted');
+    expect(r.events.filter((event) => event.type === 'plan.budget_exhausted')).toHaveLength(1);
+    expect((await (await r.handle()).advance()).status).toBe('not_active');
+    expect(r.events.filter((event) => event.type === 'plan.budget_exhausted')).toHaveLength(1);
+
+    // Still refused once the plan is blocked: the call never runs outside the budget.
+    const stream = r.runtime.streamDecision(r.session(), [{ approvalId: id, approved: true }], actor());
+    await expect((async () => { for await (const _ of stream) { /* drain */ } })()).rejects.toMatchObject({ code: 'plan_budget_exhausted' });
+    expect(await results()).toBe(recorded);
+    expect(r.weatherRan).toBe(0);
+    expect(r.requests.length).toBe(before);
+  });
+
+  it('closes the run when a shared plan budget cannot be written', async () => {
+    const r = new Rig({ config: { budget: { mode: 'shared', max_steps: 10 } } });
+    await r.active(1);
+    r.durable.failBudgetWrites = true;
+    r.text('unused');
+
+    await expect((await r.handle()).advance()).rejects.toThrow('store down');
+    expect((await r.session().run())!.status).toBe('failed');
+    expect(r.events.some((event) => event.type === 'run.failed')).toBe(true);
   });
 });
