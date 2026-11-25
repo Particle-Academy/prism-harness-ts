@@ -891,3 +891,22 @@ describe('a host call policy that forbids a plan tool (G-360 follow-up)', () => 
     expect(plan.steps[0].pauses).toBe(0);
   });
 });
+
+describe('two stored answers to one plan approval', () => {
+  it('reads the FIRST answer everywhere: a denied draft stays rejected and its tool never applies', async () => {
+    const r = new Rig();
+    r.calls([['plan_draft', draft()]]);
+    const id = (await r.send('Plan the trip')).pendingApprovals[0]!.id;
+    await recordApproval(r.session(), id, false, 'no');
+    // A second answer for the same id, as a race could leave it before the
+    // check and the write shared the session lock.
+    await r.session().thread().record([{ type: 'tool_result', tool_results: [], tool_approval_responses: [{ approval_id: id, approved: true, reason: null }] }]);
+
+    r.text('ok');
+    await r.runtime.send(r.session(), '');
+
+    expect((await r.plan()).status).toBe('rejected');
+    // The resume answered the call as denied; the plan tool's handler never ran.
+    expect(r.outputs()).toEqual(['no']);
+  });
+});

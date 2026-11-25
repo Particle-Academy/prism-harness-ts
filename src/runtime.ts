@@ -3,7 +3,7 @@ import { validateAgent } from './address.js';
 import type { JsonObject, JsonValue } from './json.js';
 import {
   assistantRow,
-  approvalToolScope, approvalRunSteps,
+  approvalToolScope, approvalRunSteps, pausedRunState, turnDecisions,
   threadView,
   toolResultEntry,
   toolResultRow,
@@ -25,7 +25,7 @@ import { ToolPolicy, argsDigest } from './tool-policy.js';
 import type { AgentMode, ModeRegistry } from './modes.js';
 import type { Session } from './session.js';
 import { schemaName, schemaProblems } from './structured.js';
-import { RunBudget, RunContext, type ModelBinding } from './subagents.js';
+import { RunBudget, RunContext, RunLedger, type ModelBinding } from './subagents.js';
 import type { HarnessTool, ToolAuthorizer, ToolRegistry } from './tools.js';
 import { settleWithRefusalScope } from './refusals.js';
 import { RunStepTagger, StepChannel, type RunStep, type ToolCallOutcome } from './steps.js';
@@ -665,12 +665,25 @@ export class AgentRuntime {
     // A turnId/actor-only context is METADATA: the run takes exactly the path
     // and budget it would take with no context at all.
     const execution = executionContext(context);
-    const binding = execution?.binding ?? null;
+    // A resume with no run tree handed in continues the run that paused: the
+    // agent's spend so far and, for a subagent's child run, the binding it ran
+    // under, both stored on the row that asked (G-321 E). Without them a child
+    // resumed outside the runner would resolve its model like a root run, and
+    // any pause would restart a spend ceiling at nothing.
+    const paused = prompt === '' && execution == null
+      ? pausedRunState((await session.thread().messages()).map(entry => entry.message))
+      : null;
+    const binding = execution?.binding ?? (paused?.binding == null ? null
+      : { session: paused.binding.session, declared: paused.binding.declared, parentMode: paused.binding.parent_mode });
     const provider = await this.#choose(session, mode, binding, 'provider');
     const model = await this.#choose(session, mode, binding, 'model');
     const runId = stepping?.runId ?? randomUUID();
     const tag = session.agent === null ? {} : { harnessAgent: session.agent };
-    const run = this.#boundedRun(session, execution ?? RunContext.root(runId, new RunBudget(mode.maxSteps)));
+    const run = this.#boundedRun(session, execution
+      ?? new RunContext(RunLedger.start(runId), new RunBudget(mode.maxSteps), null, 0, {}, binding));
+    if (session.agent !== null && paused?.agentSpend != null) {
+      run.ledger.carryAgentSpend(session.agent, paused.agentSpend.cost_usd, paused.agentSpend.unmetered_runs);
+    }
     const thread = session.thread();
     const steps = stepping?.tagger;
 
@@ -888,7 +901,24 @@ export class AgentRuntime {
         : (response.additionalContent as JsonObject | undefined);
 
       const row: JsonObject = assistantRow(response.text, toolCalls, metadata, requests);
-      if (requests.length > 0) row.harness_tool_names = offered.map(tool => tool.name);
+      if (requests.length > 0) {
+        row.harness_tool_names = offered.map(tool => tool.name);
+        // What the resume continues from (pausedRunState): the agent's spend
+        // so far, and a subagent child's model binding.
+        if (session.agent !== null) {
+          row.harness_agent_spend = {
+            cost_usd: run.ledger.agentCostUsd(session.agent),
+            unmetered_runs: run.ledger.agentUnmeteredRuns(session.agent),
+          };
+        }
+        if (run.binding !== null) {
+          row.harness_binding = {
+            session: { ...run.binding.session },
+            declared: { ...run.binding.declared },
+            parent_mode: { ...run.binding.parentMode },
+          };
+        }
+      }
       await thread.record([row], runId);
 
       if (failedFinish !== null) {
@@ -1109,7 +1139,9 @@ export class AgentRuntime {
     const assistant = view[index] as AssistantRow;
     const answered = view.slice(index + 1).find((row) => row.type === 'tool_result') as ToolResultRow | undefined;
     const results = new Map((answered?.tool_results ?? []).map((entry) => [entry.tool_call_id, entry]));
-    const decisions = new Map((answered?.tool_approval_responses ?? []).map((entry) => [entry.approval_id, entry]));
+    // From the stored rows, not the replay view: the FIRST answer to an
+    // approval is the answer, as the plan reads it too.
+    const decisions = turnDecisions(rows);
     const approvalIds = new Map(assistant.tool_approval_requests.map((request) => [request.tool_call_id, request.approval_id]));
 
     // A call that has a result is DONE, whatever its decision says. A call that
@@ -1287,7 +1319,7 @@ export async function recordApproval(
   approved: boolean,
   reason: string | null = null,
 ): Promise<void> {
-  await writeDecisions(session, [{ approvalId, approved, reason }]);
+  await writeDecisionsLocked(session, [{ approvalId, approved, reason }]);
 }
 
 /**
@@ -1298,7 +1330,18 @@ export async function recordApproval(
  * a call with no decision is refused when it does.
  */
 export async function recordDecisions(session: Session, decisions: readonly ApprovalDecision[]): Promise<void> {
-  await writeDecisions(session, assertDecisions(decisions));
+  await writeDecisionsLocked(session, assertDecisions(decisions));
+}
+
+/**
+ * The pending check and the write under the session lock, so two decisions
+ * for one id cannot both pass the check: the second waits, finds the id
+ * answered, and is refused with `approval_not_pending`. A caller that cannot
+ * get the lock gets `session_locked` and nothing is recorded.
+ * `streamDecision()` already holds this lock for its whole turn.
+ */
+async function writeDecisionsLocked(session: Session, decisions: readonly ApprovalDecision[]): Promise<void> {
+  await session.lock((live) => writeDecisions(live, decisions), RESOLUTION_LOCK_SECONDS, RESOLUTION_WAIT_SECONDS);
 }
 
 /**
@@ -1308,6 +1351,8 @@ export async function recordDecisions(session: Session, decisions: readonly Appr
  * id the run never issued, an id already answered, or the same id twice in one
  * batch refuses the WHOLE batch with `approval_not_pending`, before anything
  * is written and so before any tool or provider call.
+ *
+ * Call it holding the session lock: the check and the write are one step.
  */
 async function writeDecisions(session: Session, decisions: readonly ApprovalDecision[]): Promise<void> {
   const pending = new Set(pendingApprovalIds((await session.thread().messages()).map((entry) => entry.message)));

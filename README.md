@@ -223,7 +223,18 @@ second account. An agent at its ceiling is refused with
 `agent_spend_ceiling_exceeded`. If its provider reported no cost, it is refused
 with `budget_unpriced`, because the ceiling cannot be measured. A refused
 subagent returns to the parent as an `exhausted` result, and the parent keeps
-running. The ceiling covers one run tree; there is no per-day window.
+running.
+
+The ceiling covers one run tree; there is no per-day window. A run that pauses
+for an approval and is resumed (`send(session, '')` or `streamDecision()`) is
+the same run: the agent's spend so far is stored with the approval request and
+counts against the ceiling after the resume, as the step count does. A subagent's
+child run resumed that way, outside the runner, also keeps the provider and model
+it was bound to. Every other `send()` starts a new run tree with the full
+ceiling, and so does each `plan.advance()` called without a context. To hold
+the steps of a plan to one ceiling, pass the same `RunContext` to every
+`advance(context)`; that context's budget then bounds the whole plan, its step
+limit included.
 
 Every run event of a named agent carries `harnessAgent`. Legacy events do not.
 

@@ -166,6 +166,20 @@ export class RunLedger {
   }
 
   /**
+   * Charge what a named agent spent BEFORE an approval pause back to it, when
+   * the paused run resumes as a new tree (G-321 E). A run that pauses for a
+   * person and resumes is the same run, so its spend ceiling continues rather
+   * than starting again at nothing.
+   *
+   * The agent's account only: that spend was already reported by the run that
+   * paused, and counting it into this tree's total would report it twice.
+   */
+  carryAgentSpend(agent: string, usd: number, unmeteredRuns: number): void {
+    this.#agentCost.set(agent, (this.#agentCost.get(agent) ?? 0) + Math.max(0, usd));
+    if (unmeteredRuns > 0) this.#agentUnmetered.set(agent, (this.#agentUnmetered.get(agent) ?? 0) + unmeteredRuns);
+  }
+
+  /**
    * What one named agent has spent in this tree.
    *
    * A LABEL on the tree's own account, not a second account: the same charge

@@ -131,6 +131,10 @@ export function toolResultRow(
  * provider separately, a tool output would go twice. Folded, a result is keyed
  * by its tool call id and a decision by its approval id, and a later one
  * replaces an earlier one in the earlier one's position.
+ *
+ * This is the REPLAY view, pinned by the harness-thread-rows corpus. What a
+ * decision means for running a call is read from the stored rows instead, by
+ * `turnDecisions()`, where the first answer to an approval is the answer.
  */
 export function threadView(rows: readonly JsonObject[]): JsonObject[] {
   const view: JsonObject[] = [];
@@ -152,16 +156,37 @@ export function threadView(rows: readonly JsonObject[]): JsonObject[] {
   return view;
 }
 
+/**
+ * The decisions recorded for the turn being resumed (the last assistant row
+ * with tool calls), by approval id, read from the stored rows.
+ *
+ * An approval has ONE answer: the first one recorded. A second decision for
+ * the same id (two reviewers, a retry racing the original, a row written by
+ * hand) is never the one that counts, here or in the plan's reading of the
+ * thread, so what runs and what the plan records cannot disagree.
+ */
+export function turnDecisions(rows: readonly JsonObject[]): Map<string, ApprovalDecisionEntry> {
+  const decisions = new Map<string, ApprovalDecisionEntry>();
+  let start = rows.length;
+  while (start > 0 && !(rows[start - 1]!.type === 'assistant' && list(rows[start - 1]!.tool_calls).length > 0)) start -= 1;
+  if (start === 0) return decisions;
+
+  for (const row of rows.slice(start)) {
+    const answers = row.type === 'tool_result' ? list(row.tool_approval_responses)
+      : row.type === 'tool_approval_response' ? [row] : [];
+    for (const answer of answers) {
+      const entry = decision(answer);
+      if (!decisions.has(entry.approval_id)) decisions.set(entry.approval_id, entry);
+    }
+  }
+
+  return decisions;
+}
+
 /** Stored approval authority, kept separate from the provider replay view. */
 export function approvalToolScope(rows: readonly JsonObject[]): { names: string[]; legacy: boolean } | null {
-  const decisions = new Map<string, boolean>();
   for (const row of threadView(rows).reverse()) {
-    if (row.type === 'tool_result') {
-      for (const response of list(row.tool_approval_responses)) {
-        if (typeof response.approval_id === 'string' && !decisions.has(response.approval_id)) decisions.set(response.approval_id, response.approved === true);
-      }
-      continue;
-    }
+    if (row.type === 'tool_result') continue;
     if (row.type === 'user') return null;
     if (row.type !== 'assistant') continue;
     const requests = list(row.tool_approval_requests);
@@ -174,7 +199,8 @@ export function approvalToolScope(rows: readonly JsonObject[]): { names: string[
     if (Array.isArray(scope) && scope.every((name): name is string => typeof name === 'string' && name !== '' && name !== '*')) {
       return {names: [...new Set(scope)], legacy: false};
     }
-    const approvedCalls = new Set(requests.filter(request => typeof request.approval_id === 'string' && decisions.get(request.approval_id) === true)
+    const decisions = turnDecisions(rows);
+    const approvedCalls = new Set(requests.filter(request => typeof request.approval_id === 'string' && decisions.get(request.approval_id)?.approved === true)
       .map(request => request.tool_call_id));
     const names = list(row.tool_calls).filter(call => approvedCalls.has(call.id) && typeof call.name === 'string' && call.name !== '' && call.name !== '*')
       .map(call => call.name as string);
@@ -234,19 +260,74 @@ export function approvalRunSteps(rows: readonly JsonObject[]): number | null {
   return steps;
 }
 
+/** What a named agent had spent in its run tree when the run paused for a person. */
+export type PausedAgentSpend = { cost_usd: number; unmetered_runs: number };
+
+/** A subagent child run's model binding, as stored on the row it paused on. */
+export type PausedBinding = {
+  session: { provider: string | null; model: string | null };
+  declared: { provider: string | null; model: string | null };
+  parent_mode: { provider: string | null; model: string | null };
+};
+
+/**
+ * What the run paused at the transcript tail carries into its resume, or null
+ * when nothing at the tail is waiting on an approval: its named agent's spend
+ * (`harness_agent_spend`) and, for a subagent's child run, the provider and
+ * model binding it ran under (`harness_binding`). Both are written on the
+ * assistant row that asked for the approvals.
+ *
+ * A spend that is present but malformed is read as one call that reported no
+ * cost, so a spend ceiling refuses (`budget_unpriced`) rather than starting
+ * again from nothing. A malformed binding is read as none. A row written
+ * before these fields existed carries neither.
+ */
+export function pausedRunState(rows: readonly JsonObject[]): { agentSpend: PausedAgentSpend | null; binding: PausedBinding | null } | null {
+  if (approvalToolScope(rows) === null) return null;
+  const paused = [...rows].reverse().find((row) => row.type === 'assistant');
+  if (paused === undefined) return null;
+
+  let agentSpend: PausedAgentSpend | null = null;
+  if (paused.harness_agent_spend !== undefined) {
+    const spend = paused.harness_agent_spend;
+    const cost = isObject(spend) ? spend.cost_usd : undefined;
+    const unmetered = isObject(spend) ? spend.unmetered_runs : undefined;
+    agentSpend = typeof cost === 'number' && Number.isFinite(cost) && cost >= 0
+      && typeof unmetered === 'number' && Number.isSafeInteger(unmetered) && unmetered >= 0
+      ? { cost_usd: cost, unmetered_runs: unmetered }
+      : { cost_usd: 0, unmetered_runs: 1 };
+  }
+
+  return { agentSpend, binding: storedBinding(paused.harness_binding) };
+}
+
+function storedBinding(value: JsonValue | undefined): PausedBinding | null {
+  if (!isObject(value)) return null;
+  const choice = (entry: JsonValue | undefined): { provider: string | null; model: string | null } | null => {
+    if (!isObject(entry)) return null;
+    const valid = (field: JsonValue | undefined): field is string | null => field === null || (typeof field === 'string' && field !== '');
+    return valid(entry.provider) && valid(entry.model) ? { provider: entry.provider, model: entry.model } : null;
+  };
+  const session = choice(value.session), declared = choice(value.declared), parentMode = choice(value.parent_mode);
+
+  return session === null || declared === null || parentMode === null ? null : { session, declared, parent_mode: parentMode };
+}
+
 /**
  * The ids of stored calls whose arguments cannot be used. Read from the rows as
  * written, because the thread view has already replaced such arguments with
  * none, and an approved call must not run on an empty set nobody sent.
+ *
+ * Read from the one turn being resumed, the last assistant row with tool
+ * calls, never the whole thread: providers that number calls per response
+ * reuse ids, and an older turn's call must not decide a newer one.
  */
 export function unusableStoredCalls(rows: readonly JsonObject[]): Set<string> {
   const unusable = new Set<string>();
+  const turn = [...rows].reverse().find((row) => row.type === 'assistant' && list(row.tool_calls).length > 0);
 
-  for (const row of rows) {
-    if (row.type !== 'assistant') continue;
-    for (const call of list(row.tool_calls)) {
-      if (usableArguments(call.arguments) === null) unusable.add(text(call.id));
-    }
+  for (const call of list(turn?.tool_calls)) {
+    if (usableArguments(call.arguments) === null) unusable.add(text(call.id));
   }
 
   return unusable;
