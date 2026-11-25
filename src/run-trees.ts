@@ -105,6 +105,10 @@ export const RunTrees = {
    */
   contextKind(context: RunContext | null | undefined): RunContextKind {
     if (context == null) return 'none';
+    // The context the subagent runner built to start a child is the
+    // runner's, even under a run tree the host built: it spends from the
+    // tree it was derived from and never from a tree its session saved.
+    if (childContexts.has(context)) return 'runner';
     if (context.metadataOnly) return 'metadata';
 
     return runs.get(context.rootRunId)?.ledger === context.ledger ? 'runner' : 'host';
@@ -130,7 +134,7 @@ export const RunTrees = {
    * and binds itself is never the runner's.
    */
   bindingContextKind(context: RunContext | null | undefined): RunContextKind {
-    return context != null && childContexts.has(context) ? 'runner' : RunTrees.contextKind(context);
+    return RunTrees.contextKind(context);
   },
 
   /** The tree a run of this process belongs to, or null. */
