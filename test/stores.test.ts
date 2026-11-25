@@ -246,7 +246,12 @@ describe('file store: legacy timestamp files require explicit maintenance', () =
     await expect(store.withLock('k',()=>1,10,0)).rejects.toMatchObject({code:'session_locked'});
     const released={...JSON.parse(bytes.toString('utf8')),released:true};
     await writeFile(join(path,filename),JSON.stringify(released)+'\n');
-    expect(await store.withLock('k',()=>7,10,0.5)).toBe(7);
+    // Reclaiming deletes the record. On Windows another process (a scan, the
+    // indexer) can hold the file just written for a while, and the delete then
+    // fails until it lets go, so the wait is long enough for that and returns
+    // as soon as the reclaim succeeds. It is not a speed claim; see
+    // file-lock-transient-cleanup.test.ts for the held-handle case itself.
+    expect(await store.withLock('k',()=>7,10,10)).toBe(7);
   });
 });
 
