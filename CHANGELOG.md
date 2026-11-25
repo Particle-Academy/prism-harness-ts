@@ -20,6 +20,12 @@
   with `plan_budget_exhausted` before anything is recorded when the shared
   budget is spent, on every decision path, and the next `advance()` blocks
   the plan once, so an approval is never recorded and then never run.
+- A subagent tool built with `SubagentRunner.tool()` and called by a turn on
+  its parent session now runs its child in that turn's run tree, so the
+  child's spend counts against the turn's budget and a shared plan budget.
+  The run context the host built the tool with can only narrow the turn's
+  limits; before, the child spent from that context's own ledger, outside the
+  turn and outside the plan budget.
 
 - Agent plans (G-360), the port of the reference's: an agent drafts an ordered
   plan with `plan_draft`, a person approves it, and `session.plan().advance()`

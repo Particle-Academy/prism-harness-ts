@@ -236,6 +236,14 @@ the steps of a plan to one ceiling, pass the same `RunContext` to every
 `advance(context)`; that context's budget then bounds the whole plan, its step
 limit included.
 
+A subagent tool built with `SubagentRunner.tool(subagent, parent, context, parentRunId)`
+and called by a turn on `parent` runs its child in THAT turn's run tree: the
+child spends from the turn's ledger, so from the turn's budget and, for a plan
+step, from the plan's shared budget. The `context` it was built with can then
+only narrow the turn's limits, by what it has left; it never widens them and
+its own ledger is not charged. Called outside a turn, `context` is the run tree,
+as before.
+
 Every run event of a named agent carries `harnessAgent`. Legacy events do not.
 
 ## What your model client receives

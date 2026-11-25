@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { validateAgent } from './address.js';
 import type { JsonObject, JsonValue } from './json.js';
@@ -782,7 +783,11 @@ export class AgentRuntime {
         await thread.record([turn], runId);
       }
 
-      return await this.#loop(session, mode, run, runId, provider, model, offered, called, systemPrompt, schema, steps);
+      // The tools this turn calls run inside it: a subagent tool reads the
+      // turn's own run context from here (see activeTurn()).
+      const turn = run;
+      return await activeTurns.run({ sessionKey: session.key(), runId, run: turn },
+        () => this.#loop(session, mode, turn, runId, provider, model, offered, called, systemPrompt, schema, steps));
     } catch (error) {
       // THE MODEL'S OWN WORDS DO NOT BELONG IN A RUN ROW OR AN EVENT. A schema
       // violation names the values that missed, so its message carries pieces
@@ -1420,6 +1425,23 @@ function assertDecisions(decisions: unknown): ApprovalDecision[] {
 
     return { approvalId: candidate.approvalId, approved: candidate.approved, reason: candidate.reason ?? null };
   });
+}
+
+/** The turn whose tools are running, for the code those tools call. */
+const activeTurns = new AsyncLocalStorage<{ sessionKey: string; runId: string; run: RunContext }>();
+
+/**
+ * The run id and run context of the turn running on this session whose tool
+ * is executing now, or null outside one. A subagent the turn delegates to
+ * spends from this context's ledger, so from whatever the turn spends from:
+ * the run tree and, for a plan step, the plan's shared budget.
+ *
+ * @internal Read by SubagentRunner.
+ */
+export function activeTurn(sessionKey: string): { runId: string; run: RunContext } | null {
+  const turn = activeTurns.getStore();
+
+  return turn === undefined || turn.sessionKey !== sessionKey ? null : { runId: turn.runId, run: turn.run };
 }
 
 /** The context a run EXECUTES under: a metadata-only context states no run tree. */
