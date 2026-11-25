@@ -25,6 +25,8 @@ export type HarnessEvent =
   | RunResumed
   | RunFinished
   | RunFailed
+  | RunCancelRequested
+  | RunCancelled
   | RunStepped
   | ToolAutoAllowed
   | ToolApprovalAsked
@@ -162,6 +164,46 @@ export interface RunFailed extends HarnessAgentTag {
   /** Why it stopped: a budget reason, a cancellation, or a provider failure. */
   failure: string;
   steps: number;
+  at: string;
+}
+
+/**
+ * A person asked for a run to stop, and the flag is now durable (G-285).
+ *
+ * Emitted by `Session.cancel()` the moment the flag is written, in the process
+ * that wrote it, and always BEFORE the run's `run.cancelled`. The run may be
+ * executing in another process: it stops at its next step or tool, and that
+ * process emits `run.cancelled`. A tool call already running is not
+ * interrupted. The tags are the ones the run recorded when it began.
+ */
+export interface RunCancelRequested extends HarnessAgentTag {
+  type: 'run.cancel_requested';
+  runId: string;
+  sessionKey: string;
+  parentRunId: string | null;
+  rootRunId: string | null;
+  /** The ACP turn the run serves, when it serves one. */
+  turnId: string | null;
+  /** `running`: the run stops at its next check. `parked`: it was waiting on a person and is now settled. */
+  state: 'running' | 'parked';
+  at: string;
+}
+
+/**
+ * A run ended because a person cancelled it (G-285). Terminal: the run never
+ * resumes, and any approval it was waiting on reads as settled-cancelled.
+ *
+ * Emitted INSTEAD of `run.finished` or `run.failed`, never beside them, and
+ * always after its `run.cancel_requested`. A run inside a cancelled run tree
+ * (a subagent's child) ends with this event too.
+ */
+export interface RunCancelled extends HarnessAgentTag {
+  type: 'run.cancelled';
+  runId: string;
+  sessionKey: string;
+  parentRunId: string | null;
+  rootRunId: string | null;
+  turnId: string | null;
   at: string;
 }
 

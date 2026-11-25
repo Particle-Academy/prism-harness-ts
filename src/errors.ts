@@ -19,6 +19,12 @@ export type HarnessErrorCode =
   /** A run was refused — by budget, by depth, or by a cancelled ledger. */
   | 'run_not_permitted'
   /**
+   * A person cancelled this run, or the run tree it belongs to (G-285). Its
+   * own code: a stop someone asked for is not a spent budget, and a caller
+   * must never report it as one. The same code in the PHP reference.
+   */
+  | 'run_cancelled'
+  /**
    * A subagent child session has no saved provider and model binding, so it
    * may not run outside the subagent runner. The same code in the PHP reference.
    */
@@ -182,6 +188,11 @@ export class HarnessError extends Error {
 
   static runNotPermitted(reason: string): HarnessError {
     return new HarnessError('run_not_permitted', reason);
+  }
+
+  /** A person cancelled this run, or its run tree (G-285). */
+  static runCancelled(): HarnessError {
+    return new HarnessError('run_cancelled', 'This run may not proceed (run_cancelled): it was cancelled.');
   }
 
   /**
@@ -426,6 +437,14 @@ export class HarnessError extends Error {
     return new HarnessError(
       'approval_not_pending',
       `No pending approval has the id [${approvalId}]. It was never issued, or it has already been answered.`,
+    );
+  }
+
+  /** The approval belongs to a run a person cancelled: it is settled, and the run never resumes (G-285). */
+  static approvalCancelled(approvalId: string): HarnessError {
+    return new HarnessError(
+      'approval_not_pending',
+      `The approval [${approvalId}] is settled: the run that asked for it was cancelled.`,
     );
   }
 

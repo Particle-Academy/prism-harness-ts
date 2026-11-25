@@ -188,6 +188,8 @@ export const PlanMachine = {
   TOOLS: ['plan_draft', 'plan_complete_step', 'plan_pause_for_person', 'plan_propose_change'] as readonly string[],
   LIVE: ['proposed', 'active', 'waiting', 'blocked'] as readonly string[],
   TERMINAL: ['done', 'failed', 'skipped'] as readonly string[],
+  /** The reason a plan blocks when a person cancelled its step's run (G-285). resume() continues it. */
+  RUN_CANCELLED: 'run_cancelled',
 
   // -- Drafting ---------------------------------------------------------------
 
@@ -392,9 +394,16 @@ export const PlanMachine = {
    * Settle the previous head from persisted state, check the limits, and
    * choose what happens next.
    */
-  prepare(original: Plan, runFailed: boolean, limits: PlanLimits, now: number, runId: string | null, budgetExhausted = false): [Plan, PrepareOutcome] {
+  prepare(original: Plan, runFailed: boolean, limits: PlanLimits, now: number, runId: string | null, budgetExhausted = false, runCancelled = false): [Plan, PrepareOutcome] {
     if (original.status !== 'active') return [original, ['not_active', original.status]];
-    let plan = settle(copy(original), runFailed, limits);
+    // G-285: the head step's own turn was cancelled by a person. The step
+    // goes back to todo and the plan stops, once: the next advance does not
+    // quietly start a new run the person just asked to stop.
+    const running = headIndex(original);
+    const cancelledTurn = runCancelled && running !== null && original.steps[running]!.owner === 'agent'
+      && original.steps[running]!.state === 'running';
+    let plan = settle(copy(original), runFailed || runCancelled, limits);
+    if (cancelledTurn && plan.status === 'active') plan = block(plan, PlanMachine.RUN_CANCELLED);
 
     const head = headIndex(plan);
     let outcome: PrepareOutcome;

@@ -89,6 +89,8 @@ export class SubagentRunner {
 
     // Checked BEFORE spawning, so an exhausted tree does not pay for a session,
     // a thread write and a provider call to discover it is exhausted.
+    // A person's cancel of any run on the tree (G-285) is read first.
+    await context.ledger.cancelRequested();
     const stop = context.ledger.exhaustion(context.budget);
 
     if (stop !== null) {
@@ -159,12 +161,14 @@ export class SubagentRunner {
       // the parent does not retry it.
       const ceiling = error instanceof HarnessError
         && (error.code === 'agent_spend_ceiling_exceeded' || error.code === 'budget_unpriced');
+      // A child a person's cancel stopped (G-285) was stopped, not broken.
+      const cancelled = error instanceof HarnessError && error.code === 'run_cancelled';
 
       return refused(
         subagent.name,
         runId,
         parentRunId,
-        ceiling ? 'exhausted' : 'failed',
+        cancelled ? 'cancelled' : ceiling ? 'exhausted' : 'failed',
         error instanceof Error ? error.message : String(error),
       );
     }

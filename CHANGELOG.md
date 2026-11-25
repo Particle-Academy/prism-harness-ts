@@ -4,6 +4,22 @@
 
 ### Added
 
+- Durable cross-process cancel (G-285). `session.cancel(runId)` writes a cancel
+  flag to the session's durable store and returns a `CancelOutcome` (`ok`,
+  `not-running`, `no-turn`, `unsupported` or `refused`). The run checks it
+  before every model step and before every tool call, lets a call already
+  running finish, refuses the next with `Not run: the run was cancelled.`, ends
+  `cancelled` and rejects with `run_cancelled`. A cancel racing the last step
+  still ends the run `cancelled` (with `ended_as`). A run parked on an approval
+  is settled at once: `session.approvalStatus(id)` reads `cancelled`, every
+  decision path is refused with `approval_not_pending`, and an empty-prompt
+  resume is refused. The whole run tree stops, and a plan whose step turn was
+  cancelled is blocked with `run_cancelled`. New events `run.cancel_requested`
+  and `run.cancelled` (instead of `run.finished` / `run.failed`). The run state
+  now records `parent_run_id`, `root_run_id`, `turn_id`, a bounded
+  `run_history`, and `parked_at` on a run that stops on an approval. See the
+  README's "Cancelling a run".
+
 - Plan budgets (G-366): the plans config's `budget.mode` is `per_step` (the
   default, unchanged behaviour), `shared` (one ledger of `max_steps` model
   steps and optionally `max_cost_usd` across the plan's own turns, kept in

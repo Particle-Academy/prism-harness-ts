@@ -404,6 +404,60 @@ answered, and refuse the whole batch when any one decision is like that. Nothing
 is written and nothing is sent, so a made-up id cannot cancel a real one, and a
 decision with nothing pending starts no model turn.
 
+## Cancelling a run
+
+A run executing in one process can be stopped from another: a web request
+stopping a run in a queue worker.
+
+```ts
+import type { CancelOutcome } from '@particle-academy/prism-harness';
+
+// In the web request, after YOUR authorization check:
+const outcome: CancelOutcome = await session.cancel(runId); // 'ok' | 'not-running' | 'no-turn' | 'unsupported' | 'refused'
+```
+
+- **The flag is durable.** `cancel()` writes it to the session's durable store,
+  so the process running the run reads it at its next check. Nothing in memory
+  is shared.
+- **Where it is checked.** Before every model step and before every tool call,
+  including each call of a step that makes several. A tool call that is already
+  running is **not interrupted**: it finishes, its result is recorded, and the
+  next tool is refused with `Not run: the run was cancelled.` (a refused result
+  in run steps). The run then ends `cancelled`, and `send()`, `sendStructured()`
+  and `streamSteps()` reject with a `HarnessError` coded `run_cancelled`. A
+  cancel that lands during the run's last model call still ends the run
+  `cancelled`, with `ended_as` recording what it would otherwise have ended as;
+  the answer that call produced is kept in the thread.
+- **Events.** `run.cancel_requested` is emitted the moment the flag is written,
+  in the process that wrote it, with `state` `running` or `parked`.
+  `run.cancelled` is emitted when the run stops, instead of `run.finished` or
+  `run.failed`. Both carry the run's `runId`, `sessionKey`, `parentRunId`,
+  `rootRunId`, `turnId` and, for a named agent, `harnessAgent`.
+- **A run parked on an approval** is cancelled at once. Its approvals read
+  `await session.approvalStatus(id) === 'cancelled'`, never `pending`, and
+  `recordApproval()`, `recordDecisions()`, `runtime.decide()` and
+  `streamDecision()` reject with `approval_not_pending` for them. A cancelled
+  run never resumes: an empty-prompt turn that would continue it rejects with
+  `run_cancelled` before it begins. `approvalStatus()` returns `pending`,
+  `approved`, `denied`, `cancelled`, `superseded` (never decided, and a later
+  turn ended it) or `unknown` (this thread never issued it).
+- **The whole tree stops.** Cancelling a run stops the run tree it belongs to:
+  its subagents' child runs end `cancelled` too, and the parent takes no further
+  step. A plan whose step turn was cancelled is blocked with `run_cancelled`,
+  and `resume()` continues it with a new run.
+- **The outcome.** `ok`: the flag is set. `not-running`: one of this session's
+  runs that has already ended (the session remembers its last 20); nothing
+  changed, and cancelling twice is `ok` then `not-running` once the run has
+  stopped. `no-turn`: the session has no run. `unsupported`: the session was
+  built without a runtime, or its lock store cannot lock. `refused`: the id is
+  not one of this session's runs, whether malformed, made up or another
+  session's. Run ids are matched exactly, with nothing trimmed.
+
+**Who may cancel is your decision.** The session is scoped to a participant, so
+nobody can cancel another participant's run through it, but whether this user
+may stop THIS run is a question only your application can answer. Authorize
+before calling, as for `recordApproval()`.
+
 ## Run steps for a UI
 
 `streamSteps()` takes the same arguments as `send()` and yields run steps as the

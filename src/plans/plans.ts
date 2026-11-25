@@ -761,8 +761,8 @@ export class PlanHandle {
       try {
         response = await runtime.send(this.session, prompt(step), undefined, context);
       } catch (error) {
-        const stopped = error instanceof HarnessError && error.code === 'run_not_permitted' || error instanceof HarnessError && error.code === PLAN_BUDGET_EXHAUSTED
-          ? await this.#stoppedOnBudget() : null;
+        const stopped = await this.#stoppedOnCancel(error) ?? (error instanceof HarnessError && error.code === 'run_not_permitted' || error instanceof HarnessError && error.code === PLAN_BUDGET_EXHAUSTED
+          ? await this.#stoppedOnBudget() : null);
         if (stopped === null) throw error;
 
         return stopped;
@@ -797,8 +797,8 @@ export class PlanHandle {
           try {
             next = await stream.next();
           } catch (error) {
-            const stopped = error instanceof HarnessError && (error.code === 'run_not_permitted' || error.code === PLAN_BUDGET_EXHAUSTED)
-              ? await this.#stoppedOnBudget() : null;
+            const stopped = await this.#stoppedOnCancel(error) ?? (error instanceof HarnessError && (error.code === 'run_not_permitted' || error.code === PLAN_BUDGET_EXHAUSTED)
+              ? await this.#stoppedOnBudget() : null);
             if (stopped === null) throw error;
 
             return stopped;
@@ -887,6 +887,17 @@ export class PlanHandle {
     return runtime;
   }
 
+  /**
+   * A turn a person cancelled (G-285) stops the plan: prepare settles the step
+   * back to todo and blocks the plan with `run_cancelled`, so the next advance
+   * does not start the run again. Null for any other failure.
+   */
+  async #stoppedOnCancel(error: unknown): Promise<AdvanceOutcome | null> {
+    if (!(error instanceof HarnessError) || error.code !== 'run_cancelled') return null;
+
+    return (await this.#prepare())[0];
+  }
+
   /** A turn refused because the plan's shared budget is spent stops the plan cleanly; null when the budget is not what stopped it. */
   async #stoppedOnBudget(): Promise<AdvanceOutcome | null> {
     const plan = await this.plans.load(this.session);
@@ -901,9 +912,11 @@ export class PlanHandle {
     if (plan === null) return [new AdvanceOutcome('not_active', null), null];
     const run = await this.session.run();
     const runFailed = run !== null && run.status === 'failed';
+    // A run a person cancelled, in this process or another (G-285).
+    const runCancelled = run !== null && run.status === 'cancelled';
     const now = this.plans.now();
     const spent = plan.status === 'active' ? await this.plans.budgetExhaustion(this.session, plan.id) : null;
-    const [next, [kind, value]] = PlanMachine.prepare(plan, runFailed, this.plans.limits(), now, null, spent !== null);
+    const [next, [kind, value]] = PlanMachine.prepare(plan, runFailed, this.plans.limits(), now, null, spent !== null, runCancelled);
     if (JSON.stringify(next) !== JSON.stringify(plan)) await this.plans.write(this.session, next, plan.revision);
     if (kind === 'blocked' && value === PLAN_BUDGET_EXHAUSTED) await this.plans.announceBudgetExhausted(this.session, plan.id, String(spent));
     if (kind !== 'run') {

@@ -114,6 +114,20 @@ export class RunLedger {
 
   #cancelReason: string | null = null;
 
+  /**
+   * The reason a ledger stopped by a person's cancel carries (G-285), so a
+   * cancel is never confused with a spent budget.
+   */
+  static readonly CANCELLED = 'run cancelled';
+
+  /**
+   * Durable cancel flags this tree watches, one per run executing on it in
+   * this process (G-285). Not part of any snapshot: each reads the store.
+   */
+  readonly #cancelProbes = new Map<number, () => Promise<boolean>>();
+
+  #probeSequence = 0;
+
   constructor(
     readonly rootRunId: string,
     private readonly startedAt: number = Date.now(),
@@ -234,6 +248,40 @@ export class RunLedger {
 
   get cancelled(): boolean {
     return this.#cancelled;
+  }
+
+  /**
+   * Watch a run's durable cancel flag (G-285). Every check this tree makes
+   * before a step, a tool or a child reads it; once one reads true the tree
+   * is cancelled, for every run on it, and stays cancelled. Returns the
+   * unwatch, called when that run ends.
+   *
+   * @internal Registered by the runtime for each run it executes.
+   */
+  watchCancel(probe: () => Promise<boolean>): () => void {
+    const id = ++this.#probeSequence;
+    this.#cancelProbes.set(id, probe);
+
+    return () => { this.#cancelProbes.delete(id); };
+  }
+
+  /**
+   * Whether a person cancelled this tree (G-285), reading every watched flag
+   * now. A budget stop, or a host's own `cancel()`, is not a person's cancel
+   * and never reads as one.
+   */
+  async cancelRequested(): Promise<boolean> {
+    if (this.#cancelled) return this.#cancelReason === RunLedger.CANCELLED;
+    for (const probe of [...this.#cancelProbes.values()]) {
+      if (await probe()) {
+        // Sticky: set by whichever check saw it first, for the whole tree.
+        if (!this.#cancelled) this.cancel(RunLedger.CANCELLED);
+
+        return this.#cancelReason === RunLedger.CANCELLED;
+      }
+    }
+
+    return false;
   }
 
   get cancelReason(): string | null {

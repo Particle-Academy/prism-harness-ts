@@ -15,7 +15,7 @@ export { SessionStoreManager, SLOT_DURABLE, SLOT_EPHEMERAL } from './stores/stor
 export type { StoreFactory, StoreManagerOptions } from './stores/store-manager.js';
 
 export { Session } from './session.js';
-export type { Participant, RunState, SessionOptions } from './session.js';
+export type { ApprovalStatus, CancelOutcome, Participant, RunState, SessionOptions } from './session.js';
 
 export { Thread } from './thread.js';
 export type { ThreadMessage } from './thread.js';
@@ -48,6 +48,8 @@ export type {
   HarnessAgentTag,
   HarnessEvent,
   HarnessListener,
+  RunCancelRequested,
+  RunCancelled,
   RunFailed,
   RunFinished,
   RunResumed,

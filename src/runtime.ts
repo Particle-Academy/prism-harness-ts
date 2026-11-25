@@ -21,7 +21,7 @@ import {
 import { usableArguments } from './tool-arguments.js';
 import { admitAttachments } from './attachments.js';
 import { HarnessError } from './errors.js';
-import type { HarnessEvents, ToolDecisionEvent } from './events.js';
+import type { HarnessEvent, HarnessEvents, ToolDecisionEvent } from './events.js';
 import { ToolPolicy, argsDigest } from './tool-policy.js';
 import type { AgentMode, ModeRegistry } from './modes.js';
 import type { ChildRefs, Session } from './session.js';
@@ -201,6 +201,9 @@ interface Invoked {
 
 const REFUSED_CALL: ToolCallOutcome = { ok: false, code: 'tool_call_refused', refused: true };
 
+/** What a tool call a person's cancel stopped records instead of running (G-285). The same words in every port. */
+export const CANCELLED_TOOL_RESULT = 'Not run: the run was cancelled.';
+
 function approvalExpired(tool: string): string {
   return `Not run: the approval for ${tool} was recorded by an earlier version and has expired. `
     + 'Call the tool again if it is still needed, and the person will be asked to approve it again.';
@@ -291,6 +294,30 @@ export class AgentRuntime {
     }));
     validateRuntimeConfig(this.#config);
     this.#toolPolicy = this.#admitPolicy(options.toolPolicy ?? ToolPolicy.none());
+  }
+
+  /**
+   * Deliver an event on this runtime's listeners.
+   *
+   * @internal Used by `Session.cancel()`, which announces a cancel in the
+   * process that wrote it (G-285).
+   */
+  announce(event: HarnessEvent): void {
+    this.#events?.emit(event);
+  }
+
+  /** `run.cancelled`, with the run's tags, INSTEAD of `run.finished` or `run.failed` (G-285). */
+  #announceCancelled(session: Session, runId: string, run: RunContext, turnId: string | null): void {
+    this.#events?.emit({
+      type: 'run.cancelled',
+      runId,
+      sessionKey: session.key(),
+      parentRunId: run.parentRunId,
+      rootRunId: run.rootRunId,
+      turnId,
+      at: new Date().toISOString(),
+      ...(session.agent === null ? {} : { harnessAgent: session.agent }),
+    });
   }
 
   /** The host tool policy in force. */
@@ -610,7 +637,7 @@ export class AgentRuntime {
   async #parkedRun(session: Session): Promise<{ id: string; lastSeq: number } | null> {
     const run = await session.run();
 
-    if (run === null || run.status === 'failed') return null;
+    if (run === null || run.status === 'failed' || run.status === 'cancelled') return null;
 
     const entries = await session.thread().messages();
 
@@ -693,6 +720,15 @@ export class AgentRuntime {
     // Refused before a run exists: a bad attachment is a mistake in the call,
     // and it should not cost a run, events or budget.
     const attachments = admitAttachments(prompt, additionalContent);
+    // A cancelled run never resumes (G-285): refused before it begins.
+    if (await session.resumesCancelledRun(prompt)) throw HarnessError.runCancelled();
+    // The parked run an empty-prompt turn continues, read before this run
+    // begins: a cancel written for it while this turn waited on the session
+    // lock must stop this turn too. Only a run still parked (a parked run in
+    // this port reads `running`): a run that already ended, a cancelled one
+    // included, is not continued, and its flag must not stop a new turn.
+    const prior = prompt === '' ? await session.run() : null;
+    const resumedFrom = prior?.status === 'running' ? prior.id : null;
     const mode = this.#modes.forAgent(session.agent).resolve(await session.mode());
     // A turnId/actor-only context is METADATA: the run takes exactly the path
     // and budget it would take with no context at all.
@@ -752,7 +788,8 @@ export class AgentRuntime {
 
     steps?.bind(session.key(), runId, run.parentRunId, run.rootRunId, session.agent);
     const unwatchPlan = steps !== undefined && stepping?.watchPlan === true ? await this.#watchPlan(session, steps) : () => {};
-    await session.beginRun(runId, mode.name, provider, model);
+    await session.beginRun(runId, mode.name, provider, model, { parentRunId: run.parentRunId, rootRunId: run.rootRunId, turnId: context?.turnId ?? null });
+    let unwatchCancel = (): void => {};
     this.#events?.emit({
       // A parked run continued under its own id has already STARTED once; a
       // second run.started for it would read as a new run.
@@ -816,6 +853,11 @@ export class AgentRuntime {
       // G-366: a turn serving a plan step with a shared budget holds what the
       // plan has left, after the paused steps it continues are counted.
       if (plans !== null) run = await plans.planTurn(session, runId, run, context, prompt);
+      // G-285: this run watches its durable cancel flag on its tree's ledger,
+      // and the flag of the parked run it continues, for as long as it runs.
+      unwatchCancel = run.ledger.watchCancel(async () => await session.cancelRequestedFor(runId)
+        || (resumedFrom !== null && resumedFrom !== runId && await session.cancelRequestedFor(resumedFrom)));
+      const cancelRequested = (): Promise<boolean> => run.ledger.cancelRequested();
       if (scope !== null) {
         if (scope.legacy) console.warn('Pending approval has no valid stored tool scope; offering approved requests only.');
         offered = offered.filter(tool => scope.names.includes(tool.name)
@@ -826,7 +868,7 @@ export class AgentRuntime {
       // Decisions recorded since the run stopped are acted on FIRST, before a
       // new prompt is recorded, so the results land after the calls they answer
       // rather than after the new turn.
-      offered = await this.#resolveApprovals(session, mode, offered, runId, called, scope?.legacy === true, steps, stepping?.locked === true);
+      offered = await this.#resolveApprovals(session, mode, offered, runId, called, scope?.legacy === true, cancelRequested, steps, stepping?.locked === true);
 
       if (prompt !== '') {
         // With attachments, the shape prism-ts's UserMessage.toObject() writes:
@@ -846,6 +888,14 @@ export class AgentRuntime {
       return await activeTurns.run({ sessionKey: session.key(), runId, run: turn },
         () => this.#loop(session, mode, turn, runId, provider, model, offered, called, systemPrompt, schema, steps));
     } catch (error) {
+      // G-285: a person's cancel ends the run `cancelled`, with run.cancelled
+      // INSTEAD of run.failed.
+      if (error instanceof HarnessError && error.code === 'run_cancelled') {
+        if (!(await session.runWasCancelled(runId))) await session.cancelRun(runId);
+        this.#announceCancelled(session, runId, run, context?.turnId ?? null);
+
+        throw error;
+      }
       // THE MODEL'S OWN WORDS DO NOT BELONG IN A RUN ROW OR AN EVENT. A schema
       // violation names the values that missed, so its message carries pieces
       // of the document — and an event carrying those would put model output in
@@ -861,6 +911,12 @@ export class AgentRuntime {
             : String(error);
 
       await session.failRun(runId, failure);
+      // A cancel set before the run's end turns it cancelled (Session.failRun).
+      if (await session.runWasCancelled(runId)) {
+        this.#announceCancelled(session, runId, run, context?.turnId ?? null);
+
+        throw error;
+      }
       this.#events?.emit({
         type: 'run.failed',
         runId,
@@ -873,6 +929,7 @@ export class AgentRuntime {
 
       throw error;
     } finally {
+      unwatchCancel();
       unwatchPlan();
       this.#childRefs.delete(runId);
       // A root run that holds part of a run tree's budget settles it.
@@ -899,6 +956,10 @@ export class AgentRuntime {
     let finishReason = 'stop';
 
     for (;;) {
+      // G-285: a person's cancel, from this process or another, is read
+      // before every model step.
+      if (await run.ledger.cancelRequested()) throw HarnessError.runCancelled();
+
       // BEFORE the step, never after. Checking afterwards means the step that
       // broke the limit has already been paid for.
       const exhausted = run.ledger.exhaustion(run.budget);
@@ -1048,6 +1109,15 @@ export class AgentRuntime {
       for (const call of gated) this.#toolDecision('tool_approval_asked', session, runId, call, offered.find((tool) => tool.name === call.name), 'person');
 
       for (const call of toolCalls.filter((candidate) => !gated.includes(candidate))) {
+        // G-285: read immediately before each call, so a cancel during one
+        // call refuses the next one in the same step. A call already running
+        // is never interrupted.
+        if (await run.ledger.cancelRequested()) {
+          const entry = toolResultEntry(call, CANCELLED_TOOL_RESULT);
+          steps?.toolResult(call.id, entry.result, REFUSED_CALL);
+          results.push(entry);
+          continue;
+        }
         if (unusable.has(call)) {
           const entry = toolResultEntry(call, `Not run: the arguments for ${call.name} are not a JSON object.`);
           steps?.toolResult(call.id, entry.result, { ok: false, code: 'tool_failed', refused: false });
@@ -1083,6 +1153,11 @@ export class AgentRuntime {
       steps?.stepFinish(response.text);
 
       if (requests.length > 0) {
+        // G-285: a run a person cancelled does not park; it ends cancelled.
+        // Parking is recorded under the cancel lock, so a cancel racing it
+        // either sees a parked run or is seen here.
+        if (await run.ledger.cancelRequested() || !(await session.parkRun(runId))) throw HarnessError.runCancelled();
+
         // G-360: the run stops here for a person; a plan binds the approvals
         // this turn staged, as it does when a run finishes.
         await session.planService()?.afterTurn(session);
@@ -1130,6 +1205,7 @@ export class AgentRuntime {
     runId: string,
     called: string[],
     legacyDiagnosticEmitted: boolean,
+    cancelRequested: () => Promise<boolean>,
     steps?: RunStepTagger,
     alreadyLocked = false,
   ): Promise<HarnessTool[]> {
@@ -1161,7 +1237,12 @@ export class AgentRuntime {
         const decision = approvalId === undefined ? undefined : work.decisions.get(approvalId);
 
         const declared = bounded.find((tool) => tool.name === call.name);
-        if (decision?.approved === true && work.unusable.has(call.id)) {
+        if (decision?.approved === true && await cancelRequested()) {
+          // G-285: an approved call is still a call, and a cancel refuses it.
+          const entry = toolResultEntry(input, CANCELLED_TOOL_RESULT);
+          steps?.toolResult(call.id, entry.result, REFUSED_CALL);
+          resolved.push(entry);
+        } else if (decision?.approved === true && work.unusable.has(call.id)) {
           const entry = toolResultEntry(input, `Not run: the arguments for ${call.name} are not a JSON object.`);
           steps?.toolResult(call.id, entry.result, { ok: false, code: 'tool_failed', refused: false });
           resolved.push(entry);
@@ -1336,6 +1417,9 @@ export class AgentRuntime {
     stoppedBecause: string | null,
   ): Promise<AgentResponse> {
     await session.completeRun(runId, finishReason, called);
+    // G-285: a cancel set before the run's end turned it cancelled; the
+    // caller's catch announces it instead of run.finished.
+    if (await session.runWasCancelled(runId)) throw HarnessError.runCancelled();
     this.#events?.emit({
       type: 'run.finished',
       runId,
@@ -1453,6 +1537,8 @@ async function writeDecisions(session: Session, decisions: readonly ApprovalDeci
   const pending = new Set(pendingApprovalIds(rows));
   for (const decision of decisions) {
     if (!pending.delete(decision.approvalId)) throw HarnessError.approvalNotPending(decision.approvalId);
+    // Settled-cancelled, never pending: a cancelled run never resumes (G-285).
+    if (await session.approvalCancelled(decision.approvalId)) throw HarnessError.approvalCancelled(decision.approvalId);
   }
   // A decision a spent shared plan budget could not run is refused here, with
   // nothing recorded, rather than consumed by a resume the budget then
