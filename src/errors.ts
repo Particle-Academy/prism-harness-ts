@@ -18,6 +18,11 @@ export type HarnessErrorCode =
   | 'tool_not_available'
   /** A run was refused — by budget, by depth, or by a cancelled ledger. */
   | 'run_not_permitted'
+  /**
+   * A subagent child session has no saved provider and model binding, so it
+   * may not run outside the subagent runner. The same code in the PHP reference.
+   */
+  | 'child_binding_missing'
   /** A plan's shared budget is spent (G-366). The same code in the PHP reference and the Python port. */
   | 'plan_budget_exhausted'
   /** A model returned a terminal error/unknown finish; its tools must not run. */
@@ -177,6 +182,18 @@ export class HarnessError extends Error {
 
   static runNotPermitted(reason: string): HarnessError {
     return new HarnessError('run_not_permitted', reason);
+  }
+
+  /**
+   * A subagent child session has no saved provider and model binding. Running
+   * it on the root rules would send the child's conversation to a provider its
+   * declaration did not choose, so it is refused instead.
+   */
+  static childBindingMissing(): HarnessError {
+    return new HarnessError(
+      'child_binding_missing',
+      'This subagent child session has no saved provider and model binding, so it may not run outside the subagent runner.',
+    );
   }
 
   static modelStepFailed(finishReason: 'error' | 'unknown'): HarnessError {

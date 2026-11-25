@@ -6,6 +6,8 @@ import type { SessionStore } from './stores/session-store.js';
 import { StoreTaskSource } from './store-task-source.js';
 import type { StoreTaskSourceOptions } from './store-task-source.js';
 import { Thread } from './thread.js';
+import { storedBinding } from './thread-rows.js';
+import type { ModelBinding } from './subagents.js';
 import type { AgentRuntime } from './runtime.js';
 import { PlansDisabled } from './plans/refusal.js';
 import type { PlanHandle, Plans } from './plans/plans.js';
@@ -280,6 +282,42 @@ export class Session {
       tree: pair(refs.tree, 'session', 'run') as ChildRefs['tree'],
       planLedger: pair(refs.plan_ledger, 'session', 'plan') as ChildRefs['planLedger'],
     };
+  }
+
+  /**
+   * The provider and model binding the subagent runner gave this session's
+   * child runs, or null for a session the runner never started (or one
+   * started before the binding was kept here).
+   *
+   * Kept in the DURABLE half, beside the thread and its pending approvals: a
+   * child is resumed by a person answering one of those approvals, or sent a
+   * new message, long after the ephemeral half may have expired. Every turn
+   * on the child the runner does not start resolves its provider and model
+   * from this, never from the child's own override slot.
+   *
+   * @internal Read by the runtime.
+   */
+  async childBinding(): Promise<ModelBinding | null> {
+    const stored = (await this.#durable.get(this.#durableKey())) ?? {};
+    const binding = storedBinding(stored.child_binding);
+
+    return binding === null ? null : { session: binding.session, declared: binding.declared, parentMode: binding.parent_mode };
+  }
+
+  /** @internal Written by the runtime when the subagent runner starts a child run. */
+  async rememberChildBinding(binding: ModelBinding): Promise<this> {
+    this.#assertWritable();
+    const stored = (await this.#durable.get(this.#durableKey())) ?? {};
+    await this.#durable.put(this.#durableKey(), {
+      ...stored,
+      child_binding: {
+        session: { ...binding.session },
+        declared: { ...binding.declared },
+        parent_mode: { ...binding.parentMode },
+      },
+    });
+
+    return this;
   }
 
   /** @internal Written by the runtime when the subagent runner starts a child run. */

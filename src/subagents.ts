@@ -495,6 +495,11 @@ export class RunContext {
     return new RunContext(this.ledger, budget, this.parentRunId, this.depth, { turnId: this.turnId, actor: this.actor, metadataOnly: this.metadataOnly }, this.binding);
   }
 
+  /** The same run under another model binding, keeping its tree, budget and metadata. */
+  withBinding(binding: ModelBinding | null): RunContext {
+    return new RunContext(this.ledger, this.budget, this.parentRunId, this.depth, { turnId: this.turnId, actor: this.actor, metadataOnly: this.metadataOnly }, binding);
+  }
+
   get rootRunId(): string {
     return this.ledger.rootRunId;
   }
