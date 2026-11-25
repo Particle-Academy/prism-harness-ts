@@ -714,14 +714,29 @@ export class AgentRuntime {
     const paused = prompt === '' && execution == null ? tail : null;
     const savedRefs: ChildRefs | null = contextKind === 'runner' ? null
       : (await session.childRefs()) ?? { tree: tail?.tree ?? null, planLedger: tail?.planLedger ?? null };
-    const binding = execution?.binding ?? (paused?.binding == null ? null
-      : { session: paused.binding.session, declared: paused.binding.declared, parentMode: paused.binding.parent_mode });
+    // The binding: from the runner's own context when the runner starts the
+    // child; otherwise the one SAVED with the child session, which a context
+    // the host supplies never replaces. A child paused before the binding was
+    // saved there carries it on its paused row. A session the runner started
+    // as a child (it has saved run tree references) with no binding anywhere
+    // is refused rather than run on the root rules, which would send the
+    // child's conversation to a provider nobody chose for it.
+    const runnerBinding = contextKind === 'runner' ? execution?.binding ?? null : null;
+    const legacyBinding = tail?.binding == null ? null
+      : { session: tail.binding.session, declared: tail.binding.declared, parentMode: tail.binding.parent_mode };
+    const savedBinding = runnerBinding !== null ? null : (await session.childBinding()) ?? legacyBinding;
+    const isChild = savedBinding !== null || (await session.childRefs()) !== null;
+    if (runnerBinding === null && savedBinding === null && isChild) throw HarnessError.childBindingMissing();
+    // A host context on a session that was never a child keeps the binding it
+    // states for this turn; it is never saved.
+    const binding = runnerBinding ?? savedBinding ?? (isChild ? null : execution?.binding ?? null);
     const provider = await this.#choose(session, mode, binding, 'provider');
     const model = await this.#choose(session, mode, binding, 'model');
     const runId = stepping?.runId ?? randomUUID();
     const tag = session.agent === null ? {} : { harnessAgent: session.agent };
-    let run = this.#boundedRun(session, execution
-      ?? new RunContext(RunLedger.start(runId), new RunBudget(mode.maxSteps), null, 0, {}, binding));
+    let run = this.#boundedRun(session, execution === null || execution === undefined
+      ? new RunContext(RunLedger.start(runId), new RunBudget(mode.maxSteps), null, 0, {}, binding)
+      : (execution.binding === binding ? execution : execution.withBinding(binding)));
     if (session.agent !== null && paused?.agentSpend != null) {
       run.ledger.carryAgentSpend(session.agent, paused.agentSpend.cost_usd, paused.agentSpend.unmetered_runs);
     }
@@ -787,12 +802,15 @@ export class AgentRuntime {
       // not start: the run tree it belongs to and the shared plan budget that
       // tree spends from, kept on the session and on the row it pauses on.
       if (run.binding !== null) {
-        const refs: ChildRefs = execution?.binding != null
+        // Only the runner's own context writes them: a context the host
+        // supplies never replaces the tree or the binding the child saved.
+        const refs: ChildRefs = runnerBinding !== null && execution != null
           ? { tree: await RunTrees.childStarted(session, execution), planLedger: plans?.ledgerOf(execution.rootRunId) ?? null }
           : { tree: RunTrees.treeOf(runId), planLedger: savedRefs?.planLedger ?? null };
         this.#childRefs.set(runId, refs);
-        if (execution?.binding != null && JSON.stringify(await session.childRefs()) !== JSON.stringify(refs)) {
-          await session.rememberChildRefs(refs);
+        if (runnerBinding !== null) {
+          if (JSON.stringify(await session.childBinding()) !== JSON.stringify(runnerBinding)) await session.rememberChildBinding(runnerBinding);
+          if (JSON.stringify(await session.childRefs()) !== JSON.stringify(refs)) await session.rememberChildRefs(refs);
         }
       }
       // G-366: a turn serving a plan step with a shared budget holds what the

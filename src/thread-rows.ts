@@ -338,7 +338,8 @@ function storedPair(value: JsonValue | undefined, first: string, second: string)
   return typeof a === 'string' && a !== '' && typeof b === 'string' && b !== '' ? { [first]: a, [second]: b } : null;
 }
 
-function storedBinding(value: JsonValue | undefined): PausedBinding | null {
+/** A stored model binding (`{session, declared, parent_mode}`), or null when absent or malformed. @internal */
+export function storedBinding(value: JsonValue | undefined): PausedBinding | null {
   if (!isObject(value)) return null;
   const choice = (entry: JsonValue | undefined): { provider: string | null; model: string | null } | null => {
     if (!isObject(entry)) return null;
