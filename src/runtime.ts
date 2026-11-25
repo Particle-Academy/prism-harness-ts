@@ -24,7 +24,7 @@ import { HarnessError } from './errors.js';
 import type { HarnessEvents, ToolDecisionEvent } from './events.js';
 import { ToolPolicy, argsDigest } from './tool-policy.js';
 import type { AgentMode, ModeRegistry } from './modes.js';
-import type { Session } from './session.js';
+import type { ChildRefs, Session } from './session.js';
 import { schemaName, schemaProblems } from './structured.js';
 import { RunBudget, RunContext, RunLedger, type ModelBinding } from './subagents.js';
 import { RunTrees, type RunTreeRef } from './run-trees.js';
@@ -381,6 +381,16 @@ export class AgentRuntime {
     return chosen ?? 'unknown';
   }
 
+  /**
+   * How long a run tree hold for this session's turns lasts before it is
+   * charged in full: the agent's `lock_ttl`, as the turn itself holds it.
+   *
+   * @internal Read by the decision writer.
+   */
+  holdTtl(session: Session): number {
+    return this.#setting(session, 'lock_ttl') ?? RESOLUTION_LOCK_SECONDS;
+  }
+
   /** Inspect the offer without a run/handler or logical mutation; reads may purge expired entries. */
   async effectiveTools(session: Session, modeName?: string): Promise<EffectiveTool[]> {
     const mode = this.#modes.forAgent(session.agent).resolve(modeName ?? await session.mode());
@@ -692,9 +702,18 @@ export class AgentRuntime {
     // under, both stored on the row that asked (G-321 E). Without them a child
     // resumed outside the runner would resolve its model like a root run, and
     // any pause would restart a spend ceiling at nothing.
-    const paused = prompt === '' && execution == null
+    //
+    // Any turn on a subagent child the runner did not start (that resume, a
+    // new message, or a run context the host built) continues the run tree
+    // and the shared plan budget the child was started under (G-366): kept on
+    // the session, or on the paused row for a child paused before that.
+    const contextKind = RunTrees.contextKind(execution);
+    const tail = execution == null || contextKind === 'host'
       ? pausedRunState((await session.thread().messages()).map(entry => entry.message))
       : null;
+    const paused = prompt === '' && execution == null ? tail : null;
+    const savedRefs: ChildRefs | null = contextKind === 'runner' ? null
+      : (await session.childRefs()) ?? { tree: tail?.tree ?? null, planLedger: tail?.planLedger ?? null };
     const binding = execution?.binding ?? (paused?.binding == null ? null
       : { session: paused.binding.session, declared: paused.binding.declared, parentMode: paused.binding.parent_mode });
     const provider = await this.#choose(session, mode, binding, 'provider');
@@ -760,15 +779,21 @@ export class AgentRuntime {
       // tree ledger its caller hands back in.
       if (prompt === '' && execution == null) run.ledger.recordSteps(approvalRunSteps(stored) ?? 0);
       const holdTtl = this.#setting(session, 'lock_ttl') ?? RESOLUTION_LOCK_SECONDS;
-      // A root run, or a child resumed outside the runner, which continues
-      // the run tree it was started in (G-366).
-      if (execution == null) run = await RunTrees.rootRun(session, runId, run, paused?.tree ?? null, holdTtl);
-      // What a subagent child's paused row carries into its resume: the run
-      // tree it belongs to and the shared plan budget that tree spends from.
+      // A root run opens a tree; any turn on a child session the runner did
+      // not start continues the run tree it was started in, a host context
+      // narrowed to what that tree has left (G-366).
+      run = await RunTrees.rootRun(session, runId, run, execution, savedRefs?.tree ?? null, holdTtl);
+      // What a subagent child carries into every later turn the runner does
+      // not start: the run tree it belongs to and the shared plan budget that
+      // tree spends from, kept on the session and on the row it pauses on.
       if (run.binding !== null) {
-        this.#childRefs.set(runId, execution?.binding != null
+        const refs: ChildRefs = execution?.binding != null
           ? { tree: await RunTrees.childStarted(session, execution), planLedger: plans?.ledgerOf(execution.rootRunId) ?? null }
-          : { tree: RunTrees.treeOf(runId), planLedger: paused?.planLedger ?? null });
+          : { tree: RunTrees.treeOf(runId), planLedger: savedRefs?.planLedger ?? null };
+        this.#childRefs.set(runId, refs);
+        if (execution?.binding != null && JSON.stringify(await session.childRefs()) !== JSON.stringify(refs)) {
+          await session.rememberChildRefs(refs);
+        }
       }
       // G-366: a turn serving a plan step with a shared budget holds what the
       // plan has left, after the paused steps it continues are counted.
@@ -1416,8 +1441,10 @@ async function writeDecisions(session: Session, decisions: readonly ApprovalDeci
   // refuses (G-366).
   await session.planService()?.assertDecisionsFunded(session, decisions.map((decision) => decision.approvalId), context);
   // And for a subagent child resumed outside the runner, a run tree with
-  // nothing left.
-  await RunTrees.assertDecisionsFunded(session, pausedRunState(rows)?.tree ?? null, context, RESOLUTION_LOCK_SECONDS);
+  // nothing left: the tree it was saved with, a host context included.
+  const kept = await session.childRefs();
+  const tree = kept !== null ? kept.tree : pausedRunState(rows)?.tree ?? null;
+  await RunTrees.assertDecisionsFunded(session, tree, context, session.planRuntime()?.holdTtl(session) ?? RESOLUTION_LOCK_SECONDS);
 
   const run = await session.run();
 

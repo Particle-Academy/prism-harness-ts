@@ -1,6 +1,6 @@
 import { HarnessError } from './errors.js';
 import type { JsonObject } from './json.js';
-import { PlanBudget, type PlanBudgetGrant, type PlanBudgetState } from './plans/budget.js';
+import { PlanBudget, type PlanBudgetGrant, type PlanBudgetState, type RunContextKind } from './plans/budget.js';
 import type { Session } from './session.js';
 import type { SessionStore } from './stores/session-store.js';
 import { RunBudget, type RunContext, type RunLedger } from './subagents.js';
@@ -46,14 +46,20 @@ const runs = new Map<string, RootRun>();
  */
 export const RunTrees = {
   /**
-   * A root run is starting. A child resumed outside the runner continues the
-   * tree `savedTree` names: it holds what that tree has left, and its run is
-   * narrowed to the hold. Any other root run opens a tree of its own, kept in
-   * memory until it starts a child.
+   * A run is starting. A turn on a child session the runner did not start (an
+   * answer to its approval, a new message, or a run context the host built)
+   * continues the tree `savedTree` names: it holds what that tree has left,
+   * and its run is narrowed to the hold, so a host context can only lower
+   * what the tree allows. Any other root run opens a tree of its own, kept in
+   * memory until it starts a child. A run on the runner's own context already
+   * spends from its tree and is left alone.
    *
    * @throws HarnessError `run_not_permitted` when the tree the child belongs to is spent
    */
-  async rootRun(session: Session, runId: string, run: RunContext, savedTree: RunTreeRef | null, ttl: number): Promise<RunContext> {
+  async rootRun(session: Session, runId: string, run: RunContext, context: RunContext | undefined, savedTree: RunTreeRef | null, ttl: number): Promise<RunContext> {
+    const route = PlanBudget.route(RunTrees.contextKind(context), '', false, false, savedTree !== null, false).tree;
+    if (route === 'none') return run;
+    if (route === 'open') savedTree = null;
     const entry: RootRun = {
       session: session.key(), tree: savedTree ?? { session: session.key(), run: runId },
       budget: run.budget, ledger: run.ledger, steps: run.ledger.steps, cost: run.ledger.costUsd,
@@ -83,6 +89,19 @@ export const RunTrees = {
     runs.set(runId, { ...entry, budget: narrowed.budget, ledger: narrowed.ledger, held: true });
 
     return narrowed;
+  },
+
+  /**
+   * What kind of run context a turn was handed, for PlanBudget.route():
+   * `runner` when it is a context of a run this runtime is running (its
+   * ledger is that run's), `host` for any other context that states a run
+   * tree.
+   */
+  contextKind(context: RunContext | null | undefined): RunContextKind {
+    if (context == null) return 'none';
+    if (context.metadataOnly) return 'metadata';
+
+    return runs.get(context.rootRunId)?.ledger === context.ledger ? 'runner' : 'host';
   },
 
   /** The tree a run of this process belongs to, or null. */
@@ -122,7 +141,7 @@ export const RunTrees = {
    * @throws HarnessError `run_not_permitted`
    */
   async assertDecisionsFunded(session: Session, tree: RunTreeRef | null, context: RunContext | undefined, ttl: number): Promise<void> {
-    if (tree === null || (context !== undefined && !context.metadataOnly)) return;
+    if (tree === null || PlanBudget.route(RunTrees.contextKind(context), '', false, false, true, false).tree !== 'continue') return;
     const state = record(await session.planStore().get(key(tree)), tree);
     if (state === null) throw spent('steps');
     const [, grant] = PlanBudget.reserve(state, 'decision', 1, null, Math.floor(Date.now() / 1000), ttl);

@@ -218,7 +218,57 @@ export const PlanBudget = {
   micros(usd: number): number {
     return Math.round(usd * 1_000_000);
   },
+
+  /**
+   * Which budgets a turn spends from. Pure, so every language answers it the
+   * same way (prism-parity harness-plans).
+   *
+   * `context` is the run context the turn was handed: `none`, `metadata` (a
+   * turnId/actor only, the same as none), `runner` (a context of a run this
+   * runtime is running, such as the subagent runner's child) or `host` (any
+   * other context the host built). `advancing` is true for the turn
+   * advance() runs for a claimed agent step, and `stepApproval` when the
+   * approval the turn would resume is one that step asked for. `savedTree`
+   * and `savedPlanLedger` say whether the session is a subagent child saved
+   * with a run tree and a shared plan budget.
+   *
+   * - `tree`: `open` (a root run that opens a tree of its own), `continue`
+   *   (hold what the saved tree has left; a host context is narrowed to it)
+   *   or `none` (the runner's own context already spends from it).
+   * - `plan`: `own` (the plan's own turn spends from its budget), `child`
+   *   (the saved plan budget; a host context is narrowed to it), `refused`
+   *   (`plan.budget_context`: the plan's own turn handed a run tree of its
+   *   own) or `none`.
+   *
+   * The prompt matters only to whether a turn is the plan's own: a new
+   * message on a child session continues its tree and plan budget exactly as
+   * an answer to its approval does. No route gives a child a fresh budget,
+   * and a host context can only narrow one.
+   *
+   * @throws PlanBudgetInvalid for an unknown context kind
+   */
+  route(context: string, prompt: string, advancing: boolean, stepApproval: boolean, savedTree: boolean, savedPlanLedger: boolean): PlanBudgetRoute {
+    if (!(CONTEXT_KINDS as readonly string[]).includes(context)) throw new PlanBudgetInvalid('Unknown run context kind.');
+    const bare = context === 'none' || context === 'metadata';
+    const tree = context === 'runner' ? 'none' : (savedTree ? 'continue' : (bare ? 'open' : 'none'));
+    const plan = advancing || (prompt === '' && stepApproval)
+      ? (bare ? 'own' : 'refused')
+      : (context !== 'runner' && savedPlanLedger ? 'child' : 'none');
+
+    return { tree, plan };
+  },
 };
+
+const CONTEXT_KINDS = ['none', 'metadata', 'runner', 'host'] as const;
+
+/** The kind of run context a turn was handed, for PlanBudget.route(). */
+export type RunContextKind = typeof CONTEXT_KINDS[number];
+
+/** Which budgets a turn spends from; see PlanBudget.route(). */
+export interface PlanBudgetRoute {
+  tree: 'open' | 'continue' | 'none';
+  plan: 'own' | 'child' | 'refused' | 'none';
+}
 
 function sortedHolds(holds: Record<string, PlanBudgetHold>): Record<string, PlanBudgetHold> {
   const out: Record<string, PlanBudgetHold> = {};

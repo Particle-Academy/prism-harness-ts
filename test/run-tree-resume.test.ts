@@ -169,3 +169,70 @@ describe('a subagent child resumed outside the runner', () => {
     expect(r.requests.length - before).toBe(1);
   });
 });
+
+// A turn on a child session the runner did not start never gets a fresh root
+// budget by any route: not a new message instead of an answer, and not a run
+// context the host hands in (which may only narrow what the tree has left).
+describe('a turn on a subagent child session outside the runner', () => {
+  const host = () => RunContext.root('host_root', new RunBudget(100));
+  const drain = async (steps: AsyncGenerator<unknown, unknown, undefined>) => { for await (const _ of steps) { /* drained */ } };
+
+  it('runs a new message to a child session on what its run tree has left', async () => {
+    const { r, child } = await pausedChild(4);
+    const before = r.requests.length;
+
+    r.calls([['lookup', { q: 'a' }]]);
+    r.calls([['lookup', { q: 'b' }]]);
+    r.text('Child answer.');
+    await r.runtime.send(child, 'New question');
+
+    expect(r.requests.length - before).toBe(1);
+  });
+
+  it('refuses a new message to a child session whose run tree is spent', async () => {
+    const { r, child } = await pausedChild(3);
+    const before = r.requests.length;
+
+    await expect(r.runtime.send(child, 'New question')).rejects.toMatchObject({ code: 'run_not_permitted' });
+    expect(r.requests.length).toBe(before);
+  });
+
+  it('narrows a host-supplied run context on a streamed child resume to what its run tree has left', async () => {
+    const { r, child, id } = await pausedChild(4);
+    const before = r.requests.length;
+
+    r.calls([['lookup', { q: 'a' }]]);
+    r.calls([['lookup', { q: 'b' }]]);
+    r.text('Child answer.');
+    await drain(r.runtime.streamDecision(child, [{ approvalId: id, approved: true }], host()));
+
+    expect(r.weatherRan).toBe(1);
+    expect(r.requests.length - before).toBe(1);
+  });
+
+  it('refuses, recording nothing, a host-supplied run context on a child whose run tree is spent', async () => {
+    const { r, child, id } = await pausedChild(3);
+    const before = r.requests.length;
+    const recorded = await r.results(child);
+
+    await expect(drain(r.runtime.streamDecision(child, [{ approvalId: id, approved: true }], host()))).rejects.toMatchObject({ code: 'run_not_permitted' });
+    expect(await r.pending(child)).toEqual([id]);
+    expect(await r.results(child)).toBe(recorded);
+    expect(r.weatherRan).toBe(0);
+    expect(r.requests.length).toBe(before);
+  });
+
+  it('narrows a host-supplied run context on a resume after the answer is recorded', async () => {
+    const { r, child, id } = await pausedChild(4);
+    const before = r.requests.length;
+
+    r.calls([['lookup', { q: 'a' }]]);
+    r.calls([['lookup', { q: 'b' }]]);
+    r.text('Child answer.');
+    await recordApproval(child, id, true);
+    await r.runtime.send(child, '', undefined, host());
+
+    expect(r.weatherRan).toBe(1);
+    expect(r.requests.length - before).toBe(1);
+  });
+});

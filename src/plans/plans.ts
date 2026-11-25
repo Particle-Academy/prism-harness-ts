@@ -4,9 +4,10 @@ import type { HarnessEvents } from '../events.js';
 import type { JsonObject } from '../json.js';
 import type { ModeRegistry } from '../modes.js';
 import type { AgentResponse, AgentRuntime } from '../runtime.js';
-import type { Session } from '../session.js';
+import type { ChildRefs, Session } from '../session.js';
 import { StepChannel, type RunStep } from '../steps.js';
 import type { SessionStore } from '../stores/session-store.js';
+import { RunTrees } from '../run-trees.js';
 import { RunBudget, type RunContext } from '../subagents.js';
 import type { HarnessTool } from '../tools.js';
 import { PLAN_BUDGET_EXHAUSTED, PlanBudget, type PlanBudgetConfig, type PlanBudgetSettings, type PlanBudgetState } from './budget.js';
@@ -51,6 +52,9 @@ type Watcher = (plan: Plan) => void;
  * Config is read when it is used, so a host that changes it at runtime is
  * read correctly.
  */
+/** A shared plan ledger a turn spends from; `refused` marks the plan's own turn handed a run tree of its own. */
+type RoutedLedger = { session: string; plan: string; settings: PlanBudgetSettings; refused: boolean };
+
 export class Plans {
   static readonly INDEX_KEY = 'prism-harness:plans:live';
   static readonly HEARTBEAT_KEY = 'prism-harness:plans:heartbeat';
@@ -397,19 +401,13 @@ export class Plans {
    */
   async assertDecisionsFunded(session: Session, approvalIds: readonly string[], context?: RunContext): Promise<void> {
     if (!this.enabled() || approvalIds.length === 0) return;
-    let target: { session: string; plan: string } | null = null;
     const plan = await this.enabledFor(session) ? await this.load(session) : null;
     const step = activeAgentStep(plan);
-    if (plan !== null && step !== null && step.approvalIds.some((id) => approvalIds.includes(id))) {
-      if ((await this.budgetFor(session, plan.id)).mode !== 'shared') return;
-      target = { session: session.key(), plan: plan.id };
-    } else if (context === undefined || context.metadataOnly) {
-      // A subagent child resumed outside the runner spends from the shared
-      // plan budget of the turn that started it.
-      target = await this.#childLedger(session);
-    }
+    const stepApproval = step !== null && step.approvalIds.some((id) => approvalIds.includes(id));
+    // A decision resumes as a turn with no new message.
+    const target = await this.#routedLedger(session, plan, '', false, stepApproval, context);
     if (target === null) return;
-    if (context !== undefined && !context.metadataOnly) throw PlanRefused.because('plan.budget_context');
+    if (target.refused) throw PlanRefused.because('plan.budget_context');
     const record = await this.#budgetRecordAt(session.planStore(), target.session, target.plan);
     const spent = record === null ? null : PlanBudget.exhaustion(PlanBudget.expire(record, this.now(), this.#lockTtl));
     if (spent !== null) throw budgetSpent(spent);
@@ -426,15 +424,18 @@ export class Plans {
    * whose worker died is still live) is not the plan's: it spends nothing
    * from the plan's budget and is never refused for it.
    *
-   * A run handed a run tree of its own cannot also spend from the plan's
-   * ledger, so it is refused.
+   * A turn on a subagent child the runner did not start (an answer, a new
+   * message, or a run context the host built) spends from the shared plan
+   * budget of the turn that started the child, a host context narrowed to
+   * what it has left. The plan's own turn handed a run tree of its own
+   * cannot also spend from the plan's ledger, so it is refused.
    *
    * @internal Called by the runtime once a run's own budget is known.
    */
   async planTurn(session: Session, runId: string, run: RunContext, context: RunContext | undefined, prompt = ''): Promise<RunContext> {
     const target = await this.#ledgerFor(session, prompt, context);
     if (target === null) return run;
-    if (context !== undefined && !context.metadataOnly) throw PlanRefused.because('plan.budget_context');
+    if (target.refused) throw PlanRefused.because('plan.budget_context');
 
     const { ledger, budget } = run;
     const baseSteps = ledger.steps;
@@ -457,38 +458,55 @@ export class Plans {
   }
 
   /**
-   * The shared ledger a turn spends from: its own plan's, when the turn is
-   * one of the plan's own; else, for a subagent child resumed outside the
-   * runner, the ledger of the plan turn that started it. Null otherwise.
+   * The shared ledger a turn spends from, as PlanBudget.route() decides: its
+   * own plan's, when the turn is the plan's own; else, for a turn on a
+   * subagent child the runner did not start, the ledger of the plan turn that
+   * started it. `refused` marks the plan's own turn handed a run tree of its
+   * own. Null otherwise.
    */
-  async #ledgerFor(session: Session, prompt: string, context?: RunContext): Promise<{ session: string; plan: string; settings: PlanBudgetSettings } | null> {
+  async #ledgerFor(session: Session, prompt: string, context?: RunContext): Promise<RoutedLedger | null> {
     if (!this.enabled()) return null;
-    if (await this.enabledFor(session)) {
-      const plan = await this.load(session);
-      const step = activeAgentStep(plan);
-      if (plan !== null && step !== null) {
-        const own = this.#advancing.has(session.key())
-          || (prompt === '' && step.approvalIds.length > 0
-            && pausedApprovalIds((await session.thread().messages()).map((entry) => entry.message)).some((id) => step.approvalIds.includes(id)));
-        if (own) {
-          const settings = await this.budgetFor(session, plan.id);
+    const plan = await this.enabledFor(session) ? await this.load(session) : null;
+    const step = activeAgentStep(plan);
+    const advancing = step !== null && this.#advancing.has(session.key());
+    const stepApproval = step !== null && step.approvalIds.length > 0
+      && pausedApprovalIds((await session.thread().messages()).map((entry) => entry.message)).some((id) => step.approvalIds.includes(id));
 
-          return settings.mode === 'shared' ? { session: session.key(), plan: plan.id, settings } : null;
-        }
-      }
-    }
-
-    return prompt === '' && (context === undefined || context.metadataOnly) ? this.#childLedger(session) : null;
+    return this.#routedLedger(session, plan, prompt, advancing, stepApproval, context);
   }
 
-  /** The plan budget saved on a paused subagent child's row, while it is still that plan's shared budget. */
-  async #childLedger(session: Session): Promise<{ session: string; plan: string; settings: PlanBudgetSettings } | null> {
-    const saved = pausedRunState((await session.thread().messages()).map((entry) => entry.message))?.planLedger ?? null;
+  async #routedLedger(session: Session, plan: Plan | null, prompt: string, advancing: boolean, stepApproval: boolean, context?: RunContext): Promise<RoutedLedger | null> {
+    const saved = await this.#savedRefs(session);
+    const route = PlanBudget.route(RunTrees.contextKind(context), prompt, advancing, stepApproval, saved.tree !== null, saved.planLedger !== null).plan;
+    if ((route === 'own' || route === 'refused') && plan !== null) {
+      const settings = await this.budgetFor(session, plan.id);
+
+      return settings.mode === 'shared' ? { session: session.key(), plan: plan.id, settings, refused: route === 'refused' } : null;
+    }
+
+    return route === 'child' ? this.#childLedger(session, saved.planLedger) : null;
+  }
+
+  /**
+   * The run tree and plan budget a subagent child was saved with: on the
+   * session, or for a child paused before they were kept there, on the row
+   * it paused on.
+   */
+  async #savedRefs(session: Session): Promise<ChildRefs> {
+    const kept = await session.childRefs();
+    if (kept !== null) return kept;
+    const paused = pausedRunState((await session.thread().messages()).map((entry) => entry.message));
+
+    return { tree: paused?.tree ?? null, planLedger: paused?.planLedger ?? null };
+  }
+
+  /** A subagent child's saved plan budget, while it is still that plan's shared budget. */
+  async #childLedger(session: Session, saved: { session: string; plan: string } | null): Promise<RoutedLedger | null> {
     if (saved === null) return null;
     const record = await this.#budgetRecordAt(session.planStore(), saved.session, saved.plan);
     if (record === null || record.mode !== 'shared') return null;
 
-    return { ...saved, settings: { mode: 'shared', max_steps: record.max_steps, max_cost_micros: record.max_cost_micros } };
+    return { ...saved, settings: { mode: 'shared', max_steps: record.max_steps, max_cost_micros: record.max_cost_micros }, refused: false };
   }
 
   async #budgetRecordAt(store: SessionStore, sessionKey: string, planId: string): Promise<PlanBudgetState | null> {

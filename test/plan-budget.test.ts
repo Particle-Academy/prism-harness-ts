@@ -535,4 +535,37 @@ describe('plan budgets (G-366)', () => {
     expect(r.weatherRan).toBe(0);
     expect(r.requests.length).toBe(before);
   });
+
+  const hostRoot = () => RunContext.root('host_root', new RunBudget(100));
+  const drained = async (steps: AsyncGenerator<unknown, unknown, undefined>) => { for await (const _ of steps) { /* drained */ } };
+
+  it('charges a host-supplied run context on a resumed child to the shared plan budget, never around it', async () => {
+    const { r, child, id } = await pausedChild(10);
+    r.text('Child answer.');
+    await drained(r.runtime.streamDecision(child, [{ approvalId: id, approved: true }], hostRoot()));
+
+    expect(r.weatherRan).toBe(1);
+    expect((await (await r.handle()).budget())!.steps).toBe(5);
+  });
+
+  it('refuses, recording nothing, a host-supplied run context on a child whose shared plan budget is spent', async () => {
+    const { r, child, id } = await pausedChild(4);
+    const before = r.requests.length;
+    const results = async () => (await child.thread().messages()).filter((entry) => entry.message.type === 'tool_result').length;
+    const recorded = await results();
+
+    await expect(drained(r.runtime.streamDecision(child, [{ approvalId: id, approved: true }], hostRoot())))
+      .rejects.toMatchObject({ code: 'plan_budget_exhausted' });
+    expect(await results()).toBe(recorded);
+    expect(r.weatherRan).toBe(0);
+    expect(r.requests.length).toBe(before);
+  });
+
+  it('charges a new message to a child session to the shared plan budget it was started under', async () => {
+    const { r, child } = await pausedChild(10);
+    r.text('Child answer.');
+    await r.runtime.send(child, 'New question');
+
+    expect((await (await r.handle()).budget())!.steps).toBe(5);
+  });
 });

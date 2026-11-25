@@ -38,6 +38,27 @@
   budget is spent. A child started under a host-built context outside a turn
   keeps the previous behaviour.
 
+### Fixed
+
+- Every turn on a subagent child session that the runner did not start
+  continues the child's run tree and the shared plan budget it was started
+  under, not only the empty-prompt resume: a new message sent to the child
+  instead of an answer to its approval no longer gets a fresh root budget,
+  and is refused with `run_not_permitted` (or `plan_budget_exhausted`) once
+  they are spent. The references are now kept on the child session as well as
+  on the row it paused on, so a turn with a new message can read them. This
+  matches the PHP reference.
+- A run context the host hands a turn on such a child (`streamDecision()` or
+  `send(child, '', …, context)`) is narrowed to what the run tree and the
+  plan budget have left, and charged to them, instead of running on its own
+  budget outside both. It is refused only when they are spent. The runner's
+  own context for a child it is running is not charged twice.
+- Which budgets a turn spends from is decided by one pure function,
+  `PlanBudget.route()`, pinned across languages by the harness-plans corpus
+  0.1.5 (hpl-0053..hpl-0055).
+- The run-tree check before a decision is recorded uses the agent's
+  `lock_ttl`, as the turn does, instead of a fixed 300 seconds.
+
 - Agent plans (G-360), the port of the reference's: an agent drafts an ordered
   plan with `plan_draft`, a person approves it, and `session.plan().advance()`
   runs one step per turn. Off unless the new `Plans` service's config sets
