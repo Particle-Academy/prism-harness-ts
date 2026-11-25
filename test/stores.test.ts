@@ -7,7 +7,7 @@ import { parseFileLockOwner } from '../src/stores/file-owner-lock.js';
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   FileSessionStore,
   HarnessError,
@@ -411,3 +411,21 @@ async function lockPath(directory: string, store: FileSessionStore): Promise<str
 async function lockName(directory: string, store: FileSessionStore): Promise<string> {
   return (await lockPath(directory, store)).slice(directory.length + 1);
 }
+
+// Two writes of one key in the same millisecond, from one process (two
+// overlapping turns on one session): each must use a temporary file of its
+// own, or the second rename finds the first already moved (ENOENT).
+describe('FileSessionStore concurrent writes of one key', () => {
+  it('lets two puts of one key in the same millisecond both land', async () => {
+    const store = await fileStore();
+    const now = Date.now();
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+    try {
+      await Promise.all([store.put('same', { n: 1 }), store.put('same', { n: 2 })]);
+    } finally {
+      clock.mockRestore();
+    }
+
+    expect([{ n: 1 }, { n: 2 }]).toContainEqual(await store.get('same'));
+  });
+});

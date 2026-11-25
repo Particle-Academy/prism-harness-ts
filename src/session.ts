@@ -6,7 +6,7 @@ import type { SessionStore } from './stores/session-store.js';
 import { StoreTaskSource } from './store-task-source.js';
 import type { StoreTaskSourceOptions } from './store-task-source.js';
 import { Thread } from './thread.js';
-import { storedBinding } from './thread-rows.js';
+import { pausedApprovalIds, storedBinding } from './thread-rows.js';
 import type { ModelBinding } from './subagents.js';
 import type { AgentRuntime } from './runtime.js';
 import { PlansDisabled } from './plans/refusal.js';
@@ -30,6 +30,9 @@ export interface ChildRefs {
   planLedger: { session: string; plan: string } | null;
 }
 
+/** How many recent runs' trees a session keeps durably (G-381), as the reference does. */
+const RUN_HISTORY = 20;
+
 export interface RunState extends JsonObject {
   id: string;
   status: 'running' | 'completed' | 'failed';
@@ -37,6 +40,10 @@ export interface RunState extends JsonObject {
   provider?: string;
   model?: string;
   started_at?: string;
+  /** The run tree the run belongs to (G-381): a tree of this runtime, `host` or `none`. */
+  tree?: { session: string; run: string } | 'host' | 'none';
+  /** The depth the run runs at, decided with its tree. */
+  depth?: number;
   /** The last run step `seq` this run emitted, so a resumed stream continues it. */
   last_seq?: number;
 }
@@ -320,9 +327,7 @@ export class Session {
 
   /** @internal Written by the runtime when the subagent runner starts a child run. */
   async rememberChildBinding(binding: ModelBinding, depth = 0): Promise<this> {
-    this.#assertWritable();
-    const stored = (await this.#durable.get(this.#durableKey())) ?? {};
-    await this.#durable.put(this.#durableKey(), {
+    return this.#writeDurable((stored) => ({
       ...stored,
       child_binding: {
         session: { ...binding.session },
@@ -330,24 +335,109 @@ export class Session {
         parent_mode: { ...binding.parentMode },
       },
       child_depth: Number.isSafeInteger(depth) && depth > 0 ? depth : 0,
-    });
-
-    return this;
+    }));
   }
 
   /** @internal Written by the runtime when the subagent runner starts a child run. */
   async rememberChildRefs(refs: ChildRefs): Promise<this> {
-    this.#assertWritable();
-    const stored = (await this.#durable.get(this.#durableKey())) ?? {};
-    await this.#durable.put(this.#durableKey(), {
+    return this.#writeDurable((stored) => ({
       ...stored,
       child_refs: {
         tree: refs.tree === null ? null : { ...refs.tree },
         plan_ledger: refs.planLedger === null ? null : { ...refs.planLedger },
       },
-    });
+    }));
+  }
 
-    return this;
+  /**
+   * The durable run tree a recent run of this session began in (G-381), or
+   * null for a run in the host's tree, in none, or not remembered.
+   *
+   * @internal Read by the runtime.
+   */
+  async runTree(runId: string): Promise<{ session: string; run: string } | null> {
+    const stored = (await this.#durable.get(this.#runTreesKey())) ?? {};
+    const runs = stored.runs;
+    const entry = isJsonObject(runs) && Object.hasOwn(runs, runId) ? runs[runId] : undefined;
+    const tree = isJsonObject(entry) ? entry.tree : undefined;
+    if (!isJsonObject(tree)) return null;
+    const { session, run } = tree;
+
+    return typeof session === 'string' && session !== '' && typeof run === 'string' && run !== '' ? { session, run } : null;
+  }
+
+  /**
+   * The durable run tree the run that issued this session's paused approvals
+   * began in (G-381), so a root resuming that run stays in it, after the
+   * ephemeral half has expired too; null when nothing is paused, the run is
+   * not remembered, or it was in the host's tree or in none.
+   *
+   * @internal Read by the runtime.
+   */
+  async resumedRunTree(): Promise<{ session: string; run: string } | null> {
+    for (const runId of await this.#parkedRunIds()) {
+      const tree = await this.runTree(runId);
+      if (tree !== null) return tree;
+    }
+
+    return null;
+  }
+
+  /** The runs that issued the approvals the thread is parked on. */
+  async #parkedRunIds(): Promise<string[]> {
+    const entries = await this.thread().messages();
+    const runs: string[] = [];
+    for (const approvalId of pausedApprovalIds(entries.map((entry) => entry.message))) {
+      const issued = entries.find((entry) => Array.isArray(entry.message.tool_approval_requests)
+        && (entry.message.tool_approval_requests as JsonObject[]).some((request) => isJsonObject(request) && request.approval_id === approvalId));
+      if (issued?.runId != null && !runs.includes(issued.runId)) runs.push(issued.runId);
+    }
+
+    return runs;
+  }
+
+  /**
+   * Keep a run's tree under its OWN durable key (G-381), so starting a run
+   * never rewrites the session's durable record (child refs, binding,
+   * capabilities a host may change from another process). Written in
+   * beginRun under a store lock on its own key, since send() holds no
+   * session lock and two turns may begin on one session at once. The newest
+   * RUN_HISTORY runs are kept, by an explicit sequence rather than key
+   * order, and a run whose approvals the thread is still parked on is never
+   * dropped: a resume that keeps failing must not forget the tree it resumes.
+   */
+  async #rememberRunTree(id: string, tree: { session: string; run: string } | 'host' | 'none', depth: number): Promise<void> {
+    this.#assertWritable();
+    // Read before the lock: stale, it can only keep an extra entry or miss
+    // pinning a run that parked a moment ago, which has the newest seq.
+    const parked = new Set(await this.#parkedRunIds());
+    const name = this.#runTreesKey();
+    // Under a lock on that key: send() holds no session lock, and two turns
+    // beginning together on one session must both be kept.
+    await this.#durable.withLock(name, async () => {
+      const stored = (await this.#durable.get(name)) ?? {};
+      const runs: JsonObject = isJsonObject(stored.runs) ? { ...stored.runs } : {};
+      const seq = typeof stored.seq === 'number' && Number.isSafeInteger(stored.seq) ? stored.seq + 1 : 1;
+      runs[id] = { tree, depth, seq };
+      const order = Object.keys(runs).map((runId) => {
+        const entry = runs[runId];
+
+        return { runId, at: isJsonObject(entry) && typeof entry.seq === 'number' ? entry.seq : 0 };
+      }).sort((a, b) => b.at - a.at);
+      const kept: JsonObject = {};
+      let count = 0;
+      for (const { runId } of order) {
+        if (count < RUN_HISTORY || parked.has(runId)) {
+          kept[runId] = runs[runId]!;
+          count += 1;
+        }
+      }
+      await this.#durable.put(name, { seq, runs: kept });
+    }, 10, 5);
+  }
+
+  #runTreesKey(): string {
+    return `${this.key()}:run-trees`;
   }
 
   async capability(name: string): Promise<JsonObject | null> {
@@ -374,7 +464,14 @@ export class Session {
     return isJsonObject(run) && typeof run.id === 'string' ? (run as RunState) : null;
   }
 
-  async beginRun(id: string, mode: string, provider: string, model: string): Promise<this> {
+  /**
+   * @param tree the run tree the run belongs to, decided once when it begins
+   *   (RunTrees.membership): a tree of this runtime, `host` or `none` (G-381)
+   * @param depth the depth it runs at, from the same decision
+   */
+  async beginRun(id: string, mode: string, provider: string, model: string, tree?: { session: string; run: string } | 'host' | 'none', depth?: number): Promise<this> {
+    if (tree !== undefined) await this.#rememberRunTree(id, typeof tree === 'object' ? { session: tree.session, run: tree.run } : tree, depth ?? 0);
+
     return this.#write('run', {
       id,
       status: 'running',
@@ -382,6 +479,8 @@ export class Session {
       provider,
       model,
       started_at: new Date().toISOString(),
+      ...(tree === undefined ? {} : { tree: typeof tree === 'object' ? { session: tree.session, run: tree.run } : tree }),
+      ...(depth === undefined ? {} : { depth }),
     });
   }
 
@@ -486,10 +585,25 @@ export class Session {
   async #writeCapabilities(
     mutate: (capabilities: JsonObject) => JsonObject,
   ): Promise<this> {
+    return this.#writeDurable((stored) => ({
+      ...stored,
+      capabilities: mutate(isJsonObject(stored.capabilities) ? stored.capabilities : {}),
+    }));
+  }
+
+  /**
+   * Every read-modify-write of the session's durable record (capabilities
+   * the host keeps, a child's binding and refs the runner saves) under one
+   * lock on that record's key, so a write from one worker never undoes a
+   * write from another: a capability revoked while a parent delegates stays
+   * revoked.
+   */
+  async #writeDurable(change: (stored: JsonObject) => JsonObject): Promise<this> {
     this.#assertWritable();
-    const stored = (await this.#durable.get(this.#durableKey())) ?? {};
-    const capabilities = isJsonObject(stored.capabilities) ? stored.capabilities : {};
-    await this.#durable.put(this.#durableKey(), { ...stored, capabilities: mutate(capabilities) });
+    const name = this.#durableKey();
+    await this.#durable.withLock(name, async () => {
+      await this.#durable.put(name, change((await this.#durable.get(name)) ?? {}));
+    }, 10, 5);
 
     return this;
   }

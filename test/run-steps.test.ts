@@ -190,7 +190,7 @@ describe('send() is unchanged', () => {
       const session = await sessionOf(h);
       const response = await runtimeWith(scripted([toolStep([['c1', 'tick']]), FINAL]), { events, stepEvents }).send(session, 'go');
       const rows = (await session.thread().messages()).map((entry) => entry.message);
-      shapes.push({ response: { ...response, runId: 'x' }, rows, run: { ...(await session.run()), id: 'x', started_at: 'x', finished_at: 'x', last_seq: 'x' } });
+      shapes.push({ response: { ...response, runId: 'x' }, rows, run: { ...(await session.run()), id: 'x', started_at: 'x', finished_at: 'x', last_seq: 'x', tree: 'x' } });
       const types = seen.map((event) => event.type);
       if (stepEvents) {
         expect(types[0]).toBe('run.started');

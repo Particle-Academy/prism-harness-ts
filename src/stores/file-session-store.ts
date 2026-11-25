@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { mkdir, open, readFile, rename, rm, stat, truncate, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -142,7 +142,9 @@ export class FileSessionStore implements SessionStore, AppendLogStore {
 
   async put(key: string, payload: JsonObject, ttlSeconds: number | null = null): Promise<void> {
     const target = this.#pathFor(key);
-    const temporary = `${target}.${process.pid}.${Date.now()}.tmp`;
+    // Unique per write: two writes of one key in the same millisecond would
+    // otherwise share a temporary file, and the second rename finds it gone.
+    const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
     const document = JSON.stringify({
       key,
       payload,

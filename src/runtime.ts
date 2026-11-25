@@ -182,7 +182,8 @@ export interface ApprovalDecision {
 
 /** What the step paths thread through a turn. */
 interface Stepping {
-  tagger: RunStepTagger;
+  /** Absent for a send() that only takes the session lock (a resumed root). */
+  tagger?: RunStepTagger;
   /** The id to run under, when the step path has already claimed one. */
   runId?: string;
   /** True when that id is a parked run's own, continued. */
@@ -433,7 +434,22 @@ export class AgentRuntime {
     context?: RunContext,
     additionalContent: readonly unknown[] = [],
   ): Promise<AgentResponse> {
-    return await this.#turn(session, prompt, toolNames, context, additionalContent, undefined, this.#observerStepping(context));
+    return await this.#resumeLocked(session, prompt, context, (live, stepping) =>
+      this.#turn(live, prompt, toolNames, context, additionalContent, undefined, stepping));
+  }
+
+  /**
+   * A turn that resumes a parked root (an empty prompt, no run tree handed
+   * in, and a run tree the parked run began in) runs under the session lock,
+   * as a decision stream does: two resumes of one parked root never overlap,
+   * so the second is held to the tree record the first opened (G-381). Any
+   * other turn runs as before.
+   */
+  async #resumeLocked<T>(session: Session, prompt: string, context: RunContext | undefined, turn: (live: Session, stepping: Stepping | undefined) => Promise<T>): Promise<T> {
+    const observer = this.#observerStepping(context);
+    if (prompt !== '' || executionContext(context) !== undefined || (await session.resumedRunTree()) === null) return turn(session, observer);
+
+    return this.#holdingTurnLock(session, (live) => turn(live, { ...observer, locked: true }));
   }
 
   /**
@@ -675,7 +691,8 @@ export class AgentRuntime {
     context?: RunContext,
     additionalContent: readonly unknown[] = [],
   ): Promise<StructuredAgentResponse> {
-    const response = await this.#turn(session, prompt, toolNames, context, additionalContent, schema, this.#observerStepping(context));
+    const response = await this.#resumeLocked(session, prompt, context, (live, stepping) =>
+      this.#turn(live, prompt, toolNames, context, additionalContent, schema, stepping));
 
     // Narrowed by #turn: with a schema it always returns the structured shape.
     return response as StructuredAgentResponse;
@@ -707,13 +724,12 @@ export class AgentRuntime {
     // new message, or a run context the host built) continues the run tree
     // and the shared plan budget the child was started under (G-366): kept on
     // the session, or on the paused row for a child paused before that.
-    const contextKind = RunTrees.contextKind(execution);
-    const tail = execution == null || contextKind === 'host'
-      ? pausedRunState((await session.thread().messages()).map(entry => entry.message))
-      : null;
+    const contextKind = RunTrees.contextKind(context);
+    const tail = contextKind === 'runner'
+      ? null
+      : pausedRunState((await session.thread().messages()).map(entry => entry.message));
     const paused = prompt === '' && execution == null ? tail : null;
-    const savedRefs: ChildRefs | null = contextKind === 'runner' ? null
-      : (await session.childRefs()) ?? { tree: tail?.tree ?? null, planLedger: tail?.planLedger ?? null };
+    const savedRefs: ChildRefs = (await session.childRefs()) ?? { tree: tail?.tree ?? null, planLedger: tail?.planLedger ?? null };
     // The binding: from the runner's own context when the runner starts the child,
     // even under a run tree the host built (RunTrees.bindingContextKind);
     // otherwise the one SAVED with the child session, which a context
@@ -737,17 +753,19 @@ export class AgentRuntime {
     const model = await this.#choose(session, mode, binding, 'model');
     const runId = stepping?.runId ?? randomUUID();
     const tag = session.agent === null ? {} : { harnessAgent: session.agent };
+    // G-381: which run tree this run belongs to, its budget route and its
+    // depth, decided ONCE here and recorded; every consumer below reads that
+    // record and nothing else. A child the runner starts takes its parent
+    // run's tree, one level deeper; a turn the runner did not start continues
+    // the tree its session saved, at least as deep as the runner started it; a
+    // host context is in the host's tree whatever run ids it states.
+    // A root turn resuming its parked run stays in the tree that run began in.
+    const resumedTree = prompt === '' && (contextKind === 'none' || contextKind === 'metadata') ? await session.resumedRunTree() : null;
+    const membership = RunTrees.membershipOf(session, runId, context, savedRefs, await session.childDepth(), resumedTree);
     let run = this.#boundedRun(session, execution === null || execution === undefined
       ? new RunContext(RunLedger.start(runId), new RunBudget(mode.maxSteps), null, 0, {}, binding)
       : (execution.binding === binding ? execution : execution.withBinding(binding)));
-    // A turn on a child session runs at least as deep as the runner started
-    // the child, as in the reference (atSavedChildDepth): a resumed child, or
-    // one handed a host context, delegates under the same depth ceiling as it
-    // would inside its tree. A context may put it deeper, never shallower.
-    // The runner's own context is at the depth it starts the child at, and
-    // that is the depth it saves: it is never raised to an older one.
-    const savedDepth = await session.childDepth();
-    if (runnerBinding === null && savedDepth > run.depth) run = run.atDepth(savedDepth);
+    if (run.depth !== membership.depth) run = run.atDepth(membership.depth);
     if (session.agent !== null && paused?.agentSpend != null) {
       run.ledger.carryAgentSpend(session.agent, paused.agentSpend.cost_usd, paused.agentSpend.unmetered_runs);
     }
@@ -763,7 +781,7 @@ export class AgentRuntime {
 
     steps?.bind(session.key(), runId, run.parentRunId, run.rootRunId, session.agent);
     const unwatchPlan = steps !== undefined && stepping?.watchPlan === true ? await this.#watchPlan(session, steps) : () => {};
-    await session.beginRun(runId, mode.name, provider, model);
+    await session.beginRun(runId, mode.name, provider, model, membership.tree, membership.depth);
     this.#events?.emit({
       // A parked run continued under its own id has already STARTED once; a
       // second run.started for it would read as a new run.
@@ -780,6 +798,8 @@ export class AgentRuntime {
     });
 
     try {
+      // Recorded before any tool can run, so a child this run starts finds it.
+      RunTrees.enter(session, runId, membership, run.ledger);
       // G-360: the plan, in the system prompt of this turn and never in the
       // thread, read after the run begins and before any model call. A turn
       // with a new user message ends every pending approval, so the plan is
@@ -808,7 +828,7 @@ export class AgentRuntime {
       // A root run opens a tree; any turn on a child session the runner did
       // not start continues the run tree it was started in, a host context
       // narrowed to what that tree has left (G-366).
-      run = await RunTrees.rootRun(session, runId, run, execution, savedRefs?.tree ?? null, holdTtl);
+      run = await RunTrees.rootRun(session, runId, run, membership, holdTtl);
       // What a subagent child carries into every later turn the runner does
       // not start: the run tree it belongs to and the shared plan budget that
       // tree spends from, kept on the session and on the row it pauses on.
@@ -819,16 +839,19 @@ export class AgentRuntime {
         // the references the child saved before are kept, never replaced
         // with nothing, so a later turn the runner does not start still
         // continues the tree it last had rather than a fresh root budget.
-        const started = runnerBinding !== null && execution != null ? await RunTrees.childStarted(session, execution) : null;
-        const refs: ChildRefs = runnerBinding !== null && execution != null
-          ? (started !== null
-            ? { tree: started, planLedger: plans?.ledgerOf(execution.rootRunId) ?? null }
-            : (await session.childRefs()) ?? { tree: null, planLedger: null })
-          : { tree: RunTrees.treeOf(runId), planLedger: savedRefs?.planLedger ?? null };
+        // The plan ledger is the one of the run the child spends from
+        // (membership.spends), not of the root its ledger names: a grandchild
+        // of a child resumed under a host context keeps the child's.
+        const runnerStart = runnerBinding !== null && execution != null;
+        if (runnerStart) await RunTrees.childStarted(session, membership);
+        const refs: ChildRefs = runnerStart
+          ? RunTrees.keptRefs(membership, membership.spends === null ? null : plans?.ledgerOf(membership.spends) ?? null,
+            savedRefs.tree, savedRefs.planLedger, false)
+          : { tree: typeof membership.tree === 'object' ? membership.tree : null, planLedger: savedRefs.planLedger };
         this.#childRefs.set(runId, refs);
-        if (runnerBinding !== null && execution != null) {
+        if (runnerStart) {
           if (JSON.stringify(await session.childBinding()) !== JSON.stringify(runnerBinding)
-            || await session.childDepth() !== execution.depth) await session.rememberChildBinding(runnerBinding, execution.depth);
+            || await session.childDepth() !== membership.depth) await session.rememberChildBinding(runnerBinding, membership.depth);
           if (JSON.stringify(await session.childRefs()) !== JSON.stringify(refs)) await session.rememberChildRefs(refs);
         }
       }
@@ -842,28 +865,32 @@ export class AgentRuntime {
       }
       const called: string[] = [];
 
-      // Decisions recorded since the run stopped are acted on FIRST, before a
-      // new prompt is recorded, so the results land after the calls they answer
-      // rather than after the new turn.
-      offered = await this.#resolveApprovals(session, mode, offered, runId, called, scope?.legacy === true, steps, stepping?.locked === true);
-
-      if (prompt !== '') {
-        // With attachments, the shape prism-ts's UserMessage.toObject() writes:
-        // the media parts, then the turn's own text as a trailing text part,
-        // which fromObject() strips back off. Without them, unchanged.
-        const turn: JsonObject =
-          attachments.length === 0
-            ? { type: 'user', content: prompt }
-            : { type: 'user', content: prompt, additional_content: [...attachments, { text: prompt }], additional_attributes: {} };
-
-        await thread.record([turn], runId);
-      }
-
       // The tools this turn calls run inside it: a subagent tool reads the
-      // turn's own run context from here (see activeTurn()).
+      // turn's own run context from here (see activeTurn()). That includes a
+      // call a person approved, run below before the model is called again:
+      // outside this scope an approved subagent would run in no tree, at the
+      // depth and on the budget of the context the host wired its tool with.
       const turn = run;
-      return await activeTurns.run({ sessionKey: session.key(), runId, run: turn },
-        () => this.#loop(session, mode, turn, runId, provider, model, offered, called, systemPrompt, schema, steps));
+      return await activeTurns.run({ sessionKey: session.key(), runId, run: turn }, async () => {
+        // Decisions recorded since the run stopped are acted on FIRST, before a
+        // new prompt is recorded, so the results land after the calls they answer
+        // rather than after the new turn.
+        offered = await this.#resolveApprovals(session, mode, offered, runId, called, scope?.legacy === true, steps, stepping?.locked === true);
+
+        if (prompt !== '') {
+          // With attachments, the shape prism-ts's UserMessage.toObject() writes:
+          // the media parts, then the turn's own text as a trailing text part,
+          // which fromObject() strips back off. Without them, unchanged.
+          const message: JsonObject =
+            attachments.length === 0
+              ? { type: 'user', content: prompt }
+              : { type: 'user', content: prompt, additional_content: [...attachments, { text: prompt }], additional_attributes: {} };
+
+          await thread.record([message], runId);
+        }
+
+        return this.#loop(session, mode, turn, runId, provider, model, offered, called, systemPrompt, schema, steps);
+      });
     } catch (error) {
       // THE MODEL'S OWN WORDS DO NOT BELONG IN A RUN ROW OR AN EVENT. A schema
       // violation names the values that missed, so its message carries pieces
@@ -1023,7 +1050,14 @@ export class AgentRuntime {
             parent_mode: { ...run.binding.parentMode },
           };
           const refs = this.#childRefs.get(runId);
-          if (refs?.tree != null) row.harness_tree = { ...refs.tree };
+          // Only for a run in a tree it did not open (a child the runner
+          // started, or a turn continuing a saved tree): read back, a tree a
+          // root opened would be continued as a saved tree that has no record.
+          const member = RunTrees.memberOf(runId);
+          const tree = member?.tree;
+          if (member !== null && member.route !== 'open' && tree !== undefined && typeof tree === 'object') {
+            row.harness_tree = { session: tree.session, run: tree.run };
+          }
           if (refs?.planLedger != null) row.harness_plan_ledger = { ...refs.planLedger };
         }
       }
@@ -1479,9 +1513,8 @@ async function writeDecisions(session: Session, decisions: readonly ApprovalDeci
   await session.planService()?.assertDecisionsFunded(session, decisions.map((decision) => decision.approvalId), context);
   // And for a subagent child resumed outside the runner, a run tree with
   // nothing left: the tree it was saved with, a host context included.
-  const kept = await session.childRefs();
-  const tree = kept !== null ? kept.tree : pausedRunState(rows)?.tree ?? null;
-  await RunTrees.assertDecisionsFunded(session, tree, context, session.planRuntime()?.holdTtl(session) ?? RESOLUTION_LOCK_SECONDS);
+  const kept = (await session.childRefs()) ?? { tree: pausedRunState(rows)?.tree ?? null, planLedger: null };
+  await RunTrees.assertDecisionsFunded(session, kept, context, session.planRuntime()?.holdTtl(session) ?? RESOLUTION_LOCK_SECONDS, await session.resumedRunTree());
 
   const run = await session.run();
 

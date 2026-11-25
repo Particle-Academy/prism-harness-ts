@@ -111,8 +111,11 @@ export class SubagentRunner {
     } catch (error) {
       return refused(subagent.name, runId, parentRunId, 'failed', error instanceof Error ? error.message : String(error));
     }
-    // Marked as the runner's own: only this context saves the child's binding.
-    const childContext = RunTrees.startingChild(context.forChild(subagent, parentRunId, binding));
+    // Marked as the runner's own, with the run whose turn is calling it (never
+    // a run id the caller states): the child joins that run's tree only when
+    // `context` is that turn's own (its ledger), G-381.
+    const turn = activeTurn(parent.key());
+    const childContext = RunTrees.startingChild(context.forChild(subagent, parentRunId, binding), turn?.runId ?? null, parent.key());
 
     // Refused BEFORE the child's address is built. Two modes naming each other
     // as subagents form a cycle budgets would eventually stop — but only after
