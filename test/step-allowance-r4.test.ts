@@ -300,25 +300,29 @@ describe('the re-delegation refusal is atomic (item 2)', () => {
     for (let i = 0; i < 4; i += 1) r.calls([['lookup', { q: i }]]);
     let release: () => void = () => {};
     let resume: Promise<unknown> | null = null;
-    const usingMode = Session.prototype.usingMode;
-    vi.spyOn(Session.prototype, 'usingMode').mockImplementation(async function (this: Session, ...args: Parameters<Session['usingMode']>) {
+    // G-387 round 7: the start's gate reads the child, then commits its
+    // records in one write that re-checks the count; the resume claims in
+    // between.
+    const remember = Session.prototype.rememberChildStart;
+    vi.spyOn(Session.prototype, 'rememberChildStart').mockImplementation(async function (this: Session, ...args: Parameters<Session['rememberChildStart']>) {
       if (this.scope.includes('::sub::') && resume === null) {
-        // Between the runner's check and its reset, a resume claims the child
-        // and is mid model call.
+        // Between the gate's read and the child write, a resume claims the
+        // child and is mid model call.
         const started = new Promise<void>((resolve) => {
           r.beforeRequest = async () => { resolve(); await new Promise<void>((done) => { release = done; }); };
         });
         resume = r.runtime.send(r.child(), '').catch(() => null);
         await started;
       }
-      return usingMode.apply(this, args);
+      return remember.apply(this, args);
     });
 
     const result = await runner(r, 'Start over');
     release();
     await resume;
 
-    expect(result.outcome).toBe('failed');
+    expect(result.outcome).toBe('denied');
+    expect(result.text).toContain('a turn on it is still running');
     expect(r.requests.length).toBeLessThanOrEqual(3);
   });
 });

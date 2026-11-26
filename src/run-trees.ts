@@ -1,4 +1,3 @@
-import { HarnessError } from './errors.js';
 import type { JsonObject } from './json.js';
 import { PlanBudget, type PlanBudgetGrant, type PlanBudgetState, type RunContextKind } from './plans/budget.js';
 import { RunBudgets, type AllowanceFacts, type StepAllowance } from './run-budgets.js';
@@ -228,7 +227,7 @@ export const RunTrees = {
       // parked run's own id, and the tree's allowance holds across the pause
       // there exactly as on a resume under a new id. One whose tree has no
       // record yet stays open: it opens the record when it first delegates
-      // (childStarted). Two resumes of one parked root never overlap: the
+      // (RunTrees.holdStart). Two resumes of one parked root never overlap: the
       // runtime starts a resumed root under the session lock, so the second
       // sees the first's record. One with no step of its own left has
       // nothing of the tree's to hold.
@@ -291,35 +290,70 @@ export const RunTrees = {
   },
 
   /**
-   * A child is starting in the run tree its membership names: that tree,
-   * opened in the durable store for the run it spends from the first time
-   * that run starts a child. Null when it is in the host's tree or in none.
+   * What the hold a runner start takes on its run tree would grant now
+   * (G-387 round 7), read without a write: the tree is opened in the durable
+   * store for the run it spends from the first time that run starts a child,
+   * holding what that run has left. Null when the start takes no hold (a
+   * child in the host's tree or in none, or a spending run that already
+   * holds its tree); 0 when the tree's record has nothing left to grant.
    */
-  async childStarted(child: Session, membership: TreeMembership): Promise<RunTreeRef | null> {
-    if (typeof membership.tree !== 'object' || membership.spends === null) return null;
-    const spends = membership.spends;
-    const entry = runs.get(spends);
-    if (entry !== undefined && !entry.held) {
-      // The tree's allowance is the spending run's own step allowance, as
-      // recorded when it began: its budget was narrowed to it (allowed()).
-      const settings = {
-        mode: 'shared' as const,
-        max_steps: Math.max(0, entry.budget.maxSteps - entry.steps),
-        max_cost_micros: entry.budget.maxCostUsd === null ? null : PlanBudget.micros(Math.max(0, entry.budget.maxCostUsd - entry.cost)),
-      };
-      const now = Math.floor(Date.now() / 1000);
-      // Named by the tree's root run; held under the run that spends (a
-      // root resuming a parked run that never delegated opens its tree's
-      // record here; one whose parked run did continues it in rootRun).
-      // The grant is never discarded: a refused one refuses the delegation.
-      const tree = membership.tree;
-      const grant = await write(child.planStore(), tree, (state) =>
-        PlanBudget.reserve(state ?? PlanBudget.open(tree.run, settings), spends, Math.max(1, settings.max_steps), settings.max_cost_micros, now, entry.ttl));
-      if ('refused' in grant) throw spent(grant.limit);
-      entry.held = true;
-    }
+  async startGrant(child: Session, membership: TreeMembership): Promise<{ steps: number; request: TreeRequest } | null> {
+    const request = treeRequest(membership);
+    if (request === null) return null;
+    const state = record(await child.planStore().get(key(request.tree)), request.tree);
+    const [, grant] = PlanBudget.reserve(state ?? PlanBudget.open(request.tree.run, request.settings), request.spends,
+      Math.max(1, request.settings.max_steps), request.settings.max_cost_micros, Math.floor(Date.now() / 1000), request.ttl);
 
-    return membership.tree;
+    return { steps: 'refused' in grant ? 0 : grant.steps, request };
+  },
+
+  /**
+   * A runner start commits its tree hold (G-387 round 7): the hold
+   * startGrant() read, in ONE conditional locked write. If the tree no
+   * longer grants all of `expected` (a sibling spent it since the read),
+   * nothing is written and the start is refused. Returns whether the
+   * record was opened by this write, for releaseStart().
+   */
+  async holdStart(child: Session, request: TreeRequest, expected: number): Promise<{ opened: boolean } | 'refused'> {
+    const entry = runs.get(request.spends);
+    if (entry === undefined || entry.held) return 'refused';
+    const now = Math.floor(Date.now() / 1000);
+    const held = await write<{ opened: boolean } | 'refused'>(child.planStore(), request.tree, (state) => {
+      const [next, grant] = PlanBudget.reserve(state ?? PlanBudget.open(request.tree.run, request.settings), request.spends,
+        Math.max(1, request.settings.max_steps), request.settings.max_cost_micros, now, request.ttl);
+      if ('refused' in grant || grant.steps < expected) return [null, 'refused' as const];
+
+      return [next, { opened: state === null }];
+    });
+    if (held !== 'refused') entry.held = true;
+
+    return held;
+  },
+
+  /**
+   * Release a hold holdStart() took, for a start that did not go ahead: a
+   * record it opened is removed, otherwise its hold is dropped unspent, and
+   * the spending run holds nothing again. Isolated: a failed release leaves
+   * the hold, which is charged in full once it expires (an over-charge).
+   */
+  async releaseStart(child: Session, request: TreeRequest, held: { opened: boolean }): Promise<void> {
+    const entry = runs.get(request.spends);
+    if (entry !== undefined) entry.held = false;
+    const store = child.planStore();
+    const name = key(request.tree);
+    try {
+      await store.withLock(name, async () => {
+        const state = record(await store.get(name), request.tree);
+        if (state === null) return;
+        if (held.opened && Object.keys(state.holds).every((id) => id === request.spends) && state.steps === 0 && state.cost_micros === 0) {
+          await store.forget(name);
+          return;
+        }
+        await store.put(name, PlanBudget.settle(state, request.spends, 0, 0) as unknown as JsonObject);
+      }, 10, 5);
+    } catch (error) {
+      process.emitWarning(`A run tree budget update failed: ${error instanceof Error ? error.constructor.name : typeof error}.`);
+    }
   },
 
   /** A run is over: its membership is dropped, and a run that holds part of a tree settles what the tree spent under it. */
@@ -339,6 +373,32 @@ export const RunTrees = {
     }
   },
 };
+
+/** The hold a runner start would take on its tree: for the run it spends from, what that run has left. */
+export interface TreeRequest {
+  tree: RunTreeRef;
+  spends: string;
+  settings: { mode: 'shared'; max_steps: number; max_cost_micros: number | null };
+  ttl: number;
+}
+
+function treeRequest(membership: TreeMembership): TreeRequest | null {
+  if (typeof membership.tree !== 'object' || membership.spends === null) return null;
+  const entry = runs.get(membership.spends);
+  if (entry === undefined || entry.held) return null;
+  // The tree's allowance is the spending run's own step allowance, as
+  // recorded when it began: its budget was narrowed to it (allowed()).
+  return {
+    tree: { session: membership.tree.session, run: membership.tree.run },
+    spends: membership.spends,
+    settings: {
+      mode: 'shared',
+      max_steps: Math.max(0, entry.budget.maxSteps - entry.steps),
+      max_cost_micros: entry.budget.maxCostUsd === null ? null : PlanBudget.micros(Math.max(0, entry.budget.maxCostUsd - entry.cost)),
+    },
+    ttl: entry.ttl,
+  };
+}
 
 function copyTree(tree: RunTreeRef | 'host' | 'none'): RunTreeRef | 'host' | 'none' {
   return typeof tree === 'object' ? { session: tree.session, run: tree.run } : tree;
@@ -364,6 +424,3 @@ function key(tree: RunTreeRef): string {
   return `${tree.session}:run-tree:${tree.run}`;
 }
 
-function spent(limit: string): HarnessError {
-  return HarnessError.runNotPermitted(`This resumed subagent may not run: its run tree's ${limit} budget is spent.`);
-}

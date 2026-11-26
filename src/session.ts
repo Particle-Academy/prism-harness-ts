@@ -380,6 +380,46 @@ export class Session {
   }
 
   /**
+   * A runner start commits the child's records (G-387 round 7), in ONE
+   * locked write: its binding, depth, the ceiling the runner gave it with
+   * its count started again at 0 and `hold` held under the starting run's
+   * id, and the run tree and plan ledger it belongs to. It re-checks that no
+   * turn on the child holds part of its count (a resume that claimed since
+   * the start read it): then nothing is written and false is returned.
+   *
+   * @internal Written by the runtime when a runner start commits.
+   */
+  async rememberChildStart(binding: ModelBinding, depth: number, ceiling: number, hold: { runId: string; steps: number; at: number }, ttlSeconds: number, refs: ChildRefs): Promise<boolean> {
+    let written = false;
+    this.#assertWritable();
+    const name = this.#durableKey();
+    await this.#durable.withLock(name, async () => {
+      const stored = (await this.#durable.get(name)) ?? {};
+      const { child_ceiling: _old, child_steps: count, ...rest } = stored;
+      if (hasLiveHold(count, hold.at, ttlSeconds)) return;
+      const holds: JsonObject = hold.steps < 1 ? {} : { [hold.runId]: { steps: hold.steps, at: hold.at } };
+      await this.#durable.put(name, {
+        ...rest,
+        child_binding: {
+          session: { ...binding.session },
+          declared: { ...binding.declared },
+          parent_mode: { ...binding.parentMode },
+        },
+        child_depth: Number.isSafeInteger(depth) && depth > 0 ? depth : 0,
+        child_ceiling: Number.isSafeInteger(ceiling) && ceiling > 0 ? ceiling : 0,
+        child_steps: { steps: 0, holds, charged: {} },
+        child_refs: {
+          tree: refs.tree === null ? null : { ...refs.tree },
+          plan_ledger: refs.planLedger === null ? null : { ...refs.planLedger },
+        },
+      });
+      written = true;
+    }, 10, 5);
+
+    return written;
+  }
+
+  /**
    * Claim, in ONE locked write, what a turn on this child session may spend
    * of its delegation's step budget (G-387). `claim` is handed the steps the
    * delegation has used since the runner last started it, live holds

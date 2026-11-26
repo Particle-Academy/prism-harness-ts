@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased
+
+### Changed: one gate for a runner start (G-387)
+
+- A runner start (`SubagentRunner.run()`, and the subagent tool that calls it)
+  is decided by ONE pure gate, `RunStarts.gate()`, pinned across languages by
+  the harness-plans corpus 0.1.10 (`start_gate`, hpl-0084..hpl-0089). Every
+  fact is read first and nothing is written before the gate answers: the task,
+  depth, the cancel and time of the context the child would run under and of
+  the context the tool was wired with, the steps the start's allowance would
+  give, cost (a context's cost budget and the child agent's `spend_ceiling`,
+  spent or unmeterable), a turn on the child still running, an approval on it
+  a person can still answer, and what the run tree and plan would grant. The
+  first stop in that order is the reason the parent's model reads, in the
+  harness's own words.
+- A refused start writes nothing: not the child's binding, depth, ceiling,
+  count, run tree refs or mode, no run state or run history, no tree hold.
+- On start it commits in order: the run tree hold, in a conditional locked
+  write refused if the tree was spent since the gate read it; the child's
+  records, in one locked write that is refused if a turn on the child claimed
+  its count since (the tree hold is then released); then the run. Once the run
+  has begun, a later stop only stops model steps; the start is never refused
+  after its records were written.
+- The child agent's `spend_ceiling` now refuses the start (`exhausted`) before
+  the child's run begins, rather than failing the child's run on its first
+  step; no `run.started`/`run.failed` event is emitted for that child.
+- A subagent task that is not text now reaches the parent's model as "the
+  task is not text" (it was reported as empty), and a cancelled run's
+  refusal no longer repeats the host's cancel reason.
+
 ## 0.12.0
 
 Includes every fix released on the 0.11 line in 0.11.1 and 0.11.2.
