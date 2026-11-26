@@ -20,6 +20,7 @@ import {
   type ModelBinding,
   type Subagent,
 } from '../src/index.js';
+import { RunTrees } from '../src/run-trees.js';
 
 // G-381: which run tree a run belongs to is decided ONCE, when the run begins,
 // and every consumer (the tree a child saves, the budget it spends from, its
@@ -84,7 +85,7 @@ class Rig {
   onHost: () => Promise<string> = async () => 'ok';
   #call = 0;
 
-  constructor(chatSteps = 20) {
+  constructor(chatSteps = 20, researchSteps = 8) {
     const modes = new ModeRegistry({
       default: 'chat',
       modes: {
@@ -93,7 +94,7 @@ class Rig {
           subagents: { research: { mode: 'research' }, scout: { mode: 'dig' } },
         } as ModeConfig,
         research: {
-          system_prompt: 'Research.', tools: ['weather', 'dig', 'hostcall'], requires_approval: ['weather'], max_steps: 8,
+          system_prompt: 'Research.', tools: ['weather', 'dig', 'hostcall'], requires_approval: ['weather'], max_steps: researchSteps,
           subagents: { dig: { mode: 'dig' } },
         } as ModeConfig,
         dig: { system_prompt: 'Dig.', tools: [], max_steps: 4 } as ModeConfig,
@@ -915,5 +916,83 @@ describe('a spent root parked on a tool and a delegation', () => {
     expect(await r.pending(root)).toEqual([]);
     const after = (await treeRecord(root, first))!;
     expect(after.steps as number).toBeLessThanOrEqual(after.max_steps as number);
+  });
+});
+
+/** What the row `session` is parked on says its root has left of its own step budget. */
+async function stepsLeftOnRow(session: Session): Promise<unknown> {
+  const rows = (await session.thread().messages()).map((entry) => entry.message);
+
+  return [...rows].reverse().find((row) => row.type === 'assistant' && Array.isArray(row.tool_approval_requests))?.harness_steps_left;
+}
+
+// Review round 5, F-1: what a re-park row says is left is the resume's OWN
+// starting allowance less the steps it took, never what the tree record could
+// grant at that moment. A sibling holding part of the record while the root
+// resumes makes the grant partial; the root's own budget is not spent, so
+// after the next approval it carries on with a model step.
+describe('a root resumed while a sibling holds part of its tree', () => {
+  it('records its own steps left on its next pause, and continues after the decision', async () => {
+    const r = new Rig(6, 3);
+    const root = r.session(1);
+    r.calls([['research', { task: 'Find the weather.' }]]); // root: step 1
+    r.calls([['weather', { city: 'Paris' }]]);              // research child: step 2, parks
+    r.calls([['weather', { city: 'Rome' }]]);               // root: step 3, parks
+    const first = (await r.runtime.send(root, 'Go')).runId;
+    const child = r.session(1, 'chat::sub::research');
+    const [childId] = await r.pending(child);
+    const [rootId] = await r.pending(root);
+    await recordApproval(child, childId!, true);
+    await recordApproval(root, rootId!, true);
+
+    // The child resumes and holds part of the tree; inside its model call the
+    // root resumes, is granted what is left, and parks again.
+    r.beforeRequest = async () => {
+      await r.runtime.send(r.session(1), '');
+    };
+    r.calls([['weather', { city: 'Oslo' }]]);               // root, resumed: parks again
+    r.text('Child done.');                                  // the child
+    await r.runtime.send(child, '');
+    expect(await stepsLeftOnRow(root)).toBe(2);
+    const [again] = await r.pending(root);
+    expect(again).toBeDefined();
+    const requests = r.requests.length;
+
+    r.text('Would continue.');
+    await recordApproval(root, again!, true);
+    const resumed = await r.runtime.send(root, '');
+
+    expect(r.requests.length).toBe(requests + 1);
+    expect(resumed.text).toBe('Would continue.');
+    const record = (await treeRecord(root, first))!;
+    expect(record.steps as number).toBeLessThanOrEqual(record.max_steps as number);
+  });
+});
+
+// A row written without harness_steps_left (by a harness before 0.12) says
+// nothing of the root's own budget: its decision takes the tree record's
+// check, and a spent tree refuses it before anything is recorded.
+describe('a legacy parked row with no step field', () => {
+  it('keeps the tree refusal', async () => {
+    const r = new Rig(3);
+    const root = r.session(1);
+    const legacy = vi.spyOn(RunTrees, 'ownStepsLeft').mockReturnValue(null);
+    try {
+      r.calls([['research', { task: 'Find the weather.' }]]); // root: step 1
+      r.text('Child answer.');                                // child: step 2
+      r.calls([['weather', { city: 'Rome' }]]);               // root: step 3, parks
+      const first = (await r.runtime.send(root, 'Go')).runId;
+      const record = (await treeRecord(root, first))!;
+      expect(record.steps).toBe(record.max_steps);
+    } finally {
+      legacy.mockRestore();
+    }
+    expect(await stepsLeftOnRow(root)).toBeUndefined();
+    const [id] = await r.pending(root);
+    const rows = (await root.thread().messages()).length;
+
+    await expect(recordApproval(root, id!, true)).rejects.toMatchObject({ code: 'run_not_permitted' });
+    expect(await r.pending(root)).toEqual([id]);
+    expect((await root.thread().messages()).length).toBe(rows);
   });
 });
