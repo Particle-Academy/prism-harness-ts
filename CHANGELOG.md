@@ -77,16 +77,21 @@ Includes every fix released on the 0.11 line in 0.11.1 and 0.11.2.
   the recorded decisions (that a denial-only batch started, too): they stay
   recorded for a later resume that can act on them. A new prompt under such a
   context, on a session parked on approvals, is refused (`run_not_permitted`)
-  before anything is recorded, so it cannot end the parked turn.
+  before anything is recorded, so it cannot end the parked turn; a runner
+  start refused that way leaves the child's saved records unchanged.
 - The subagent runner refuses (`denied`, a framed result, nothing written to
   the child) a task that is not text, or that consists only of the blank
   codepoints U+0009-U+000D, U+0020, U+0085, U+00A0, U+1680, U+2000-U+200D,
   U+2028, U+2029, U+202F, U+205F, U+2060, U+3000 and U+FEFF (the same set in
   every port); a delegation into a child that is waiting on a person to
   answer an approval that person could still answer; and one into a child
-  on which a turn is still running. Every failure while it starts or runs
-  the child is framed as `failed`, naming the error's class (and a
-  HarnessError's code), never its message.
+  on which a turn is still running. The subagent tool checks the host
+  context it was wired with first: a cancelled one, or one with nothing
+  left (an unenforceable cost cap included), returns the framed `cancelled`
+  or `exhausted` result before any child starts, inside a turn too. Every
+  failure while it starts or runs the child is framed as `failed`, naming
+  the error's class (an identifier, else `Error`) and a HarnessError's code,
+  never its message.
 - A host-supplied `RunContext` belongs to one session's turn: its ledger is
   the account every run under it spends from, so one context shared across
   sessions charges each child the steps the others took on it.

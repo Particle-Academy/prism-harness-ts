@@ -73,7 +73,15 @@ export class SubagentRunner {
         // rest: a host failure here never reaches the model as text.
         let result: SubagentResult;
         try {
-          result = await this.run(subagent, parent, turn === null ? context : narrowedTo(turn.run, context), turn?.runId ?? parentRunId, task);
+          // The host context this tool was wired with is checked FIRST, before
+          // it is narrowed to the turn (which keeps the turn's ledger): an
+          // operator's cancel, or a host budget with nothing left (an
+          // unenforceable cost cap included), stops a delegation the model
+          // asks for inside a turn too.
+          const stop = context.ledger.exhaustion(context.budget);
+          result = stop !== null
+            ? refused(subagent.name, `run_${Math.random().toString(16).slice(2, 14)}`, turn?.runId ?? parentRunId, context.ledger.cancelled ? 'cancelled' : 'exhausted', stop)
+            : await this.run(subagent, parent, turn === null ? context : narrowedTo(turn.run, context), turn?.runId ?? parentRunId, task);
         } catch (error) {
           result = refused(subagent.name, `run_${Math.random().toString(16).slice(2, 14)}`, turn?.runId ?? parentRunId, 'failed', `it failed (${failureName(error)})`);
         }
@@ -294,7 +302,21 @@ export function isBlankTask(task: string): boolean {
  * message: a store's or a host's own words do not reach a model.
  */
 function failureName(error: unknown): string {
-  if (error instanceof HarnessError) return `HarnessError ${error.code}`;
+  try {
+    if (error instanceof HarnessError) return `HarnessError ${typeof error.code === 'string' && ERROR_CODE.test(error.code) ? error.code : 'error'}`;
+    if (!(error instanceof Error)) return 'Error';
+    // The class as its prototype says, never an own `constructor` the thrown
+    // object carries; a name that is not an identifier is not reported.
+    const name: unknown = (Object.getPrototypeOf(error) as { constructor?: { name?: unknown } } | null)?.constructor?.name;
 
-  return error instanceof Error ? error.constructor.name : typeof error;
+    return typeof name === 'string' && CLASS_NAME.test(name) ? name : 'Error';
+  } catch {
+    return 'Error';
+  }
 }
+
+/** What a reported class name may look like: an identifier, at most 64 characters. */
+const CLASS_NAME = /^[A-Za-z_$][A-Za-z0-9_$]{0,63}$/;
+
+/** What a reported harness error code may look like (`session_locked`, `plan.budget_context`). */
+const ERROR_CODE = /^[a-z][a-z0-9_.]{0,63}$/;

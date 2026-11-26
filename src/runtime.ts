@@ -890,6 +890,16 @@ export class AgentRuntime {
       } else offered = (await this.#offer(session, mode, toolNames, planTools)).tools;
       const stored = (await thread.messages()).map(entry => entry.message);
       const scope = approvalToolScope(stored);
+      // A NEW prompt on a parked session under a context that was cancelled
+      // or whose time is spent is refused: it would act on none of the parked
+      // turn's decisions, and its user row would end that turn, so they would
+      // never be acted on. (On a session with nothing parked it stops as
+      // before.) It reads only the run's ledger and time, so it is checked
+      // BEFORE anything durable is written: a refused runner start leaves the
+      // child's binding, depth, ceiling, count and tree hold as they were.
+      if (prompt !== '' && scope !== null && (run.ledger.cancelled || (run.budget.maxSeconds !== null && run.ledger.elapsedSeconds() >= run.budget.maxSeconds))) {
+        throw HarnessError.runNotPermitted('This run may not start: its run context was cancelled or has no time left.');
+      }
       // G-387: how many model steps this run may take is decided ONCE, here,
       // beside its membership, and recorded with it (RunTrees.allowed); the
       // run is narrowed to it once, and every consumer reads that record or
@@ -961,13 +971,6 @@ export class AgentRuntime {
       // A NEW prompt resumes no recorded decisions: with no step to take it
       // is refused before anything is recorded. Only a resume (an empty
       // prompt) left no step acts on its decisions without a model step.
-      // So is one on a parked session under a context that was cancelled or
-      // whose time is spent: it would act on none of the parked turn's
-      // decisions, and its user row would end that turn, so they would never
-      // be acted on. (On a session with nothing parked it stops as before.)
-      if (prompt !== '' && scope !== null && (run.ledger.cancelled || (run.budget.maxSeconds !== null && run.ledger.elapsedSeconds() >= run.budget.maxSeconds))) {
-        throw HarnessError.runNotPermitted('This run may not start: its run context was cancelled or has no time left.');
-      }
       if (prompt !== '' && allowance.acts_without_step) {
         const planIsZero = allowance.plan_left === 0 && allowance.own_left > 0 && allowance.tree_left !== 0;
         throw planIsZero
