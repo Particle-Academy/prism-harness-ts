@@ -1,6 +1,6 @@
 import type { JsonObject } from './json.js';
 import type { PrismHarness } from './harness.js';
-import { activeTurn, type AgentRuntime } from './runtime.js';
+import { activeTurn, decisionsAnswerable, type AgentRuntime } from './runtime.js';
 import type { Session } from './session.js';
 import { MAX_DEPTH, RunBudget, RunContext, type ModelBinding, type Subagent } from './subagents.js';
 import type { HarnessTool } from './tools.js';
@@ -91,10 +91,32 @@ export class SubagentRunner {
 
     // A delegation with no task is not one: an empty prompt on the child is
     // how a parked child is RESUMED, so the model could otherwise use it to
-    // act on a person's decisions on the child's behalf. Refused before the
-    // child session is built or touched.
-    if (task.trim() === '') return refused(subagent.name, runId, parentRunId, 'denied', 'the task is empty');
+    // act on a person's decisions on the child's behalf. A task arrives from
+    // the model's tool arguments, so it is checked at runtime: anything that
+    // is not text, or is blank by the one codepoint set every port spells
+    // out (isBlankTask), is refused before the child session is built.
+    const given: unknown = task;
+    if (typeof given !== 'string') return refused(subagent.name, runId, parentRunId, 'denied', 'the task is not text');
+    if (isBlankTask(given)) return refused(subagent.name, runId, parentRunId, 'denied', 'the task is empty');
 
+    // EVERY way the child can fail to start or to finish, a store or host
+    // failure included, is framed here. The parent's model reads the result,
+    // so it carries the failure's class name and never its message: a
+    // store's or a host's own words do not reach a model.
+    try {
+      return await this.#delegate(subagent, parent, context, parentRunId, given, runId);
+    } catch (error) {
+      // A child agent stopped by its own spend ceiling is the tree refusing
+      // to let it spend, not the child breaking: reported as such, so the
+      // parent does not retry it.
+      const ceiling = error instanceof HarnessError
+        && (error.code === 'agent_spend_ceiling_exceeded' || error.code === 'budget_unpriced');
+
+      return refused(subagent.name, runId, parentRunId, ceiling ? 'exhausted' : 'failed', `it failed (${failureName(error)})`);
+    }
+  }
+
+  async #delegate(subagent: Subagent, parent: Session, context: RunContext, parentRunId: string, task: string, runId: string): Promise<SubagentResult> {
     // Checked BEFORE spawning, so an exhausted tree does not pay for a session,
     // a thread write and a provider call to discover it is exhausted.
     const stop = context.ledger.exhaustion(context.budget);
@@ -112,12 +134,7 @@ export class SubagentRunner {
     // The child runs as the agent its declaration names (which the parent mode
     // had to list), else as the parent's.
     const agent = subagent.agent ?? parent.agent;
-    let binding: ModelBinding;
-    try {
-      binding = await this.#binding(subagent, parent, agent);
-    } catch (error) {
-      return refused(subagent.name, runId, parentRunId, 'failed', error instanceof Error ? error.message : String(error));
-    }
+    const binding = await this.#binding(subagent, parent, agent);
     // Marked as the runner's own, with the run whose turn is calling it (never
     // a run id the caller states): the child joins that run's tree only when
     // `context` is that turn's own (its ledger), G-381.
@@ -143,12 +160,20 @@ export class SubagentRunner {
       .pending(parent.participant, agent, parent.actor)
       .session(subagent.scopeUnder(parent.scope));
 
-    // A child a person still has to answer is theirs until they do: a new
-    // task would end the approvals it is waiting on, so the model could
-    // dismiss a person's approval by delegating again. Refused, read only,
-    // with nothing written to the child.
-    if (pendingApprovalIds((await child.thread().messages()).map((entry) => entry.message)).length > 0) {
+    // A child a person can still answer is theirs until they do: a new task
+    // would end the approvals it is waiting on, so the model could dismiss a
+    // person's approval by delegating again. An approval nobody could answer
+    // (its binding is gone, it is too deep) blocks nothing: the parent may
+    // start the child again. Read only, with nothing written to the child.
+    if (pendingApprovalIds((await child.thread().messages()).map((entry) => entry.message)).length > 0
+      && await decisionsAnswerable(child)) {
       return refused(subagent.name, runId, parentRunId, 'denied', 'it is waiting on a person to answer its approval');
+    }
+    // A turn on the child that is still running holds part of its
+    // delegation's step budget; starting the child again would reset that
+    // count under it.
+    if (await child.childTurnLive(Math.floor(Date.now() / 1000), this.runtime.holdTtl(child))) {
+      return refused(subagent.name, runId, parentRunId, 'denied', 'a turn on it is still running');
     }
 
     // The child's authority comes from ITS mode, not the parent's. Its
@@ -156,38 +181,20 @@ export class SubagentRunner {
     // session override is NOT copied onto the child session (G-321 E).
     await child.usingMode(subagent.mode);
 
-    try {
-      const response = await this.runtime.send(child, task, undefined, childContext);
+    const response = await this.runtime.send(child, task, undefined, childContext);
 
-      return {
-        subagent: subagent.name,
-        runId: response.runId,
-        parentRunId,
-        outcome: response.stoppedBecause === null ? 'completed' : 'exhausted',
-        text: response.text,
-        toToolResult(): string {
-          return response.stoppedBecause === null
-            ? response.text
-            : `The [${subagent.name}] subagent stopped early: ${response.stoppedBecause}. Partial answer: ${response.text}`;
-        },
-      };
-    } catch (error) {
-      // Framed, not thrown. Tearing down the parent run would discard work it
-      // has already done, and "that subagent failed" is something the parent
-      // can act on. A child agent stopped by its own spend ceiling is the tree
-      // refusing to let it spend, not the child breaking: reported as such, so
-      // the parent does not retry it.
-      const ceiling = error instanceof HarnessError
-        && (error.code === 'agent_spend_ceiling_exceeded' || error.code === 'budget_unpriced');
-
-      return refused(
-        subagent.name,
-        runId,
-        parentRunId,
-        ceiling ? 'exhausted' : 'failed',
-        error instanceof Error ? error.message : String(error),
-      );
-    }
+    return {
+      subagent: subagent.name,
+      runId: response.runId,
+      parentRunId,
+      outcome: response.stoppedBecause === null ? 'completed' : 'exhausted',
+      text: response.text,
+      toToolResult(): string {
+        return response.stoppedBecause === null
+          ? response.text
+          : `The [${subagent.name}] subagent stopped early: ${response.stoppedBecause}. Partial answer: ${response.text}`;
+      },
+    };
   }
 
   /** What the child resolves its provider and model from; see `ModelBinding`. */
@@ -250,4 +257,37 @@ function narrowedTo(turn: RunContext, host: RunContext): RunContext {
 
   return turn.withBudget(new RunBudget(steps, cost, lower(turn.budget.maxSeconds, host.budget.maxSeconds),
     lower(turn.budget.maxOutputTokensPerCall, host.budget.maxOutputTokensPerCall)));
+}
+
+/**
+ * The codepoints a blank task consists of, spelled as an explicit set (the
+ * G-36 pattern): identical in every port, never a language's own trim(),
+ * whose idea of whitespace differs between languages and versions.
+ * U+0009-U+000D, U+0020, U+0085, U+00A0, U+1680, U+2000-U+200D, U+2028,
+ * U+2029, U+202F, U+205F, U+2060, U+3000, U+FEFF.
+ */
+const BLANK_CODEPOINTS: ReadonlySet<number> = new Set([
+  0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x20, 0x85, 0xa0, 0x1680,
+  0x2000, 0x2001, 0x2002, 0x2003, 0x2004, 0x2005, 0x2006, 0x2007, 0x2008, 0x2009, 0x200a, 0x200b, 0x200c, 0x200d,
+  0x2028, 0x2029, 0x202f, 0x205f, 0x2060, 0x3000, 0xfeff,
+]);
+
+/** True when `task` is empty or consists only of BLANK_CODEPOINTS. */
+export function isBlankTask(task: string): boolean {
+  for (const character of task) {
+    if (!BLANK_CODEPOINTS.has(character.codePointAt(0)!)) return false;
+  }
+
+  return true;
+}
+
+/**
+ * What a framed failure says of its cause: the error's class name, and for a
+ * HarnessError its code (a fixed identifier the harness defines). Never the
+ * message: a store's or a host's own words do not reach a model.
+ */
+function failureName(error: unknown): string {
+  if (error instanceof HarnessError) return `HarnessError ${error.code}`;
+
+  return error instanceof Error ? error.constructor.name : typeof error;
 }

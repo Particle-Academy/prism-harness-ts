@@ -900,8 +900,11 @@ export class AgentRuntime {
       // A subagent child: saved references or a saved binding, or a parked
       // row that names a run tree, or names a binding on a child's address (a
       // root under a host-supplied binding writes one on its row too).
-      const linked = (await session.childBinding()) !== null || (await session.childRefs()) !== null || tail?.tree != null
-        || (tail?.binding != null && session.scope.includes('::sub::'));
+      // Any address the runner builds (`::sub::`) is a child's, whatever else
+      // is saved: a child a released version parked saved no child fields at
+      // all, and with no saved ceiling it fails closed.
+      const linked = session.scope.includes('::sub::') || (await session.childBinding()) !== null
+        || (await session.childRefs()) !== null || tail?.tree != null;
       const { facts, claimed } = await this.#allowanceFacts(session, runId, mode, contextKind, execution, prompt === '' ? tail : null, stored, linked, holdTtl);
       // A turn with no run context continues the count on its own ledger.
       if (execution == null) run.ledger.recordSteps(facts.used);
@@ -939,7 +942,7 @@ export class AgentRuntime {
           // run's steps held, in one write. Every turn on the child the runner
           // does not start claims from it.
           await session.rememberChildBinding(runnerBinding, membership.depth, own.ceiling,
-            { runId, steps: own.own_left, at: Math.floor(Date.now() / 1000) });
+            { runId, steps: own.own_left, at: Math.floor(Date.now() / 1000) }, holdTtl);
           delegation = { session, startSteps };
           if (JSON.stringify(await session.childRefs()) !== JSON.stringify(refs)) await session.rememberChildRefs(refs);
         }
@@ -1630,7 +1633,7 @@ async function writeDecisions(session: Session, decisions: readonly ApprovalDeci
   // model step. A decision the resuming turn could not act on at all is
   // refused here, with nothing written; so is a plan step handed a run tree
   // of its own.
-  await assertActionable(session, rows, context);
+  await assertActionable(session, rows, context, decisions.every((decision) => !decision.approved));
   await session.planService()?.assertDecisionsFunded(session, decisions.map((decision) => decision.approvalId), context);
 
   const run = await session.run();
@@ -1650,13 +1653,32 @@ async function writeDecisions(session: Session, decisions: readonly ApprovalDeci
  * Refuse a decision the turn that resumes it could not act on, with the
  * checks that turn runs, before anything is recorded (G-387): a subagent
  * child whose binding is missing, a run nested too deep, and a supplied run
- * context whose ledger was cancelled or whose time is spent. A recorded
+ * context whose ledger was cancelled or (for a batch with an approval in it)
+ * whose time is spent. A recorded
  * decision no turn can act on would be an approval accepted and never run.
  * (This port has no per-run tool-call limit to check.)
  *
  * @throws HarnessError `child_binding_missing` or `run_not_permitted`
  */
-async function assertActionable(session: Session, rows: readonly JsonObject[], context: RunContext | undefined): Promise<void> {
+/**
+ * True when a person could still answer the approvals `session` is parked on:
+ * a decision on them, with no run context, would be accepted (G-387). The
+ * subagent runner reads it before it starts a parked child again.
+ *
+ * @internal Read by SubagentRunner.
+ */
+export async function decisionsAnswerable(session: Session): Promise<boolean> {
+  try {
+    await assertActionable(session, (await session.thread().messages()).map((entry) => entry.message), undefined);
+
+    return true;
+  } catch (error) {
+    if (error instanceof HarnessError) return false;
+    throw error;
+  }
+}
+
+async function assertActionable(session: Session, rows: readonly JsonObject[], context: RunContext | undefined, onlyDenials = false): Promise<void> {
   const execution = executionContext(context);
   const tail = RunTrees.contextKind(context) === 'runner' ? null : pausedRunState(rows);
   const savedBinding = (await session.childBinding()) ?? tail?.binding ?? null;
@@ -1671,8 +1693,11 @@ async function assertActionable(session: Session, rows: readonly JsonObject[], c
   if (execution.ledger.cancelled) {
     throw HarnessError.runNotPermitted('This decision may not be recorded: the run tree it would resume in was cancelled.');
   }
+  // Acting on a denial runs nothing, so a batch of denials only is not
+  // refused for a spent time limit; a cancelled context still refuses it,
+  // and a batch with an approval in it keeps the check.
   const seconds = execution.budget.maxSeconds;
-  if (seconds !== null && execution.ledger.elapsedSeconds() >= seconds) {
+  if (!onlyDenials && seconds !== null && execution.ledger.elapsedSeconds() >= seconds) {
     throw HarnessError.runNotPermitted('This decision may not be recorded: the run it would resume in has no time left.');
   }
 }

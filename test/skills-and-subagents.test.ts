@@ -217,7 +217,10 @@ describe('SubagentRunner', () => {
     );
 
     expect(result.outcome).toBe('failed');
-    expect(result.toToolResult()).toContain('provider is down');
+    // Framed with the failure's class only (G-387): the provider's own words
+    // never reach the parent's model.
+    expect(result.toToolResult()).toContain('it failed (Error)');
+    expect(result.toToolResult()).not.toContain('provider is down');
   });
 
   it('draws the child budget from what the TREE has left', async () => {

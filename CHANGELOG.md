@@ -20,20 +20,28 @@ Includes every fix released on the 0.11 line in 0.11.1 and 0.11.2.
   with no context, a metadata context or a host context, a new message, an
   empty send) claims from it, in one locked write against a durable count of
   the steps the child has used since the runner last started it, so two turns
-  running at once never both spend the same remainder. A hold whose turn
-  never settles is charged in full once the lock TTL has passed. A runner
-  start begins the count again. A host context can only lower what is left,
-  never raise it.
-- A subagent child session (saved run tree references or a binding, or a
-  parked row that names one) with no saved ceiling, or with one that is not a
-  non-negative whole number, fails closed: its approved calls still run, it
-  takes no model step, and a new message to it is refused before anything is
-  recorded. Only a session that was never a child runs on its mode's
-  `max_steps`.
-- A step budget that is not a finite, non-negative number is refused:
-  `new RunBudget(NaN)`, `Infinity`, `undefined` or `-1` throws `TypeError`,
-  and a run context whose budget is not a number (a host-built object) has no
-  step left.
+  running at once never both spend the same remainder. A turn is charged
+  what it took when it ends, parks or fails, even when it ran past the lock
+  TTL; a hold whose turn never settles is charged in full once the lock TTL
+  has passed, and replaced by what the turn took if it settles after all,
+  never counted twice. A count, or any part of it, that is not a
+  non-negative whole number fails closed (no model step) and is never
+  repaired; only a runner start writes a fresh one. A runner start begins
+  the count again, and is refused while a turn on the child is still
+  running. A host context can only lower what is left, never raise it.
+- A subagent child session fails closed when it has no saved ceiling, or
+  one that is not a non-negative whole number: its approved calls still run,
+  it takes no model step, and a new message to it is refused before anything
+  is recorded. A session is a child when its address is one the runner
+  builds (`::sub::` in its scope), including a child a released version
+  parked, or when it has saved run tree references, a saved binding, or a
+  parked row that names a run tree. Any other session runs on its mode's
+  `max_steps`, or on a host context's budget.
+- A step budget that is not a whole, non-negative number is refused:
+  `new RunBudget(NaN)`, `Infinity`, `undefined`, `-1` or `1.5`, and
+  `RunBudget.fromConfig({ max_steps: 1.5 })`, throw `TypeError`; a run
+  context whose budget is not a number (a host-built object) has no step
+  left.
 - The row a run parks on now records `harness_steps_used`: the steps the run
   had used, its subagent children's included. Its resume continues from that
   count, never from fewer than the model steps the session's own rows show; a
@@ -59,12 +67,23 @@ Includes every fix released on the 0.11 line in 0.11.1 and 0.11.2.
   written, on every decision path (`recordApproval()`, `recordDecisions()`,
   `decide()`, `streamDecision()`): a subagent child whose binding is missing
   (`child_binding_missing`), a run nested too deep, and a supplied run context
-  whose ledger was cancelled or whose time is spent (`run_not_permitted`); and
+  whose ledger was cancelled or whose time is spent (`run_not_permitted`; a
+  batch of denials only is not refused for spent time, as acting on a denial
+  runs nothing, but is for a cancelled context); and
   a plan step handed a run tree of its own (`plan.budget_context`). A resume
   under a cancelled run context runs none of the approved calls.
 - The subagent runner refuses (`denied`, a framed result, nothing written to
-  the child) a task that is empty or only whitespace, and a delegation into a
-  child that is waiting on a person to answer its approval.
+  the child) a task that is not text, or that consists only of the blank
+  codepoints U+0009-U+000D, U+0020, U+0085, U+00A0, U+1680, U+2000-U+200D,
+  U+2028, U+2029, U+202F, U+205F, U+2060, U+3000 and U+FEFF (the same set in
+  every port); a delegation into a child that is waiting on a person to
+  answer an approval that person could still answer; and one into a child
+  on which a turn is still running. Every failure while it starts or runs
+  the child is framed as `failed`, naming the error's class (and a
+  HarnessError's code), never its message.
+- A host-supplied `RunContext` belongs to one session's turn: its ledger is
+  the account every run under it spends from, so one context shared across
+  sessions charges each child the steps the others took on it.
 - A turn with a NEW prompt (it resumes no decisions) that is left no model
   step is refused before anything is recorded, as before:
   `plan_budget_exhausted` when the shared plan budget is what has nothing left

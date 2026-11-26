@@ -5,6 +5,7 @@ import { isJsonObject } from './json.js';
 import type { SessionStore } from './stores/session-store.js';
 import { StoreTaskSource } from './store-task-source.js';
 import type { StoreTaskSourceOptions } from './store-task-source.js';
+import { HarnessError } from './errors.js';
 import { Thread } from './thread.js';
 import { pausedApprovalIds, storedBinding } from './thread-rows.js';
 import type { ModelBinding } from './subagents.js';
@@ -351,9 +352,15 @@ export class Session {
    * steps the starting run may take) held under its run id, in this one
    * write.
    */
-  async rememberChildBinding(binding: ModelBinding, depth = 0, ceiling: number | null = null, hold: { runId: string; steps: number; at: number } | null = null): Promise<this> {
+  async rememberChildBinding(binding: ModelBinding, depth = 0, ceiling: number | null = null, hold: { runId: string; steps: number; at: number } | null = null, ttlSeconds = 300): Promise<this> {
     return this.#writeDurable((stored) => {
-      const { child_ceiling: _old, child_steps: _count, ...rest } = stored;
+      const { child_ceiling: _old, child_steps: count, ...rest } = stored;
+      // A new delegation never wipes a turn on the child that is still
+      // running: its hold would be lost, and its steps counted nowhere. The
+      // runner refuses such a delegation first; this refuses the race.
+      if (ceiling !== null && hold !== null && hasLiveHold(count, hold.at, ttlSeconds)) {
+        throw HarnessError.runNotPermitted('This subagent may not be started again: a turn on it is still running.');
+      }
       const holds: JsonObject = hold === null || hold.steps < 1 ? {} : { [hold.runId]: { steps: hold.steps, at: hold.at } };
 
       return {
@@ -366,7 +373,7 @@ export class Session {
         child_depth: Number.isSafeInteger(depth) && depth > 0 ? depth : 0,
         ...(ceiling === null ? {} : {
           child_ceiling: Number.isSafeInteger(ceiling) && ceiling > 0 ? ceiling : 0,
-          child_steps: { steps: 0, holds },
+          child_steps: { steps: 0, holds, charged: {} },
         }),
       };
     });
@@ -385,30 +392,61 @@ export class Session {
    */
   async claimChildSteps(runId: string, now: number, ttlSeconds: number, claim: (used: number | null) => number): Promise<void> {
     await this.#writeDurable((stored) => {
-      const count = childSteps(stored.child_steps, now, ttlSeconds);
+      const read = childSteps(stored.child_steps);
+      // A run id that already holds (or was charged) is not a new turn: two
+      // live turns under one id would overwrite each other's hold. Closed.
+      const count = read === null || Object.hasOwn(read.holds, runId) || Object.hasOwn(read.charged, runId) ? null : expired(read, now, ttlSeconds);
       const hold = Math.max(0, Math.trunc(claim(count === null ? null : count.steps + heldSteps(count.holds))));
+      // Never repaired: a record that is not a count stays as it is.
       if (count === null) return stored;
-      const holds: JsonObject = { ...count.holds };
+      const holds: Record<string, { steps: number; at: number }> = { ...count.holds };
       if (hold > 0) holds[runId] = { steps: hold, at: now };
 
-      return { ...stored, child_steps: { steps: count.steps, holds } };
+      return { ...stored, child_steps: { steps: count.steps, holds, charged: count.charged } };
     });
   }
 
   /**
-   * Replace a turn's hold on its delegation's step budget with the steps it
-   * took. A hold already gone (charged when it expired, or reset by a new
-   * runner start) changes nothing.
+   * True when a turn on this child session holds part of its delegation's
+   * step budget and its hold has not expired: a turn on it is running.
+   *
+   * @internal Read by the subagent runner before it starts the child again.
+   */
+  async childTurnLive(now: number, ttlSeconds: number): Promise<boolean> {
+    const stored = (await this.#durable.get(this.#durableKey())) ?? {};
+
+    return hasLiveHold(stored.child_steps, now, ttlSeconds);
+  }
+
+  /**
+   * Replace a turn's charge on its delegation's step budget with the steps it
+   * took (G-387): its hold if it is still stored, or the full charge made
+   * when another turn found it expired, never both. The run's own entry is
+   * looked up BEFORE any other hold is expired, so a turn that outlived the
+   * lock TTL is still charged what it took. A charge already gone (a new
+   * runner start reset the count) changes nothing, and a record that is not
+   * a count is never repaired.
    *
    * @internal Called by the runtime when the turn ends, parks or fails.
    */
   async settleChildSteps(runId: string, took: number, now: number, ttlSeconds: number): Promise<void> {
     await this.#writeDurable((stored) => {
-      const count = childSteps(stored.child_steps, now, ttlSeconds);
-      if (count === null || !Object.hasOwn(count.holds, runId)) return stored;
-      const { [runId]: _settled, ...holds } = count.holds;
+      const read = childSteps(stored.child_steps);
+      if (read === null) return stored;
+      const actual = Math.max(0, Math.trunc(took));
+      let steps = read.steps;
+      const holds = { ...read.holds };
+      const charged = { ...read.charged };
+      if (Object.hasOwn(holds, runId)) {
+        delete holds[runId];
+        steps += actual;
+      } else if (Object.hasOwn(charged, runId)) {
+        steps = Math.max(0, steps - charged[runId]!) + actual;
+        delete charged[runId];
+      } else return stored;
+      const count = expired({ steps, holds, charged }, now, ttlSeconds);
 
-      return { ...stored, child_steps: { steps: count.steps + Math.max(0, Math.trunc(took)), holds } };
+      return { ...stored, child_steps: { steps: count.steps, holds: count.holds, charged: count.charged } };
     });
   }
 
@@ -707,22 +745,63 @@ export class Session {
   }
 }
 
-/** A delegation's step count as stored, with every hold older than the TTL charged in full; null when missing or malformed. */
-function childSteps(value: JsonValue | undefined, now: number, ttlSeconds: number): { steps: number; holds: Record<string, { steps: number; at: number }> } | null {
-  if (!isJsonObject(value) || !isJsonObject(value.holds)) return null;
-  const count = value.steps;
-  if (typeof count !== 'number' || !Number.isSafeInteger(count) || count < 0) return null;
-  let steps = count;
-  const holds: Record<string, { steps: number; at: number }> = {};
+interface ChildCount {
+  steps: number;
+  holds: Record<string, { steps: number; at: number }>;
+  /** The full charge made for each run whose hold expired, until that run settles. */
+  charged: Record<string, number>;
+}
+
+/** A non-negative safe integer. */
+function count(value: JsonValue | undefined): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+/**
+ * A delegation's step count as stored, or null when the record, `steps` or
+ * `holds` is missing, or any of them, a hold's `steps` or `at`, or a charge,
+ * is not a non-negative safe integer: the turn then fails closed. `charged`
+ * may be absent (none).
+ */
+function childSteps(value: JsonValue | undefined): ChildCount | null {
+  if (!isJsonObject(value) || !isJsonObject(value.holds) || !count(value.steps)) return null;
+  const holds: ChildCount['holds'] = {};
   for (const [id, hold] of Object.entries(value.holds)) {
-    if (!isJsonObject(hold)) return null;
-    const held = hold.steps, at = hold.at;
-    if (typeof held !== 'number' || !Number.isSafeInteger(held) || held < 0 || typeof at !== 'number' || !Number.isFinite(at)) return null;
-    if (now - at >= ttlSeconds) steps += held;
-    else holds[id] = { steps: held, at };
+    if (!isJsonObject(hold) || !count(hold.steps) || !count(hold.at)) return null;
+    holds[id] = { steps: hold.steps, at: hold.at };
+  }
+  const charged: ChildCount['charged'] = {};
+  if (value.charged !== undefined) {
+    if (!isJsonObject(value.charged)) return null;
+    for (const [id, steps] of Object.entries(value.charged)) {
+      if (!count(steps)) return null;
+      charged[id] = steps;
+    }
   }
 
-  return { steps, holds };
+  return { steps: value.steps, holds, charged };
+}
+
+/** The count with every hold older than the TTL charged in full, and its charge kept under its run id. */
+function expired(read: ChildCount, now: number, ttlSeconds: number): ChildCount {
+  let steps = read.steps;
+  const holds: ChildCount['holds'] = {};
+  const charged = { ...read.charged };
+  for (const [id, hold] of Object.entries(read.holds)) {
+    if (now - hold.at >= ttlSeconds) {
+      steps += hold.steps;
+      charged[id] = (charged[id] ?? 0) + hold.steps;
+    } else holds[id] = hold;
+  }
+
+  return { steps, holds, charged };
+}
+
+/** A stored count with a hold that has not expired. A record that is not a count has none (a runner start may replace it). */
+function hasLiveHold(value: JsonValue | undefined, now: number, ttlSeconds: number): boolean {
+  const read = childSteps(value);
+
+  return read !== null && Object.values(read.holds).some((hold) => now - hold.at < ttlSeconds);
 }
 
 function heldSteps(holds: Record<string, { steps: number }>): number {
