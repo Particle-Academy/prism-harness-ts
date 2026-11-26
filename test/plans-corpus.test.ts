@@ -20,6 +20,7 @@ import {
 } from '../src/index.js';
 import { RunTrees } from '../src/run-trees.js';
 import { RunBudgets } from '../src/run-budgets.js';
+import { RunStarts } from '../src/run-starts.js';
 
 // The cross-language plans corpus (G-360, prism-parity suites/harness-plans).
 // Each case runs its ops through the pure PlanMachine and PlanView, the same
@@ -63,6 +64,7 @@ function runPlansCase(entry: PlansCase): { results: unknown[]; final: unknown; b
         : op.op === 'binding_context' ? plansBindingContextOp(op, state)
         : op.op === 'tree_membership' || op.op === 'kept_refs' ? plansTreeOp(op)
         : op.op === 'step_allowance' ? plansAllowanceOp(op)
+        : op.op === 'start_gate' ? plansStartGateOp(op)
         : String(op.op).startsWith('budget_') ? plansBudgetOp(op, state, now) : plansOp(op, state, ids, limits, now));
     } catch (error) {
       if (!(error instanceof PlanRefused)) throw error;
@@ -161,6 +163,25 @@ function plansAllowanceOp(op: Op): unknown {
       allowance: RunBudgets.allowance({
         kind: op.context, modeSteps: op.mode_steps, savedCeiling: op.saved_ceiling, contextLeft: op.context_left,
         stepsCeiling: op.steps_ceiling, used: op.used, treeLeft: op.tree_left, planLeft: op.plan_left, took: op.took,
+      }),
+    };
+  } catch (error) {
+    if (error instanceof RangeError) return { invalid: true };
+    throw error;
+  }
+}
+
+/**
+ * A runner start's one gate (G-387 round 7): RunStarts.gate, pure, from the
+ * corpus's facts, each passed as the corpus states it (the task raw); an
+ * unknown cost or pending state is {invalid: true}.
+ */
+function plansStartGateOp(op: Op): unknown {
+  try {
+    return {
+      gate: RunStarts.gate({
+        task: op.task, tooDeep: op.too_deep, cancelled: op.cancelled, timeSpent: op.time_spent, stepsLeft: op.steps_left,
+        cost: op.cost, childBusy: op.child_busy, childPending: op.child_pending, treeLeft: op.tree_left, planLeft: op.plan_left,
       }),
     };
   } catch (error) {
@@ -359,8 +380,8 @@ describe('the harness-plans corpus (G-360)', () => {
     return;
   }
 
-  it('vendors all 83 cases', () => {
-    expect(corpus.cases).toHaveLength(83);
+  it('vendors all 89 cases', () => {
+    expect(corpus.cases).toHaveLength(89);
   });
 
   it.each(corpus.cases.map((entry) => [entry.id, entry] as const))('%s runs as the reference recorded it', (_id, entry) => {
