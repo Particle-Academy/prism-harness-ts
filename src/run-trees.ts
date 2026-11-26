@@ -49,6 +49,11 @@ interface Member extends TreeMembership {
   ledger: RunLedger;
   /** The run's own step ceiling, before any tree narrows it. */
   ownMaxSteps: number;
+  /**
+   * An open root's own steps left when it started (the measure rootRun
+   * computes) and its ledger's steps then; null until rootRun has run.
+   */
+  base: { left: number; steps: number } | null;
 }
 
 /** Runs of this process holding a run tree's budget, by run id, until they end. */
@@ -157,7 +162,7 @@ export const RunTrees = {
 
   /** Record a live run's membership, once its run context exists and before any tool runs, with its own step ceiling (before any tree narrows it). */
   enter(session: Session, runId: string, membership: TreeMembership, run: RunContext): void {
-    members.set(runId, { ...membership, session: session.key(), ledger: run.ledger, ownMaxSteps: run.budget.maxSteps });
+    members.set(runId, { ...membership, session: session.key(), ledger: run.ledger, ownMaxSteps: run.budget.maxSteps, base: null });
   },
 
   /**
@@ -169,14 +174,17 @@ export const RunTrees = {
   ownStepsLeft(runId: string): number | null {
     const member = members.get(runId);
     if (member === undefined || member.route !== 'open') return null;
-    // A root holding from its tree is capped by the ceiling it was narrowed
-    // to: its ledger was rebuilt from its own rows at the resume, so the
-    // steps its children took before an earlier pause are counted in that
-    // ceiling, not on the ledger.
-    const entry = runs.get(runId);
-    const ceiling = entry?.held === true ? Math.min(member.ownMaxSteps, entry.budget.maxSteps) : member.ownMaxSteps;
+    // What this run had left of its own budget when it started, less the
+    // steps it took since. At a resume the ledger is rebuilt from the root's
+    // own rows, so a runner child's steps from before an earlier pause are
+    // not on it; the starting allowance already counts them (it is the
+    // smaller of the rebuilt measure and the previous row), so the row stays
+    // exact at every pause. Never what the tree record could grant: a
+    // sibling holding part of the record makes that partial, and the tree
+    // is checked on its own.
+    if (member.base !== null) return Math.max(0, member.base.left - (member.ledger.steps - member.base.steps));
 
-    return Math.max(0, ceiling - member.ledger.steps);
+    return Math.max(0, member.ownMaxSteps - member.ledger.steps);
   },
 
   /** The recorded membership of a live run of this process, or null. */
@@ -208,6 +216,8 @@ export const RunTrees = {
     let left = run.budget.maxSteps - run.ledger.steps;
     if (membership.route === 'open' && stepsLeft !== null) left = Math.min(left, stepsLeft);
     const ownLeft = left > 0;
+    const member = members.get(runId);
+    if (membership.route === 'open' && member !== undefined) member.base = { left: Math.max(0, left), steps: run.ledger.steps };
     if (membership.route === 'open' && !ownLeft && run.budget.maxSteps > run.ledger.steps) {
       // Spent by that measure: it acts on the decisions and takes no further step.
       run = run.withBudget(new RunBudget(run.ledger.steps, run.budget.maxCostUsd, run.budget.maxSeconds, run.budget.maxOutputTokensPerCall));
