@@ -267,17 +267,29 @@ the row a run parks on (`harness_steps_used`, its subagent children's steps
 included) and its resume continues from them. A child session with no usable
 saved ceiling or count, or a parked row whose count is missing or not a
 non-negative whole number, fails closed: the approved calls run, and no model
-step is taken. A budget that is not a finite number is refused (`RunBudget`
-throws `TypeError`) or, from a host-built object, leaves no step.
+step is taken. A session is a child when its address is one the runner builds
+(`::sub::` in its scope), or it has saved run tree references, a saved
+binding, or a parked row that names a run tree. A turn is charged what it
+took when it ends, even after the lock TTL. A budget that is not a whole,
+non-negative number is refused (`RunBudget` throws `TypeError`) or, from a
+host-built object, leaves no step.
+
+A host-supplied `RunContext` belongs to ONE session's turn. Its ledger is the
+account every run under it spends from: share one context across sessions and
+every child is charged the steps the others took on it. Build a context per
+turn.
 
 A decision its resume could not act on is refused before it is written: a
 child whose binding is missing, a run nested too deep, a supplied run context
 that was cancelled or is out of time. A spent step or cost budget never
 refuses one: the resume runs the approved call and takes no model step. An
 approved subagent call on a run with no step left is acted on, and its result
-is the runner's refusal (the child did not run). The runner also refuses an
-empty task, and a delegation into a child that is waiting on a person's
-answer. Every other `send()` starts a new run tree with the full
+is the runner's refusal (the child did not run). The runner also refuses a
+task that is not text or is blank (only the codepoints listed in the
+CHANGELOG, the same set in every port), a delegation into a child that is
+waiting on an answer a person could still give, and one into a child a turn
+is still running on. Any failure while it starts or runs the child comes back
+as a framed `failed` result naming the error's class, never its message. Every other `send()` starts a new run tree with the full
 ceiling, and so does each `plan.advance()` called without a context. To hold
 the steps of a plan to one ceiling, pass the same `RunContext` to every
 `advance(context)`; that context's budget then bounds the whole plan, its step

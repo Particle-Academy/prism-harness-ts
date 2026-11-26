@@ -31,18 +31,21 @@ export class RunBudget {
     readonly maxSeconds: number | null = null,
     readonly maxOutputTokensPerCall: number | null = null,
   ) {
-    // A step cap that is not a finite, non-negative number is no cap at all:
-    // NaN compares false against every count, so a run under it would never
-    // be stopped. Refused here rather than read as unlimited (G-387).
-    if (typeof maxSteps !== 'number' || !Number.isFinite(maxSteps) || maxSteps < 0) throw new TypeError('A step budget must be a finite, non-negative number of steps.');
+    // A step cap that is not a whole, non-negative number of steps is no cap
+    // at all: NaN compares false against every count, so a run under it would
+    // never be stopped. Refused here rather than read as unlimited (G-387),
+    // and a fraction is refused as the PHP and Python ports refuse it.
+    if (typeof maxSteps !== 'number' || !Number.isSafeInteger(maxSteps) || maxSteps < 0) throw new TypeError('A step budget must be a whole, non-negative number of steps.');
     if (maxOutputTokensPerCall !== null && (!Number.isSafeInteger(maxOutputTokensPerCall) || maxOutputTokensPerCall < 1)) throw new TypeError('Output ceilings must be positive integers or null.');
   }
 
   static fromConfig(config: Record<string, unknown>, defaultSteps = 8): RunBudget {
     const output = config.max_output_tokens_per_call;
     if (output !== undefined && output !== null && (typeof output !== 'number' || !Number.isSafeInteger(output) || output < 1)) throw new TypeError('Output ceilings must be positive integers or null.');
+    const steps = config.max_steps;
+    if (steps !== undefined && steps !== null && (typeof steps !== 'number' || !Number.isSafeInteger(steps) || steps < 0)) throw new TypeError('A step budget must be a whole, non-negative number of steps.');
     return new RunBudget(
-      numberOr(config.max_steps, defaultSteps),
+      (steps as number | null | undefined) ?? defaultSteps,
       numberOrNull(config.max_cost_usd),
       numberOrNull(config.max_seconds),
       output ?? null,
@@ -576,10 +579,6 @@ function lesser(a: number | null, b: number | null): number | null {
   if (b === null) return a;
 
   return Math.min(a, b);
-}
-
-function numberOr(value: unknown, fallback: number): number {
-  return typeof value === 'number' && Number.isFinite(value) ? Math.trunc(value) : fallback;
 }
 
 function numberOrNull(value: unknown): number | null {

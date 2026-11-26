@@ -900,8 +900,11 @@ export class AgentRuntime {
       // A subagent child: saved references or a saved binding, or a parked
       // row that names a run tree, or names a binding on a child's address (a
       // root under a host-supplied binding writes one on its row too).
-      const linked = (await session.childBinding()) !== null || (await session.childRefs()) !== null || tail?.tree != null
-        || (tail?.binding != null && session.scope.includes('::sub::'));
+      // Any address the runner builds (`::sub::`) is a child's, whatever else
+      // is saved: a child a released version parked saved no child fields at
+      // all, and with no saved ceiling it fails closed.
+      const linked = session.scope.includes('::sub::') || (await session.childBinding()) !== null
+        || (await session.childRefs()) !== null || tail?.tree != null;
       const { facts, claimed } = await this.#allowanceFacts(session, runId, mode, contextKind, execution, prompt === '' ? tail : null, stored, linked, holdTtl);
       // A turn with no run context continues the count on its own ledger.
       if (execution == null) run.ledger.recordSteps(facts.used);
@@ -939,7 +942,7 @@ export class AgentRuntime {
           // run's steps held, in one write. Every turn on the child the runner
           // does not start claims from it.
           await session.rememberChildBinding(runnerBinding, membership.depth, own.ceiling,
-            { runId, steps: own.own_left, at: Math.floor(Date.now() / 1000) });
+            { runId, steps: own.own_left, at: Math.floor(Date.now() / 1000) }, holdTtl);
           delegation = { session, startSteps };
           if (JSON.stringify(await session.childRefs()) !== JSON.stringify(refs)) await session.rememberChildRefs(refs);
         }
@@ -1656,6 +1659,24 @@ async function writeDecisions(session: Session, decisions: readonly ApprovalDeci
  *
  * @throws HarnessError `child_binding_missing` or `run_not_permitted`
  */
+/**
+ * True when a person could still answer the approvals `session` is parked on:
+ * a decision on them, with no run context, would be accepted (G-387). The
+ * subagent runner reads it before it starts a parked child again.
+ *
+ * @internal Read by SubagentRunner.
+ */
+export async function decisionsAnswerable(session: Session): Promise<boolean> {
+  try {
+    await assertActionable(session, (await session.thread().messages()).map((entry) => entry.message), undefined);
+
+    return true;
+  } catch (error) {
+    if (error instanceof HarnessError) return false;
+    throw error;
+  }
+}
+
 async function assertActionable(session: Session, rows: readonly JsonObject[], context: RunContext | undefined): Promise<void> {
   const execution = executionContext(context);
   const tail = RunTrees.contextKind(context) === 'runner' ? null : pausedRunState(rows);
