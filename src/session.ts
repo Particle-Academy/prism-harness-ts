@@ -329,27 +329,32 @@ export class Session {
    * The step ceiling the subagent runner gave this session's child run when
    * it last started it (G-387): the least of its declared max_steps, what
    * its parent had left and max_steps_ceiling. Every turn on the child the
-   * runner does not start is held to it. Null for a session the runner never
-   * started, or one started before the ceiling was kept here. A stored value
-   * that is not a non-negative whole number reads as 0: fails closed.
+   * runner does not start is held to it: it is the delegation's budget for
+   * its whole life, until the runner starts it again. Null for a session
+   * with none saved; `invalid` for a stored value that is not a
+   * non-negative safe integer (the runtime fails closed on it).
    *
    * @internal Read by the runtime.
    */
-  async childCeiling(): Promise<number | null> {
+  async childCeiling(): Promise<number | null | 'invalid'> {
     const stored = (await this.#durable.get(this.#durableKey())) ?? {};
     if (!Object.hasOwn(stored, 'child_ceiling') || stored.child_ceiling === undefined) return null;
     const ceiling = stored.child_ceiling;
 
-    return typeof ceiling === 'number' && Number.isSafeInteger(ceiling) && ceiling >= 0 ? ceiling : 0;
+    return typeof ceiling === 'number' && Number.isSafeInteger(ceiling) && ceiling >= 0 ? ceiling : 'invalid';
   }
 
   /**
    * @internal Written by the runtime when the subagent runner starts a child
-   * run, with the step ceiling it started it under (null keeps none).
+   * run, with the step ceiling it started it under (null keeps none). A
+   * ceiling starts the delegation's step count again at 0, with `hold` (the
+   * steps the starting run may take) held under its run id, in this one
+   * write.
    */
-  async rememberChildBinding(binding: ModelBinding, depth = 0, ceiling: number | null = null): Promise<this> {
+  async rememberChildBinding(binding: ModelBinding, depth = 0, ceiling: number | null = null, hold: { runId: string; steps: number; at: number } | null = null): Promise<this> {
     return this.#writeDurable((stored) => {
-      const { child_ceiling: _old, ...rest } = stored;
+      const { child_ceiling: _old, child_steps: _count, ...rest } = stored;
+      const holds: JsonObject = hold === null || hold.steps < 1 ? {} : { [hold.runId]: { steps: hold.steps, at: hold.at } };
 
       return {
         ...rest,
@@ -359,8 +364,51 @@ export class Session {
           parent_mode: { ...binding.parentMode },
         },
         child_depth: Number.isSafeInteger(depth) && depth > 0 ? depth : 0,
-        ...(ceiling === null ? {} : { child_ceiling: Number.isSafeInteger(ceiling) && ceiling > 0 ? ceiling : 0 }),
+        ...(ceiling === null ? {} : {
+          child_ceiling: Number.isSafeInteger(ceiling) && ceiling > 0 ? ceiling : 0,
+          child_steps: { steps: 0, holds },
+        }),
       };
+    });
+  }
+
+  /**
+   * Claim, in ONE locked write, what a turn on this child session may spend
+   * of its delegation's step budget (G-387). `claim` is handed the steps the
+   * delegation has used since the runner last started it, live holds
+   * included (an expired hold is charged in full first), or null when that
+   * count is missing or malformed, and returns the steps to hold under
+   * `runId`. Two turns on one child can therefore never both spend the same
+   * remainder.
+   *
+   * @internal Called by the runtime when a turn the runner did not start begins.
+   */
+  async claimChildSteps(runId: string, now: number, ttlSeconds: number, claim: (used: number | null) => number): Promise<void> {
+    await this.#writeDurable((stored) => {
+      const count = childSteps(stored.child_steps, now, ttlSeconds);
+      const hold = Math.max(0, Math.trunc(claim(count === null ? null : count.steps + heldSteps(count.holds))));
+      if (count === null) return stored;
+      const holds: JsonObject = { ...count.holds };
+      if (hold > 0) holds[runId] = { steps: hold, at: now };
+
+      return { ...stored, child_steps: { steps: count.steps, holds } };
+    });
+  }
+
+  /**
+   * Replace a turn's hold on its delegation's step budget with the steps it
+   * took. A hold already gone (charged when it expired, or reset by a new
+   * runner start) changes nothing.
+   *
+   * @internal Called by the runtime when the turn ends, parks or fails.
+   */
+  async settleChildSteps(runId: string, took: number, now: number, ttlSeconds: number): Promise<void> {
+    await this.#writeDurable((stored) => {
+      const count = childSteps(stored.child_steps, now, ttlSeconds);
+      if (count === null || !Object.hasOwn(count.holds, runId)) return stored;
+      const { [runId]: _settled, ...holds } = count.holds;
+
+      return { ...stored, child_steps: { steps: count.steps + Math.max(0, Math.trunc(took)), holds } };
     });
   }
 
@@ -657,4 +705,26 @@ export class Session {
 
     return this;
   }
+}
+
+/** A delegation's step count as stored, with every hold older than the TTL charged in full; null when missing or malformed. */
+function childSteps(value: JsonValue | undefined, now: number, ttlSeconds: number): { steps: number; holds: Record<string, { steps: number; at: number }> } | null {
+  if (!isJsonObject(value) || !isJsonObject(value.holds)) return null;
+  const count = value.steps;
+  if (typeof count !== 'number' || !Number.isSafeInteger(count) || count < 0) return null;
+  let steps = count;
+  const holds: Record<string, { steps: number; at: number }> = {};
+  for (const [id, hold] of Object.entries(value.holds)) {
+    if (!isJsonObject(hold)) return null;
+    const held = hold.steps, at = hold.at;
+    if (typeof held !== 'number' || !Number.isSafeInteger(held) || held < 0 || typeof at !== 'number' || !Number.isFinite(at)) return null;
+    if (now - at >= ttlSeconds) steps += held;
+    else holds[id] = { steps: held, at };
+  }
+
+  return { steps, holds };
+}
+
+function heldSteps(holds: Record<string, { steps: number }>): number {
+  return Object.values(holds).reduce((sum, hold) => sum + hold.steps, 0);
 }

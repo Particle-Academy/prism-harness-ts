@@ -26,7 +26,7 @@ import { ToolPolicy, argsDigest } from './tool-policy.js';
 import type { AgentMode, ModeRegistry } from './modes.js';
 import type { ChildRefs, Session } from './session.js';
 import { schemaName, schemaProblems } from './structured.js';
-import { RunBudget, RunContext, RunLedger, bindingRoute, type ModelBinding } from './subagents.js';
+import { MAX_DEPTH, RunBudget, RunContext, RunLedger, bindingRoute, type ModelBinding } from './subagents.js';
 import { RunTrees, type RunTreeRef } from './run-trees.js';
 import { RunBudgets, type AllowanceFacts } from './run-budgets.js';
 import { PLAN_BUDGET_EXHAUSTED, type RunContextKind } from './plans/budget.js';
@@ -368,40 +368,59 @@ export class AgentRuntime {
   /**
    * What a run's step allowance is computed from (RunBudgets.allowance,
    * G-387), as it begins. `resumed` is the state of the parked run this turn
-   * resumes, null for a turn that resumes nothing.
+   * resumes, null for a turn that resumes nothing; `linked` says the session
+   * is a subagent child (saved run tree references or a binding, on the
+   * session or on its parked row). Returns the facts, and whether the turn
+   * holds part of its delegation's step budget (settled when it ends).
    *
-   * - The ceiling saved with a subagent child applies on every turn the
-   *   runner did not start.
-   * - What a runner or host context has left is that context's own budget.
-   * - The steps used are what the parked run wrote on the row it parked on
-   *   (`harness_steps_used`, its children's steps included), never fewer
-   *   than the model steps its own rows show: a row cannot be forged below
-   *   the transcript it sits in, and a row written before the field existed
-   *   is counted from its rows. A field that is present and malformed fails
-   *   closed: the run has used its whole ceiling.
+   * - A subagent child's ceiling is the runner's grant, saved when the
+   *   runner started it: the delegation's budget for its whole life, until
+   *   the runner starts it again. Every turn the runner did not start claims
+   *   from it in one locked write (Session.claimChildSteps), so two turns on
+   *   one child never both spend the same remainder. A linked session with
+   *   no usable saved ceiling, or no usable count, fails closed.
+   * - What a runner or host context has left is that context's own budget;
+   *   a budget that is not a finite number has nothing left.
+   * - The steps used are the most of: the delegation's count (live holds
+   *   included), what the parked run wrote on the row it parked on
+   *   (`harness_steps_used`, its children's steps included) and the model
+   *   steps its own rows show. A malformed row count fails closed, as does
+   *   a missing one on a child.
    */
-  async #allowanceFacts(session: Session, mode: AgentMode, kind: RunContextKind, execution: RunContext | undefined, resumed: ReturnType<typeof pausedRunState>, rows: readonly JsonObject[]): Promise<AllowanceFacts> {
+  async #allowanceFacts(session: Session, runId: string, mode: AgentMode, kind: RunContextKind, execution: RunContext | undefined, resumed: ReturnType<typeof pausedRunState>, rows: readonly JsonObject[], linked: boolean, holdTtl: number): Promise<{ facts: AllowanceFacts; claimed: boolean }> {
+    const max: unknown = execution?.budget.maxSteps;
+    const saved = kind === 'runner' ? null : await session.childCeiling();
     const facts: AllowanceFacts = {
       kind,
       modeSteps: mode.maxSteps,
-      savedCeiling: kind === 'runner' ? null : await session.childCeiling(),
-      contextLeft: execution == null ? null : Math.max(0, execution.budget.maxSteps - execution.ledger.steps),
+      savedCeiling: saved === 'invalid' || (saved === null && linked) ? 0 : saved,
+      contextLeft: execution == null ? null : (typeof max === 'number' && Number.isFinite(max) ? Math.max(0, max - execution.ledger.steps) : 0),
       stepsCeiling: this.#setting(session, 'max_steps_ceiling') ?? null,
       used: 0,
       treeLeft: null,
       planLeft: null,
       took: 0,
     };
-    if (kind === 'runner' || resumed === null) return facts;
+    if (kind === 'runner') return { facts, claimed: false };
+    const closed = (base: AllowanceFacts): AllowanceFacts => {
+      const ceiling = RunBudgets.allowance({ ...base, used: 0 }).ceiling;
+
+      return { ...base, savedCeiling: ceiling, used: ceiling };
+    };
     // A session that saved a child's ceiling was written by a version that
-    // also writes the count: an absent one there is not a legacy row.
-    if (resumed.stepsUsed === 'invalid' || (resumed.stepsUsed === null && facts.savedCeiling !== null)) {
-      const ceiling = RunBudgets.allowance(facts).ceiling;
+    // also writes the row count: an absent one there is not a legacy row.
+    const rowClosed = resumed !== null && (resumed.stepsUsed === 'invalid' || (resumed.stepsUsed === null && facts.savedCeiling !== null));
+    const rowUsed = resumed === null || rowClosed ? 0 : Math.max(resumed.stepsUsed === 'invalid' ? 0 : resumed.stepsUsed ?? 0, approvalRunSteps(rows) ?? 0);
+    if (facts.savedCeiling === null) return { facts: rowClosed ? closed(facts) : { ...facts, used: rowUsed }, claimed: false };
 
-      return { ...facts, savedCeiling: ceiling, used: ceiling };
-    }
+    let claimedFacts: AllowanceFacts = closed(facts);
+    await session.claimChildSteps(runId, Math.floor(Date.now() / 1000), holdTtl, (count) => {
+      claimedFacts = count === null || rowClosed ? closed(facts) : { ...facts, used: Math.max(count, rowUsed) };
 
-    return { ...facts, used: Math.max(resumed.stepsUsed ?? 0, approvalRunSteps(rows) ?? 0) };
+      return RunBudgets.allowance(claimedFacts).own_left;
+    });
+
+    return { facts: claimedFacts, claimed: true };
   }
 
   /** The mode a session's next run resolves to, as the runtime would resolve it. */
@@ -845,6 +864,9 @@ export class AgentRuntime {
       ...tag,
     });
 
+    // A turn that holds part of its delegation's step budget (G-387): the
+    // hold is replaced by what the run took when it ends, parks or fails.
+    let delegation: { session: Session; startSteps: number } | null = null;
     try {
       // Recorded before any tool can run, so a child this run starts finds it.
       RunTrees.enter(session, runId, membership, run);
@@ -874,12 +896,18 @@ export class AgentRuntime {
       // that budget. A turn resuming a parked run continues the count the
       // parked run wrote (its children's steps included), never below the
       // steps its own rows show; a runner start is a new run.
-      const facts = await this.#allowanceFacts(session, mode, contextKind, execution, prompt === '' ? tail : null, stored);
+      const holdTtl = this.#setting(session, 'lock_ttl') ?? RESOLUTION_LOCK_SECONDS;
+      // A subagent child: saved references or a saved binding, or a parked
+      // row that names a run tree, or names a binding on a child's address (a
+      // root under a host-supplied binding writes one on its row too).
+      const linked = (await session.childBinding()) !== null || (await session.childRefs()) !== null || tail?.tree != null
+        || (tail?.binding != null && session.scope.includes('::sub::'));
+      const { facts, claimed } = await this.#allowanceFacts(session, runId, mode, contextKind, execution, prompt === '' ? tail : null, stored, linked, holdTtl);
       // A turn with no run context continues the count on its own ledger.
       if (execution == null) run.ledger.recordSteps(facts.used);
       const startSteps = run.ledger.steps;
+      if (claimed) delegation = { session, startSteps };
       const own = RunBudgets.allowance(facts);
-      const holdTtl = this.#setting(session, 'lock_ttl') ?? RESOLUTION_LOCK_SECONDS;
       // A root run opens a tree; any turn on a child session the runner did
       // not start continues the run tree it was started in, holding what it
       // may spend of it (G-366).
@@ -906,11 +934,13 @@ export class AgentRuntime {
           : { tree: typeof membership.tree === 'object' ? membership.tree : null, planLedger: savedRefs.planLedger };
         this.#childRefs.set(runId, refs);
         if (runnerStart) {
-          // With the ceiling the runner gave it (G-387), re-applied on every
-          // turn on the child the runner does not start.
-          if (JSON.stringify(await session.childBinding()) !== JSON.stringify(runnerBinding)
-            || await session.childDepth() !== membership.depth
-            || await session.childCeiling() !== own.ceiling) await session.rememberChildBinding(runnerBinding, membership.depth, own.ceiling);
+          // With the ceiling the runner gave it (G-387): the delegation's
+          // budget for its whole life, its count started again at 0 with this
+          // run's steps held, in one write. Every turn on the child the runner
+          // does not start claims from it.
+          await session.rememberChildBinding(runnerBinding, membership.depth, own.ceiling,
+            { runId, steps: own.own_left, at: Math.floor(Date.now() / 1000) });
+          delegation = { session, startSteps };
           if (JSON.stringify(await session.childRefs()) !== JSON.stringify(refs)) await session.rememberChildRefs(refs);
         }
       }
@@ -950,8 +980,11 @@ export class AgentRuntime {
       return await activeTurns.run({ sessionKey: session.key(), runId, run: turn }, async () => {
         // Decisions recorded since the run stopped are acted on FIRST, before a
         // new prompt is recorded, so the results land after the calls they answer
-        // rather than after the new turn.
-        offered = await this.#resolveApprovals(session, mode, offered, runId, called, scope?.legacy === true, steps, stepping?.locked === true);
+        // rather than after the new turn. Never in a run tree that was
+        // cancelled: an approved call does not run after its tree was stopped
+        // (the loop then stops the run before any model step), and its
+        // approval is left as it is.
+        if (!turn.ledger.cancelled) offered = await this.#resolveApprovals(session, mode, offered, runId, called, scope?.legacy === true, steps, stepping?.locked === true);
 
         if (prompt !== '') {
           // With attachments, the shape prism-ts's UserMessage.toObject() writes:
@@ -999,6 +1032,7 @@ export class AgentRuntime {
       this.#childRefs.delete(runId);
       // A root run that holds part of a run tree's budget settles it.
       await RunTrees.finished(session, runId);
+      if (delegation !== null) await settleDelegation(delegation.session, runId, run.ledger.steps - delegation.startSteps, this.#setting(session, 'lock_ttl') ?? RESOLUTION_LOCK_SECONDS);
       if (steps !== undefined) await rememberSeq(session, runId, steps);
     }
   }
@@ -1593,7 +1627,10 @@ async function writeDecisions(session: Session, decisions: readonly ApprovalDeci
   }
   // No budget, steps or cost, refuses a decision (G-387): acting on an
   // approved call makes no provider call, so the resume runs it and takes no
-  // model step. Refused only for a plan step handed a run tree of its own.
+  // model step. A decision the resuming turn could not act on at all is
+  // refused here, with nothing written; so is a plan step handed a run tree
+  // of its own.
+  await assertActionable(session, rows, context);
   await session.planService()?.assertDecisionsFunded(session, decisions.map((decision) => decision.approvalId), context);
 
   const run = await session.run();
@@ -1607,6 +1644,37 @@ async function writeDecisions(session: Session, decisions: readonly ApprovalDeci
   // A plan held on one of these approvals reads the decision from the thread,
   // before the run resumes (G-360).
   await session.planService()?.decided(session);
+}
+
+/**
+ * Refuse a decision the turn that resumes it could not act on, with the
+ * checks that turn runs, before anything is recorded (G-387): a subagent
+ * child whose binding is missing, a run nested too deep, and a supplied run
+ * context whose ledger was cancelled or whose time is spent. A recorded
+ * decision no turn can act on would be an approval accepted and never run.
+ * (This port has no per-run tool-call limit to check.)
+ *
+ * @throws HarnessError `child_binding_missing` or `run_not_permitted`
+ */
+async function assertActionable(session: Session, rows: readonly JsonObject[], context: RunContext | undefined): Promise<void> {
+  const execution = executionContext(context);
+  const tail = RunTrees.contextKind(context) === 'runner' ? null : pausedRunState(rows);
+  const savedBinding = (await session.childBinding()) ?? tail?.binding ?? null;
+  const saved = await session.childRefs();
+  const route = bindingRoute(RunTrees.bindingContextKind(execution), execution?.binding != null, savedBinding !== null, saved !== null);
+  if (route.binding === 'refused') throw HarnessError.childBindingMissing();
+  const membership = RunTrees.membershipOf(session, 'decision', context, saved ?? { tree: tail?.tree ?? null, planLedger: null }, await session.childDepth());
+  if (membership.depth >= MAX_DEPTH) {
+    throw HarnessError.runNotPermitted(`This decision may not be recorded: its run would be nested ${membership.depth} deep, at or past the ceiling.`);
+  }
+  if (execution === undefined) return;
+  if (execution.ledger.cancelled) {
+    throw HarnessError.runNotPermitted('This decision may not be recorded: the run tree it would resume in was cancelled.');
+  }
+  const seconds = execution.budget.maxSeconds;
+  if (seconds !== null && execution.ledger.elapsedSeconds() >= seconds) {
+    throw HarnessError.runNotPermitted('This decision may not be recorded: the run it would resume in has no time left.');
+  }
 }
 
 /** Runtime guards: a decision arrives from an app's request handling, not from a typed caller. */
@@ -1648,6 +1716,19 @@ export function activeTurn(sessionKey: string): { runId: string; run: RunContext
 /** The context a run EXECUTES under: a metadata-only context states no run tree. */
 function executionContext(context: RunContext | undefined): RunContext | undefined {
   return context?.metadataOnly === true ? undefined : context;
+}
+
+/**
+ * Replace a turn's hold on its delegation's step budget with what it took.
+ * Isolated: a failed write leaves the hold, which is charged in full once
+ * the lock TTL has passed, so a crash can only over-charge the delegation.
+ */
+async function settleDelegation(session: Session, runId: string, took: number, ttl: number): Promise<void> {
+  try {
+    await session.settleChildSteps(runId, took, Math.floor(Date.now() / 1000), ttl);
+  } catch (error) {
+    process.emitWarning(`A delegation step budget update failed: ${error instanceof Error ? error.constructor.name : typeof error}.`);
+  }
 }
 
 /**

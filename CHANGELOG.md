@@ -12,14 +12,28 @@ Includes every fix released on the 0.11 line in 0.11.1 and 0.11.2.
   recorded beside the run's tree membership. The run is narrowed to it once;
   the step gate, the row it parks on, the subagent runner's pre-check, the
   run-tree and plan holds and both decision checks read that record or that
-  budget. Before, about twenty sites each computed "steps left" from a
-  different pair of sources.
-- A subagent's declared `max_steps` is saved with the child's binding (the
-  ceiling the runner started it under) and applied on every turn the runner
-  did not start: a resume with no context, with a metadata context, or with a
-  host context, and a new message. Before, a declared subagent ceiling was
-  not re-applied on turns the runner did not start. A host context can only
-  lower the saved ceiling, never raise it.
+  budget.
+- A subagent child's ceiling is the runner's grant (its declared `max_steps`
+  within what its parent had left, and `max_steps_ceiling`), saved with the
+  child's binding when the runner starts it. It is the delegation's budget for
+  its whole life: every turn on the child the runner did not start (a resume
+  with no context, a metadata context or a host context, a new message, an
+  empty send) claims from it, in one locked write against a durable count of
+  the steps the child has used since the runner last started it, so two turns
+  running at once never both spend the same remainder. A hold whose turn
+  never settles is charged in full once the lock TTL has passed. A runner
+  start begins the count again. A host context can only lower what is left,
+  never raise it.
+- A subagent child session (saved run tree references or a binding, or a
+  parked row that names one) with no saved ceiling, or with one that is not a
+  non-negative whole number, fails closed: its approved calls still run, it
+  takes no model step, and a new message to it is refused before anything is
+  recorded. Only a session that was never a child runs on its mode's
+  `max_steps`.
+- A step budget that is not a finite, non-negative number is refused:
+  `new RunBudget(NaN)`, `Infinity`, `undefined` or `-1` throws `TypeError`,
+  and a run context whose budget is not a number (a host-built object) has no
+  step left.
 - The row a run parks on now records `harness_steps_used`: the steps the run
   had used, its subagent children's included. Its resume continues from that
   count, never from fewer than the model steps the session's own rows show; a
@@ -28,17 +42,29 @@ Includes every fix released on the 0.11 line in 0.11.1 and 0.11.2.
   does a missing value on a child session that saved its ceiling.
   `harness_steps_left` is still written (it now includes plan narrowing), but
   nothing reads it to decide a budget.
-- `max_steps_ceiling` bounds a run's whole count under every context. Before,
-  a resume under a host context restarted it from the host's ledger.
+- `max_steps_ceiling` bounds a run's whole count under every context.
+- A root run under a host-supplied run context runs on that context's budget,
+  not its mode's `max_steps` (still capped by `max_steps_ceiling`).
 - A spent budget, steps or cost (the run's own, its run tree's or a shared
   plan's), never refuses a decision and never refuses a resume: acting on an
   approved call makes no provider call. The decision is recorded, the resume
   runs the approved call and finishes with `budget_exhausted` without a model
-  call, on `send()`, `streamDecision()` and `sendStructured()` alike. A
-  subagent call approved on such a run is refused by the runner before its
-  child takes a step. A decision is still refused for a missing binding,
-  depth and `plan.budget_context`. This replaces the `run_not_permitted` /
-  `plan_budget_exhausted` decision refusals described below.
+  call, on `send()`, `streamDecision()` and `sendStructured()` alike. An
+  approved subagent call on such a run is acted on: the call runs, and its
+  result is the runner's "did not run" refusal (the step budget is
+  exhausted), so its child takes no step. This replaces the
+  `run_not_permitted` / `plan_budget_exhausted` decision refusals described
+  below.
+- A decision its resume could not act on is refused before anything is
+  written, on every decision path (`recordApproval()`, `recordDecisions()`,
+  `decide()`, `streamDecision()`): a subagent child whose binding is missing
+  (`child_binding_missing`), a run nested too deep, and a supplied run context
+  whose ledger was cancelled or whose time is spent (`run_not_permitted`); and
+  a plan step handed a run tree of its own (`plan.budget_context`). A resume
+  under a cancelled run context runs none of the approved calls.
+- The subagent runner refuses (`denied`, a framed result, nothing written to
+  the child) a task that is empty or only whitespace, and a delegation into a
+  child that is waiting on a person to answer its approval.
 - A turn with a NEW prompt (it resumes no decisions) that is left no model
   step is refused before anything is recorded, as before:
   `plan_budget_exhausted` when the shared plan budget is what has nothing left

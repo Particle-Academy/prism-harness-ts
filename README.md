@@ -249,17 +249,35 @@ plan budget, the resumed child spends from that plan budget too.
 How many model steps any run may take is decided once, when it begins, and
 never re-derived (G-387): the least of its own ceiling less the steps it has
 used, what a host context offers, and what its run tree and shared plan budget
-grant it. Its own ceiling is, for a child the runner starts, what the runner's
-context leaves it (its declared `max_steps` within its parent's remainder);
-for any later turn on that child the runner did not start, that same ceiling,
-saved with the child; otherwise the mode's `max_steps`. `max_steps_ceiling`
-caps it under every context. The steps used are written on the row a run parks
-on (`harness_steps_used`, its subagent children's steps included) and its
-resume continues from them; a value there that is not a non-negative whole
-number fails closed, as does a missing value on a child session that saved
-its ceiling. A child started under a run
-context the host built itself, outside any turn, has no tree record and is
-resumed on its own root budget. Every other `send()` starts a new run tree with the full
+grant it. Its own ceiling is:
+
+- for a child the runner starts, the runner's grant: its declared `max_steps`
+  within what its parent has left. It is saved with the child and is the
+  delegation's budget for its whole life: every later turn on that child the
+  runner did not start (a resume, a new message, a turn under a host context)
+  spends from what is left of it, claimed in one locked write against a
+  durable count, so two turns at once cannot both spend it. A runner start
+  begins a new delegation and a new count;
+- for a root run under a host-supplied context, that context's budget (the
+  mode's `max_steps` does not apply);
+- otherwise, the mode's `max_steps`.
+
+`max_steps_ceiling` caps it under every context. The steps used are written on
+the row a run parks on (`harness_steps_used`, its subagent children's steps
+included) and its resume continues from them. A child session with no usable
+saved ceiling or count, or a parked row whose count is missing or not a
+non-negative whole number, fails closed: the approved calls run, and no model
+step is taken. A budget that is not a finite number is refused (`RunBudget`
+throws `TypeError`) or, from a host-built object, leaves no step.
+
+A decision its resume could not act on is refused before it is written: a
+child whose binding is missing, a run nested too deep, a supplied run context
+that was cancelled or is out of time. A spent step or cost budget never
+refuses one: the resume runs the approved call and takes no model step. An
+approved subagent call on a run with no step left is acted on, and its result
+is the runner's refusal (the child did not run). The runner also refuses an
+empty task, and a delegation into a child that is waiting on a person's
+answer. Every other `send()` starts a new run tree with the full
 ceiling, and so does each `plan.advance()` called without a context. To hold
 the steps of a plan to one ceiling, pass the same `RunContext` to every
 `advance(context)`; that context's budget then bounds the whole plan, its step

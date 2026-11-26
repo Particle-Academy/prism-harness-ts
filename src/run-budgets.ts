@@ -56,9 +56,15 @@ export interface StepAllowance {
 
 const KINDS: readonly string[] = ['none', 'metadata', 'runner', 'host'];
 
-/** A whole number of steps, clamped to 0; null stays null. */
-function steps(value: number | null | undefined): number | null {
-  return value === null || value === undefined ? null : Math.max(0, Math.trunc(value));
+/**
+ * A whole number of steps, clamped to 0; null stays null. Anything that is
+ * not a finite number (NaN, Infinity, a string) is 0: an input that cannot
+ * be read as a count of steps never removes the cap (G-387).
+ */
+function steps(value: unknown): number | null {
+  if (value === null || value === undefined) return null;
+
+  return typeof value === 'number' && Number.isFinite(value) ? Math.max(0, Math.trunc(value)) : 0;
 }
 
 /**

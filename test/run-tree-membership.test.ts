@@ -334,7 +334,7 @@ describe('the depth a turn the runner did not start runs at', () => {
   async function savedAt(r: Rig, depth: number): Promise<Session> {
     const child = r.session(1, 'chat::sub::research');
     await child.usingMode('research');
-    await child.rememberChildBinding(binding, depth);
+    await child.rememberChildBinding(binding, depth, 8);
 
     return child;
   }
@@ -603,7 +603,7 @@ describe('an approved subagent call, run on the resume', () => {
     const r = new Rig();
     const child = r.session(1, 'chat::sub::guarded');
     await child.usingMode('guarded');
-    await child.rememberChildBinding(binding, 3);
+    await child.rememberChildBinding(binding, 3, 8);
     r.calls([['research', { task: 'Find the weather.' }]]);   // parks on its approval
     await r.runtime.send(child, 'Go');
 

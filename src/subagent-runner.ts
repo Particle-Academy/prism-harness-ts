@@ -7,6 +7,7 @@ import type { HarnessTool } from './tools.js';
 import { HarnessError } from './errors.js';
 import { markRefused } from './refusals.js';
 import { RunTrees } from './run-trees.js';
+import { pendingApprovalIds } from './thread-rows.js';
 
 export type SubagentOutcome =
   /** It ran and returned. */
@@ -88,6 +89,12 @@ export class SubagentRunner {
   ): Promise<SubagentResult> {
     const runId = `run_${Math.random().toString(16).slice(2, 14)}`;
 
+    // A delegation with no task is not one: an empty prompt on the child is
+    // how a parked child is RESUMED, so the model could otherwise use it to
+    // act on a person's decisions on the child's behalf. Refused before the
+    // child session is built or touched.
+    if (task.trim() === '') return refused(subagent.name, runId, parentRunId, 'denied', 'the task is empty');
+
     // Checked BEFORE spawning, so an exhausted tree does not pay for a session,
     // a thread write and a provider call to discover it is exhausted.
     const stop = context.ledger.exhaustion(context.budget);
@@ -135,6 +142,14 @@ export class SubagentRunner {
     const child = this.harness
       .pending(parent.participant, agent, parent.actor)
       .session(subagent.scopeUnder(parent.scope));
+
+    // A child a person still has to answer is theirs until they do: a new
+    // task would end the approvals it is waiting on, so the model could
+    // dismiss a person's approval by delegating again. Refused, read only,
+    // with nothing written to the child.
+    if (pendingApprovalIds((await child.thread().messages()).map((entry) => entry.message)).length > 0) {
+      return refused(subagent.name, runId, parentRunId, 'denied', 'it is waiting on a person to answer its approval');
+    }
 
     // The child's authority comes from ITS mode, not the parent's. Its
     // provider and model come from the binding on its context: the parent's

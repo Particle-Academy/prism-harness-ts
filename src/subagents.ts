@@ -31,6 +31,10 @@ export class RunBudget {
     readonly maxSeconds: number | null = null,
     readonly maxOutputTokensPerCall: number | null = null,
   ) {
+    // A step cap that is not a finite, non-negative number is no cap at all:
+    // NaN compares false against every count, so a run under it would never
+    // be stopped. Refused here rather than read as unlimited (G-387).
+    if (typeof maxSteps !== 'number' || !Number.isFinite(maxSteps) || maxSteps < 0) throw new TypeError('A step budget must be a finite, non-negative number of steps.');
     if (maxOutputTokensPerCall !== null && (!Number.isSafeInteger(maxOutputTokensPerCall) || maxOutputTokensPerCall < 1)) throw new TypeError('Output ceilings must be positive integers or null.');
   }
 
