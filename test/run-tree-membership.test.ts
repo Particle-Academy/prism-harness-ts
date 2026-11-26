@@ -97,6 +97,11 @@ class Rig {
           subagents: { dig: { mode: 'dig' } },
         } as ModeConfig,
         dig: { system_prompt: 'Dig.', tools: [], max_steps: 4 } as ModeConfig,
+        // A tool and a delegation that both need a person.
+        gated: {
+          system_prompt: 'Gated.', tools: ['weather', 'research'], requires_approval: ['weather', 'research'], max_steps: 4,
+          subagents: { research: { mode: 'research' } },
+        } as ModeConfig,
         // A delegation a person must approve first.
         guarded: {
           system_prompt: 'Guarded.', tools: ['research'], requires_approval: ['research'], max_steps: 3,
@@ -462,9 +467,34 @@ describe('a root that resumes its parked run and delegates again', () => {
     expect(r.requests.length).toBe(requests);
   });
 
-  it('keeps refusing a resume of a spent tree however often it is retried', async () => {
-    const { r } = await resumedRootDelegatesAgain(6);
+  // A root resumed into a tree its sibling spent while the root waited still
+  // has steps of its own, so its decision is refused before anything is
+  // recorded and its resume is refused by the tree. A refused resume still
+  // begins a run, and the session keeps the trees of its newest runs only:
+  // the run the thread is parked on is never dropped, so retrying the
+  // refused resume never escapes the tree.
+  it('keeps refusing a resume of a tree its sibling spent however often it is retried', async () => {
+    const r = new Rig(6);
+    const root = r.session(1);
+    r.calls([['research', { task: 'Find the weather.' }]]); // root
+    r.calls([['weather', { city: 'Paris' }]]);              // research child: parks
+    r.calls([['weather', { city: 'Rome' }]]);               // root: parks, 3 of 6
+    const first = await r.runtime.send(root, 'Go');
+    const child = r.session(1, 'chat::sub::research');
+    const [childId] = await r.pending(child);
+    r.calls([['hostcall', {}]]);                            // the child spends the rest of the tree
+    r.calls([['hostcall', {}]]);
+    r.text('Child done.');
+    await recordApproval(child, childId!, true);
+    await r.runtime.send(child, '');
+    const record = (await treeRecord(root, first.runId))!;
+    expect(record.steps).toBe(record.max_steps);
+    const [rootId] = await r.pending(root);
     const ran = r.weatherRan, requests = r.requests.length;
+    const rows = (await root.thread().messages()).length;
+
+    await expect(recordApproval(root, rootId!, true)).rejects.toMatchObject({ code: 'run_not_permitted' });
+    expect((await root.thread().messages()).length).toBe(rows);
     r.text('Should not run.');
     let refusals = 0;
     for (let attempt = 0; attempt < 23; attempt++) {
@@ -800,6 +830,87 @@ describe('a decision on a root whose own step budget is spent', () => {
     await act(r, id!, how);
 
     expect(r.weatherRan).toBe(ran + 1);
+    expect(r.requests.length).toBe(requests);
+    expect(await r.pending(root)).toEqual([]);
+    const after = (await treeRecord(root, first))!;
+    expect(after.steps as number).toBeLessThanOrEqual(after.max_steps as number);
+  });
+});
+
+// Review round 4, F-1: a root that delegated BEFORE its first pause. At its
+// resume the ledger is rebuilt from the root's own rows, so the child's steps
+// from before that pause are not on it; what the row it parks on again says
+// is left is capped by the tree ceiling the resume holds, so the rule holds at
+// every pause: spent, it acts on its decision with no model step.
+describe('a root spent at its second pause, having delegated before its first', () => {
+  const drain = async (steps: AsyncGenerator<unknown, unknown, undefined>) => { for await (const _ of steps) { /* drained */ } };
+
+  it.each([['recordApproval'], ['decide'], ['streamDecision']] as const)('acts on its decision with no model step (%s)', async (how) => {
+    const r = new Rig(4);
+    const root = r.session(1);
+    r.calls([['research', { task: 'Find the weather.' }]]); // root: step 1
+    r.text('Child answer.');                                // child: step 2
+    r.calls([['weather', { city: 'Paris' }]]);              // root: step 3, parks
+    const first = (await r.runtime.send(root, 'Go')).runId;
+    const [firstId] = await r.pending(root);
+    r.calls([['weather', { city: 'Rome' }]]);               // resumed: step 4, parks again
+    await recordApproval(root, firstId!, true);
+    await r.runtime.send(root, '');
+    const [id] = await r.pending(root);
+    expect(id).toBeDefined();
+    const record = (await treeRecord(root, first))!;
+    expect(record.steps).toBe(record.max_steps);
+    const ran = r.weatherRan, requests = r.requests.length;
+
+    if (how === 'recordApproval') {
+      await recordApproval(root, id!, true);
+      await r.runtime.send(root, '');
+    } else if (how === 'decide') {
+      await r.runtime.decide(root, id!, true);
+      await r.runtime.send(root, '');
+    } else {
+      await drain(r.runtime.streamDecision(root, [{ approvalId: id!, approved: true }]));
+    }
+
+    expect(r.weatherRan).toBe(ran + 1);
+    expect(r.requests.length).toBe(requests);
+    expect(await r.pending(root)).toEqual([]);
+    const after = (await treeRecord(root, first))!;
+    expect(after.steps as number).toBeLessThanOrEqual(after.max_steps as number);
+  });
+});
+
+// Review round 4, P2: a spent root acts on the decisions in its parked batch,
+// but takes nothing of its spent tree: an approved delegation in that batch is
+// refused, and its child never calls the model.
+describe('a spent root parked on a tool and a delegation', () => {
+  it('runs the tool and refuses the delegation, with no child request', async () => {
+    const r = new Rig();
+    const root = r.session(1, 'gated');
+    await root.usingMode('gated');
+    r.calls([['research', { task: 'First.' }]]);            // step 1: parks on research
+    const first = (await r.runtime.send(root, 'Go')).runId;
+    let [id] = await r.pending(root);
+    r.text('Child answer.');                                // child: step 2
+    r.calls([['weather', { city: 'Paris' }]]);              // step 3: parks on weather
+    await recordApproval(root, id!, true);
+    await r.runtime.send(root, '');
+    [id] = await r.pending(root);
+    r.calls([['weather', { city: 'Rome' }], ['research', { task: 'Second.' }]]); // step 4: parks on both
+    await recordApproval(root, id!, true);
+    await r.runtime.send(root, '');
+    const record = (await treeRecord(root, first))!;
+    expect(record.steps).toBe(record.max_steps);
+    const pending = await r.pending(root);
+    expect(pending).toHaveLength(2);
+    const ran = r.weatherRan, requests = r.requests.length, research = r.made('Research.');
+    r.text('Should not run.');
+
+    for (const approvalId of pending) await recordApproval(root, approvalId, true);
+    await r.runtime.send(root, '');
+
+    expect(r.weatherRan).toBe(ran + 1);
+    expect(r.made('Research.')).toBe(research);
     expect(r.requests.length).toBe(requests);
     expect(await r.pending(root)).toEqual([]);
     const after = (await treeRecord(root, first))!;

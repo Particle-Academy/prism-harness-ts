@@ -168,8 +168,15 @@ export const RunTrees = {
    */
   ownStepsLeft(runId: string): number | null {
     const member = members.get(runId);
+    if (member === undefined || member.route !== 'open') return null;
+    // A root holding from its tree is capped by the ceiling it was narrowed
+    // to: its ledger was rebuilt from its own rows at the resume, so the
+    // steps its children took before an earlier pause are counted in that
+    // ceiling, not on the ledger.
+    const entry = runs.get(runId);
+    const ceiling = entry?.held === true ? Math.min(member.ownMaxSteps, entry.budget.maxSteps) : member.ownMaxSteps;
 
-    return member === undefined || member.route !== 'open' ? null : Math.max(0, member.ownMaxSteps - member.ledger.steps);
+    return Math.max(0, ceiling - member.ledger.steps);
   },
 
   /** The recorded membership of a live run of this process, or null. */
