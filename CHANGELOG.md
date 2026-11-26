@@ -30,6 +30,48 @@
   task is not text" (it was reported as empty), and a cancelled run's
   refusal no longer repeats the host's cancel reason.
 
+### Fixed: a runner start after its records are written (G-387 round 8)
+
+- A runner start is narrowed from the steps its context had when the gate
+  read them: a step spent on a shared context after that read is counted
+  against the child, never added back on top.
+- The child's mode is saved in the same locked write as its other records.
+  A start that fails after that write and before its task row is recorded
+  (the run cannot begin, the tool offer or a plan read throws) restores the
+  child's records and mode as they were, only if nobody has written them
+  since (otherwise only the start's own count hold is settled), and releases
+  its holds. A failed start no longer leaves the child re-bound, holding a
+  count, or with an approval answerable that was not.
+- That write also re-checks, under the child's lock, for an approval a person
+  could answer that parked since the gate read the child: the start is then
+  refused (`denied`, waiting on a person) with nothing written.
+- Whether a pending approval could be answered is decided by the known
+  reasons only (no binding, too deep). A store read that fails there now
+  fails the start (`failed`, nothing written) instead of counting the
+  approval unanswerable.
+- A runner start's tree hold is released only by the start that took it.
+- Everything the parent's model reads of a child is harness-written and chosen
+  by code: the gate's reasons, a fixed reason for each stop after the start
+  (cancelled, steps, cost, time), a fixed reason for a child agent's spend
+  ceiling or an unmetered cost, and otherwise the class name and harness code.
+  A host's cancel reason no longer reaches the parent's tool result or a later
+  provider request; `AgentResponse.stoppedBecause` keeps it for the host. An
+  error's `code` is read once, guarded, and a refusal's outcome comes from its
+  code, never from the thrown object. A task lease that cannot be extended
+  names the stop, not the host's cancel reason.
+- `RunBudget` (and `RunBudget.fromConfig`) refuses a cost or time limit that
+  is `NaN`, infinite or negative (`TypeError`); `fromConfig` used to read such
+  a value as no limit. A runner start counts a non-finite limit as spent.
+
+### Changed: no exception text in run rows or `run.failed` (G-387 round 8)
+
+- A failed run's row (`session.run().failure`) and its `run.failed` event now
+  carry a fixed description with the error's class name and harness code,
+  `The run failed (HarnessError model_step_failed).`, never the exception's
+  message. This package has no content-capture setting, so exception text is
+  never written there. A structured run's schema violation still records its
+  code alone. The exception is still thrown to the caller.
+
 ## 0.12.0
 
 Includes every fix released on the 0.11 line in 0.11.1 and 0.11.2.

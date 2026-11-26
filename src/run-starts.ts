@@ -145,6 +145,30 @@ export class StartRefused extends HarnessError {
   }
 }
 
+/** Each code's outcome, exactly as the gate gives it. */
+const START_OUTCOMES: Readonly<Record<StartCode, StartOutcome>> = {
+  task_invalid: 'denied', task_blank: 'denied', too_deep: 'denied', cancelled: 'cancelled', time: 'exhausted',
+  steps: 'exhausted', cost: 'exhausted', cost_unenforceable: 'exhausted', child_busy: 'denied', child_waiting: 'denied',
+  tree: 'exhausted', plan: 'exhausted',
+};
+
+/**
+ * A refused start's code and outcome, read once and guarded (G-387 round 8):
+ * the outcome is the one the gate gives that code, never the one the thrown
+ * object states, and a code the gate does not know is null (the start is
+ * then framed as failed).
+ */
+export function startRefusal(error: StartRefused): { code: StartCode; outcome: StartOutcome } | null {
+  try {
+    const code: unknown = error.refused;
+    if (typeof code !== 'string' || !Object.hasOwn(START_OUTCOMES, code)) return null;
+
+    return { code: code as StartCode, outcome: START_OUTCOMES[code as StartCode] };
+  } catch {
+    return null;
+  }
+}
+
 /** What the parent's model is told of a refused start: harness-written, never a host's or a store's words. */
 export function startRefusalText(code: StartCode, maxDepth: number): string {
   switch (code) {

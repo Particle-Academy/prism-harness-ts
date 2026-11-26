@@ -21,12 +21,13 @@ import {
 import { usableArguments } from './tool-arguments.js';
 import { admitAttachments } from './attachments.js';
 import { HarnessError } from './errors.js';
+import { errorCode, runFailure } from './failures.js';
 import type { HarnessEvents, ToolDecisionEvent } from './events.js';
 import { ToolPolicy, argsDigest } from './tool-policy.js';
 import type { AgentMode, ModeRegistry } from './modes.js';
 import type { ChildRefs, Session } from './session.js';
 import { schemaName, schemaProblems } from './structured.js';
-import { MAX_DEPTH, RunBudget, RunContext, RunLedger, bindingRoute, type ModelBinding } from './subagents.js';
+import { MAX_DEPTH, RunBudget, RunContext, RunLedger, bindingRoute, type ModelBinding, type RunStop } from './subagents.js';
 import { RunTrees, type RunTreeRef, type TreeMembership } from './run-trees.js';
 import { RunStarts, StartRefused } from './run-starts.js';
 import { RunBudgets, type AllowanceFacts } from './run-budgets.js';
@@ -388,21 +389,25 @@ export class AgentRuntime {
    *   steps its own rows show. A malformed row count fails closed, as does
    *   a missing one on a child.
    */
-  async #allowanceFacts(session: Session, runId: string, mode: AgentMode, kind: RunContextKind, execution: RunContext | undefined, resumed: ReturnType<typeof pausedRunState>, rows: readonly JsonObject[], linked: boolean, holdTtl: number): Promise<{ facts: AllowanceFacts; claimed: boolean }> {
+  async #allowanceFacts(session: Session, runId: string, mode: AgentMode, kind: RunContextKind, execution: RunContext | undefined, resumed: ReturnType<typeof pausedRunState>, rows: readonly JsonObject[], linked: boolean, holdTtl: number): Promise<{ facts: AllowanceFacts; claimed: boolean; readSteps: number | null }> {
     const max: unknown = execution?.budget.maxSteps;
+    // The context's steps as `contextLeft` is read from them: the run is
+    // narrowed from THIS count, so a step spent on the context after the
+    // read is counted against it (G-387 round 8).
+    const readSteps = execution == null ? null : execution.ledger.steps;
     const saved = kind === 'runner' ? null : await session.childCeiling();
     const facts: AllowanceFacts = {
       kind,
       modeSteps: mode.maxSteps,
       savedCeiling: saved === 'invalid' || (saved === null && linked) ? 0 : saved,
-      contextLeft: execution == null ? null : (typeof max === 'number' && Number.isFinite(max) ? Math.max(0, max - execution.ledger.steps) : 0),
+      contextLeft: execution == null || readSteps === null ? null : (typeof max === 'number' && Number.isFinite(max) ? Math.max(0, max - readSteps) : 0),
       stepsCeiling: this.#setting(session, 'max_steps_ceiling') ?? null,
       used: 0,
       treeLeft: null,
       planLeft: null,
       took: 0,
     };
-    if (kind === 'runner') return { facts, claimed: false };
+    if (kind === 'runner') return { facts, claimed: false, readSteps };
     const closed = (base: AllowanceFacts): AllowanceFacts => {
       const ceiling = RunBudgets.allowance({ ...base, used: 0 }).ceiling;
 
@@ -412,7 +417,7 @@ export class AgentRuntime {
     // also writes the row count: an absent one there is not a legacy row.
     const rowClosed = resumed !== null && (resumed.stepsUsed === 'invalid' || (resumed.stepsUsed === null && facts.savedCeiling !== null));
     const rowUsed = resumed === null || rowClosed ? 0 : Math.max(resumed.stepsUsed === 'invalid' ? 0 : resumed.stepsUsed ?? 0, approvalRunSteps(rows) ?? 0);
-    if (facts.savedCeiling === null) return { facts: rowClosed ? closed(facts) : { ...facts, used: rowUsed }, claimed: false };
+    if (facts.savedCeiling === null) return { facts: rowClosed ? closed(facts) : { ...facts, used: rowUsed }, claimed: false, readSteps };
 
     let claimedFacts: AllowanceFacts = closed(facts);
     await session.claimChildSteps(runId, Math.floor(Date.now() / 1000), holdTtl, (count) => {
@@ -421,7 +426,7 @@ export class AgentRuntime {
       return RunBudgets.allowance(claimedFacts).own_left;
     });
 
-    return { facts: claimedFacts, claimed: true };
+    return { facts: claimedFacts, claimed: true, readSteps };
   }
 
   /**
@@ -440,25 +445,28 @@ export class AgentRuntime {
    * runs in a parent turn's context instead: its cancel, time, steps and
    * cost stop the start too.
    */
-  async #startRunner(session: Session, runId: string, prompt: string, mode: AgentMode, run: RunContext, membership: TreeMembership, context: RunContext, host: RunContext | null, runnerBinding: ModelBinding | null, savedRefs: ChildRefs, holdTtl: number): Promise<RunnerStart> {
+  async #startRunner(session: Session, runId: string, prompt: string, mode: AgentMode, run: RunContext, membership: TreeMembership, context: RunContext, start: { mode: string | null; host: RunContext | null }, runnerBinding: ModelBinding | null, savedRefs: ChildRefs, holdTtl: number): Promise<RunnerStart> {
+    const host = start.host;
     const plans = session.planService();
     const now = Math.floor(Date.now() / 1000);
     // -- read: nothing is written before the gate ------------------------------
-    const { facts } = await this.#allowanceFacts(session, runId, mode, 'runner', run, null, [], false, holdTtl);
+    const { facts, readSteps } = await this.#allowanceFacts(session, runId, mode, 'runner', run, null, [], false, holdTtl);
     const own = RunBudgets.allowance(facts);
     const contexts = host === null || host === run || host === context ? [run] : [run, host];
-    const timeSpent = (c: RunContext): boolean => c.budget.maxSeconds !== null && c.ledger.elapsedSeconds() >= c.budget.maxSeconds;
+    // A limit that is not a finite number counts as spent (G-387 round 8).
+    const timeSpent = (c: RunContext): boolean => c.budget.maxSeconds !== null
+      && !(Number.isFinite(c.budget.maxSeconds) && c.ledger.elapsedSeconds() < c.budget.maxSeconds);
     let stepsLeft = own.own_left;
     // NaN (a host budget that is not a number) reaches the gate as no steps.
     if (host !== null && contexts.length > 1) stepsLeft = Math.min(stepsLeft, Math.max(0, host.budget.maxSteps - host.ledger.steps));
     const ceiling = session.agent === null ? null : (this.#agents[session.agent]?.spend_ceiling ?? null);
     const agentSpent = session.agent !== null && ceiling !== null && run.ledger.agentCostUsd(session.agent) >= ceiling;
     const agentUnmetered = session.agent !== null && ceiling !== null && run.ledger.agentUnmeteredRuns(session.agent) > 0;
-    const costSpent = agentSpent || contexts.some((c) => c.budget.maxCostUsd !== null && !(c.ledger.costUsd < c.budget.maxCostUsd));
+    const costSpent = agentSpent || contexts.some((c) => c.budget.maxCostUsd !== null && !(Number.isFinite(c.budget.maxCostUsd) && c.ledger.costUsd < c.budget.maxCostUsd));
     const unenforceable = agentUnmetered || contexts.some((c) => c.budget.maxCostUsd !== null && c.ledger.unmeteredRuns > 0);
     const busy = await session.childTurnLive(now, holdTtl);
     const rows = (await session.thread().messages()).map((entry) => entry.message);
-    const pending = pendingApprovalIds(rows).length === 0 ? 'none' : (await decisionsAnswerable(session) ? 'answerable' : 'unanswerable');
+    const pending = await pendingState(session, rows);
     const tree = await RunTrees.startGrant(session, membership);
     const wanted = Math.min(own.own_left, tree?.steps ?? Number.POSITIVE_INFINITY);
     const planLeft = plans === null ? null : await plans.startGrant(session, runId, run, context, prompt, wanted);
@@ -479,7 +487,7 @@ export class AgentRuntime {
     // -- commit (a): the tree hold, then a plan hold ---------------------------
     let treeHold: { opened: boolean } | null = null;
     if (tree !== null) {
-      const held = await RunTrees.holdStart(session, tree.request, tree.steps);
+      const held = await RunTrees.holdStart(session, tree.request, tree.steps, runId);
       if (held === 'refused') throw new StartRefused('tree', 'exhausted');
       treeHold = held;
     }
@@ -487,7 +495,7 @@ export class AgentRuntime {
     const release = async (): Promise<void> => {
       if (released) return;
       released = true;
-      if (tree !== null && treeHold !== null) await RunTrees.releaseStart(session, tree.request, treeHold);
+      if (tree !== null && treeHold !== null) await RunTrees.releaseStart(session, tree.request, treeHold, runId);
       await plans?.release(session, runId);
     };
     try {
@@ -496,15 +504,33 @@ export class AgentRuntime {
         planned = await plans.planTurn(session, runId, run, context, prompt, wanted);
         if ((planned.planLeft ?? 0) < planLeft) throw new StartRefused('plan', 'exhausted');
       }
-      // -- commit (b): the child's records, in one write -------------------------
+      // -- commit (b): the child's records and its mode, in one write ---------
+      // It re-checks, under the child's lock, a turn holding its count and an
+      // approval a person could answer that parked since the read (round 8).
       const refs = RunTrees.keptRefs(membership, membership.spends === null ? null : plans?.ledgerOf(membership.spends) ?? null,
         savedRefs.tree, savedRefs.planLedger, false);
-      if (runnerBinding !== null && !await session.rememberChildStart(runnerBinding, membership.depth, own.ceiling,
-        { runId, steps: own.own_left, at: now }, holdTtl, refs)) {
-        throw new StartRefused('child_busy', 'denied');
-      }
+      const committed = await session.rememberChildStart(runnerBinding, membership.depth, own.ceiling,
+        { runId, steps: own.own_left, at: now }, holdTtl, refs, start.mode,
+        async () => (await pendingState(session, (await session.thread().messages()).map((entry) => entry.message))) === 'answerable');
+      if (committed === 'busy') throw new StartRefused('child_busy', 'denied');
+      if (committed === 'waiting') throw new StartRefused('child_waiting', 'denied');
+      const steps = run.ledger.steps, cost = run.ledger.costUsd, unmetered = run.ledger.unmeteredRuns;
+      let undone = false;
+      // A start that fails before its task row is recorded is undone: the
+      // child's records and mode go back (compare-and-restore), its count
+      // hold with them, and the holds of (a) are released while nothing has
+      // been spent under them (else they settle what was, as any run's do).
+      const undo = async (): Promise<void> => {
+        if (undone) return;
+        undone = true;
+        try {
+          await session.undoChildStart(committed, Math.floor(Date.now() / 1000), holdTtl);
+        } finally {
+          if (run.ledger.steps === steps && run.ledger.costUsd === cost && run.ledger.unmeteredRuns === unmetered) await release();
+        }
+      };
 
-      return { run: planned.run, facts, treeLeft: tree?.steps ?? null, planLeft: planned.planLeft, refs, recorded: runnerBinding !== null, release };
+      return { run: planned.run, facts, readSteps: readSteps ?? run.ledger.steps, treeLeft: tree?.steps ?? null, planLeft: planned.planLeft, refs, recorded: runnerBinding !== null, undo };
     } catch (error) {
       await release();
       throw error;
@@ -936,7 +962,7 @@ export class AgentRuntime {
     // its run begins (c). A refusal, from the gate or a commit race, has
     // written nothing. Once committed, a later stop only stops model steps.
     const started = start === null ? null
-      : await this.#startRunner(session, runId, prompt, mode, run, membership, context!, start.host, runnerBinding, savedRefs, holdTtl);
+      : await this.#startRunner(session, runId, prompt, mode, run, membership, context!, start, runnerBinding, savedRefs, holdTtl);
     if (started === null && run.tooDeep()) {
       throw HarnessError.runNotPermitted(
         `This run is nested ${run.depth} deep, at or past the ceiling. Nobody debugs a tree that deep, ` +
@@ -948,12 +974,13 @@ export class AgentRuntime {
     steps?.bind(session.key(), runId, run.parentRunId, run.rootRunId, session.agent);
     const unwatchPlan = steps !== undefined && stepping?.watchPlan === true ? await this.#watchPlan(session, steps) : () => {};
     try {
-      if (start?.mode != null) await session.usingMode(start.mode);
+      // A runner start wrote the child's mode with its records (b).
       await session.beginRun(runId, mode.name, provider, model, membership.tree, membership.depth);
     } catch (error) {
-      // The run never began: the holds the start took are released, and it fails as before.
+      // The run never began: a runner start is undone (its child records,
+      // mode and holds), and it fails as before.
       unwatchPlan();
-      await started?.release();
+      await started?.undo();
       throw error;
     }
     this.#events?.emit({
@@ -974,6 +1001,8 @@ export class AgentRuntime {
     // A turn that holds part of its delegation's step budget (G-387): the
     // hold is replaced by what the run took when it ends, parks or fails.
     let delegation: { session: Session; startSteps: number } | null = null;
+    // A runner start is undone by any failure before its task row is recorded.
+    let taskRecorded = false;
     try {
       // Recorded before any tool can run, so a child this run starts finds it.
       RunTrees.enter(session, runId, membership, run);
@@ -1021,11 +1050,14 @@ export class AgentRuntime {
       // all, and with no saved ceiling it fails closed.
       const linked = session.scope.includes('::sub::') || (await session.childBinding()) !== null
         || (await session.childRefs()) !== null || tail?.tree != null;
-      const { facts, claimed } = started !== null ? { facts: started.facts, claimed: false }
+      const { facts, claimed, readSteps } = started !== null ? { facts: started.facts, claimed: false, readSteps: started.readSteps }
         : await this.#allowanceFacts(session, runId, mode, contextKind, execution, prompt === '' ? tail : null, stored, linked, holdTtl);
       // A turn with no run context continues the count on its own ledger.
       if (execution == null) run.ledger.recordSteps(facts.used);
       const startSteps = run.ledger.steps;
+      // The count its context's remainder was read at (G-387 round 8): a
+      // step spent on a shared context since is counted, never re-added.
+      const narrowBase = execution == null || readSteps === null ? startSteps : Math.min(readSteps, startSteps);
       if (claimed) delegation = { session, startSteps };
       const own = RunBudgets.allowance(facts);
       // A root run opens a tree; any turn on a child session the runner did
@@ -1062,7 +1094,7 @@ export class AgentRuntime {
       // Narrowed ONCE: the loop's step gate, a subagent's pre-check and every
       // hold it takes read this budget. A host or runner context can only
       // lower what it offered, never raise it.
-      run = run.withBudget(new RunBudget(startSteps + allowance.allowance, run.budget.maxCostUsd, run.budget.maxSeconds, run.budget.maxOutputTokensPerCall));
+      run = run.withBudget(new RunBudget(narrowBase + allowance.allowance, run.budget.maxCostUsd, run.budget.maxSeconds, run.budget.maxOutputTokensPerCall));
       RunTrees.allowed(runId, { ...facts, treeLeft: held.treeLeft, planLeft: planned.planLeft }, startSteps, run);
       // A NEW prompt resumes no recorded decisions: with no step to take it
       // is refused before anything is recorded. Only a resume (an empty
@@ -1110,6 +1142,7 @@ export class AgentRuntime {
 
           await thread.record([message], runId);
         }
+        taskRecorded = true;
 
         return this.#loop(session, mode, turn, runId, provider, model, offered, called, systemPrompt, schema, steps);
       });
@@ -1121,12 +1154,19 @@ export class AgentRuntime {
       // names-only here. The document is already in the thread, in full, where
       // it is read deliberately rather than shipped by default. An error that
       // holds one records its CODE.
-      const failure =
-        error instanceof HarnessError && error.document !== undefined
-          ? error.code
-          : error instanceof Error
-            ? error.message
-            : String(error);
+      //
+      // NOR ANY EXCEPTION'S OWN WORDS (G-387 round 8): this harness has no
+      // content-capture setting, so the run row, run state and event carry
+      // a fixed description with the class name and harness code only; the
+      // exception itself still reaches the caller.
+      if (started !== null && !taskRecorded) {
+        try {
+          await started.undo();
+        } catch {
+          // The start's holds then expire; the failure below is the run's.
+        }
+      }
+      const failure = documentCode(error) ?? runFailure(error);
 
       await session.failRun(runId, failure);
       this.#events?.emit({
@@ -1620,6 +1660,7 @@ export class AgentRuntime {
     stoppedBecause: string | null,
   ): Promise<AgentResponse> {
     await session.completeRun(runId, finishReason, called);
+    const stop = stoppedBecause === null ? null : run.ledger.stopCode(run.budget);
     this.#events?.emit({
       type: 'run.finished',
       runId,
@@ -1632,7 +1673,7 @@ export class AgentRuntime {
       ...(session.agent === null ? {} : { harnessAgent: session.agent }),
     });
 
-    return {
+    const response: AgentResponse = {
       runId,
       text,
       steps: run.ledger.steps,
@@ -1641,6 +1682,9 @@ export class AgentRuntime {
       pendingApprovals: [],
       stoppedBecause,
     };
+    if (stop !== null) STOPS.set(response, stop);
+
+    return response;
   }
 }
 
@@ -1685,10 +1729,12 @@ interface RunnerStart {
   treeLeft: number | null;
   planLeft: number | null;
   refs: ChildRefs;
+  /** The context's steps when the start's facts were read: the run is narrowed from it. */
+  readSteps: number;
   /** Whether the child's records (and its count's hold) were written. */
   recorded: boolean;
-  /** Release the holds of a start whose run never began. */
-  release: () => Promise<void>;
+  /** Undo a start that failed before its task row: its child records, mode and holds. */
+  undo: () => Promise<void>;
 }
 
 function narrowedTools(ceiling: readonly string[], requested?: readonly string[]): readonly string[] {
@@ -1791,37 +1837,72 @@ async function writeDecisions(session: Session, decisions: readonly ApprovalDeci
  * @internal Read by SubagentRunner.
  */
 export async function decisionsAnswerable(session: Session): Promise<boolean> {
-  try {
-    await assertActionable(session, (await session.thread().messages()).map((entry) => entry.message), undefined);
+  // ONLY the known reasons nobody could answer make an approval unanswerable
+  // (G-387 round 8). Any read that fails throws, so the start that asked is
+  // refused (failed) rather than ending an approval a person could answer.
+  return await actionability(session, (await session.thread().messages()).map((entry) => entry.message), undefined) === null;
+}
 
-    return true;
-  } catch (error) {
-    if (error instanceof HarnessError) return false;
-    throw error;
-  }
+/** A parked child's pending approvals, as the start gate reads them. */
+async function pendingState(session: Session, rows: readonly JsonObject[]): Promise<'none' | 'answerable' | 'unanswerable'> {
+  if (pendingApprovalIds(rows).length === 0) return 'none';
+
+  return await decisionsAnswerable(session) ? 'answerable' : 'unanswerable';
 }
 
 async function assertActionable(session: Session, rows: readonly JsonObject[], context: RunContext | undefined, onlyDenials = false): Promise<void> {
+  const refusal = await actionability(session, rows, context, onlyDenials);
+  if (refusal === null) return;
+  if (refusal.reason === 'binding') throw HarnessError.childBindingMissing();
+  if (refusal.reason === 'depth') throw HarnessError.runNotPermitted(`This decision may not be recorded: its run would be nested ${refusal.depth} deep, at or past the ceiling.`);
+  if (refusal.reason === 'cancelled') throw HarnessError.runNotPermitted('This decision may not be recorded: the run tree it would resume in was cancelled.');
+  throw HarnessError.runNotPermitted('This decision may not be recorded: the run it would resume in has no time left.');
+}
+
+/**
+ * Why the turn that resumes `rows`' decisions could not act on them, or null
+ * when it could: one of the KNOWN reasons only (no binding, too deep, a
+ * cancelled tree, no time left). A read that fails is not a reason: it throws.
+ */
+async function actionability(session: Session, rows: readonly JsonObject[], context: RunContext | undefined, onlyDenials = false): Promise<{ reason: 'binding' | 'depth' | 'cancelled' | 'time'; depth: number } | null> {
   const execution = executionContext(context);
   const tail = RunTrees.contextKind(context) === 'runner' ? null : pausedRunState(rows);
   const savedBinding = (await session.childBinding()) ?? tail?.binding ?? null;
   const saved = await session.childRefs();
   const route = bindingRoute(RunTrees.bindingContextKind(execution), execution?.binding != null, savedBinding !== null, saved !== null);
-  if (route.binding === 'refused') throw HarnessError.childBindingMissing();
+  if (route.binding === 'refused') return { reason: 'binding', depth: 0 };
   const membership = RunTrees.membershipOf(session, 'decision', context, saved ?? { tree: tail?.tree ?? null, planLedger: null }, await session.childDepth());
-  if (membership.depth >= MAX_DEPTH) {
-    throw HarnessError.runNotPermitted(`This decision may not be recorded: its run would be nested ${membership.depth} deep, at or past the ceiling.`);
-  }
-  if (execution === undefined) return;
-  if (execution.ledger.cancelled) {
-    throw HarnessError.runNotPermitted('This decision may not be recorded: the run tree it would resume in was cancelled.');
-  }
+  if (membership.depth >= MAX_DEPTH) return { reason: 'depth', depth: membership.depth };
+  if (execution === undefined) return null;
+  if (execution.ledger.cancelled) return { reason: 'cancelled', depth: membership.depth };
   // Acting on a denial runs nothing, so a batch of denials only is not
   // refused for a spent time limit; a cancelled context still refuses it,
   // and a batch with an approval in it keeps the check.
   const seconds = execution.budget.maxSeconds;
-  if (!onlyDenials && seconds !== null && execution.ledger.elapsedSeconds() >= seconds) {
-    throw HarnessError.runNotPermitted('This decision may not be recorded: the run it would resume in has no time left.');
+  if (!onlyDenials && seconds !== null && execution.ledger.elapsedSeconds() >= seconds) return { reason: 'time', depth: membership.depth };
+
+  return null;
+}
+
+/** What a response stopped on, by code, for the subagent runner (never the host's cancel words). */
+const STOPS = new WeakMap<AgentResponse, RunStop>();
+
+/**
+ * The fixed code of the stop a run's response reports (RunLedger.stopCode),
+ * or null when it did not stop on one.
+ *
+ * @internal Read by SubagentRunner.
+ */
+export function stopCodeOf(response: AgentResponse): RunStop | null {
+  return STOPS.get(response) ?? null;
+}
+
+/** A structured run's failure records its CODE (it holds the model's document), guarded; else null. */
+function documentCode(error: unknown): string | null {
+  try {
+    return error instanceof HarnessError && error.document !== undefined ? errorCode(error) ?? 'error' : null;
+  } catch {
+    return null;
   }
 }
 

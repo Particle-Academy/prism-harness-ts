@@ -23,6 +23,7 @@ import {
   type RuntimeConfig,
 } from '../src/index.js';
 import { StartRefused } from '../src/run-starts.js';
+import { activeTurn } from '../src/runtime.js';
 
 // G-387 round 8: the round-7 review findings, at the public seams (the
 // subagent TOOL inside a parent turn, SubagentRunner.run, send and
@@ -413,7 +414,7 @@ describe('item 4: no foreign text reaches the parent model', () => {
   it("a throwing code getter is framed as failed, never a rejection", async () => {
     const r = new Rig();
     await r.session().usingMode('lead');
-    const error = new HarnessError('x', 'm');
+    const error = new HarnessError('session_locked', 'm');
     Object.defineProperty(error, 'code', { configurable: true, get: () => { throw new Error('GETTER-SECRET'); } });
     vi.spyOn(Session.prototype, 'childTurnLive').mockRejectedValue(error);
 
@@ -440,7 +441,7 @@ describe('item 5: a start releases only the hold it took', () => {
     const r = new Rig({ declared: { a: 2, b: 2 } });
     await r.session().usingMode('lead');
     const childA = r.child('a').key();
-    let second: Promise<string> | null = null;
+    let second: Promise<unknown> | null = null;
     let holdsDuringA: unknown = 'unread';
     const beginRun = Session.prototype.beginRun;
     vi.spyOn(Session.prototype, 'beginRun').mockImplementation(function (this: Session, ...args: Parameters<Session['beginRun']>) {
@@ -449,7 +450,7 @@ describe('item 5: a start releases only the hold it took', () => {
     });
     r.events.listen((event: HarnessEvent) => {
       if (event.type !== 'run.started' || event.sessionKey !== childA || second !== null) return;
-      second = r.tools.b!.handle({ task: 'Other.' });
+      second = Promise.resolve(r.tools.b!.handle({ task: 'Other.' }));
       r.beforeRequest = async () => {
         await second;
         const key = r.durable.writes.find((written) => written.includes(':run-tree:'));
@@ -462,7 +463,7 @@ describe('item 5: a start releases only the hold it took', () => {
     await r.runtime.send(r.session(), 'Go');
 
     expect(second).not.toBeNull();
-    expect(await second).toMatch(/it failed/);
+    expect(String(await second)).toMatch(/it failed/);
     expect(holdsDuringA).not.toBe('unread');
     expect(holdsDuringA).not.toBeNull();
     expect(Object.keys(holdsDuringA as object)).toHaveLength(1);
@@ -574,5 +575,107 @@ describe('item 8: exception text never reaches RunFailed or a run row', () => {
     expect(failed).toHaveLength(1);
     expect(JSON.stringify(failed)).not.toContain('SECRET');
     expect(JSON.stringify(await r.ephemeral.get(`${r.child().key()}:ephemeral`))).not.toContain('SECRET');
+  });
+});
+
+describe('new channels considered (round 8)', () => {
+  it('a start whose failure comes AFTER its task row is not undone: the task row ended the dead approval, and no hold is left', async () => {
+    const r = new Rig({ client: async (request) => { if (request.systemPrompt.startsWith('Work.')) throw new Error('PROVIDER-SECRET'); return null; } });
+    await r.session().usingMode('lead');
+    await deadChild(r);
+
+    const result = await r.run(RunContext.root('root', new RunBudget(8)), 'Start over');
+
+    expect(result.outcome).toBe('failed');
+    expect(result.text).not.toMatch(/SECRET/);
+    expect(await r.child().childBinding()).not.toBeNull();
+    const rows = (await r.child().thread().messages()).map((entry) => entry.message);
+    expect(rows.some((message) => message.type === 'user' && message.content === 'Start over')).toBe(true);
+    await expect(recordApproval(r.child(), 'apr_dead', true)).rejects.toMatchObject({ code: 'approval_not_pending' });
+    expect(await r.child().childTurnLive(Math.floor(Date.now() / 1000), 300)).toBe(false);
+  });
+
+  it('a mode another writer set after the start is never put back', async () => {
+    const r = new Rig();
+    await r.session().usingMode('lead');
+    await deadChild(r);
+    const before = await durableOf(r, r.child());
+    const beginRun = Session.prototype.beginRun;
+    vi.spyOn(Session.prototype, 'beginRun').mockImplementation(async function (this: Session, ...args: Parameters<Session['beginRun']>) {
+      if (this.scope.includes('::sub::')) {
+        await r.child().usingMode('other');
+        throw new Error('STORE-SECRET');
+      }
+      return beginRun.apply(this, args);
+    });
+
+    const result = await r.run(RunContext.root('root', new RunBudget(8)), 'Start over');
+    vi.restoreAllMocks();
+
+    expect(result.outcome).toBe('failed');
+    expect(await r.child().mode()).toBe('other');
+    expect(await durableOf(r, r.child())).toBe(before);
+  });
+
+  it('a re-check of the pending approvals that throws under the lock fails the start, nothing written on the child', async () => {
+    const r = new Rig();
+    await r.session().usingMode('lead');
+    await deadChild(r);
+    const before = await durableOf(r, r.child());
+    const modeBefore = await r.child().mode();
+    const childBinding = Session.prototype.childBinding;
+    vi.spyOn(Session.prototype, 'childBinding').mockImplementation(function (this: Session) {
+      if (new Error().stack?.includes('rememberChildStart') === true) return Promise.reject(new HarnessError('session_locked', 'STORE-SECRET'));
+      return childBinding.apply(this);
+    });
+
+    const result = await r.run(RunContext.root('root', new RunBudget(8)), 'Start over');
+    vi.restoreAllMocks();
+
+    expect(result.outcome).toBe('failed');
+    expect(result.text).not.toMatch(/SECRET/);
+    expect(r.childRequests()).toBe(0);
+    expect(await durableOf(r, r.child())).toBe(before);
+    expect(await r.child().mode()).toBe(modeBefore);
+    await expect(recordApproval(r.child(), 'apr_dead', true)).rejects.toMatchObject({ code: 'child_binding_missing' });
+  });
+
+  it('a start undone after something was spent under it keeps its tree hold, so the tree is charged what was spent', async () => {
+    const r = new Rig();
+    await r.session().usingMode('lead');
+    const resolve = ToolRegistry.prototype.resolveDetailed;
+    let spent = false;
+    vi.spyOn(ToolRegistry.prototype, 'resolveDetailed').mockImplementation(function (this: ToolRegistry, ...args: Parameters<ToolRegistry['resolveDetailed']>) {
+      if (args[1]?.scope.includes('::sub::') === true) {
+        spent = true;
+        throw new Error('REGISTRY-SECRET');
+      }
+      return resolve.apply(this, args);
+    });
+    r.calls([['a', { task: 'Work.' }]]);
+    r.text('Parent done.');
+    let ledger: { recordSteps: (n: number) => void } | null = null;
+    const beginRun = Session.prototype.beginRun;
+    vi.spyOn(Session.prototype, 'beginRun').mockImplementation(async function (this: Session, ...args: Parameters<Session['beginRun']>) {
+      const begun = await beginRun.apply(this, args);
+      if (this.scope.includes('::sub::')) {
+        // A step spent on the shared ledger after the run began, before the task row.
+        ledger = activeTurn(r.session().key())?.run.ledger ?? null;
+        ledger?.recordSteps(1);
+      }
+      return begun;
+    });
+
+    await r.runtime.send(r.session(), 'Go');
+    vi.restoreAllMocks();
+
+    expect(spent).toBe(true);
+    expect(ledger).not.toBeNull();
+    const key = r.durable.writes.find((written) => written.includes(':run-tree:'));
+    expect(key).toBeDefined();
+    const record = (await r.durable.get(key!)) as unknown as { steps: number; holds: object } | null;
+    expect(record).not.toBeNull();
+    expect(record!.holds).toEqual({});
+    expect(record!.steps).toBeGreaterThanOrEqual(2);
   });
 });

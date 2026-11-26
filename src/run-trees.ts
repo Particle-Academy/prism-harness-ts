@@ -41,6 +41,8 @@ interface RootRun {
   cost: number;
   unmetered: number;
   held: boolean;
+  /** The run id of the runner start whose hold this is (G-387 round 8), or null. */
+  heldBy: string | null;
   ttl: number;
 }
 
@@ -219,7 +221,7 @@ export const RunTrees = {
     const entry: RootRun = {
       session: session.key(), tree,
       budget: run.budget, ledger: run.ledger, steps: run.ledger.steps, cost: run.ledger.costUsd,
-      unmetered: run.ledger.unmeteredRuns, held: false, ttl,
+      unmetered: run.ledger.unmeteredRuns, held: false, heldBy: null, ttl,
     };
     if (membership.route === 'open') {
       // An open run whose tree already has a record is held to it, whatever
@@ -312,9 +314,10 @@ export const RunTrees = {
    * startGrant() read, in ONE conditional locked write. If the tree no
    * longer grants all of `expected` (a sibling spent it since the read),
    * nothing is written and the start is refused. Returns whether the
-   * record was opened by this write, for releaseStart().
+   * record was opened by this write, for releaseStart(). The hold is the
+   * start `startRunId`'s: only that start may release it.
    */
-  async holdStart(child: Session, request: TreeRequest, expected: number): Promise<{ opened: boolean } | 'refused'> {
+  async holdStart(child: Session, request: TreeRequest, expected: number, startRunId: string): Promise<{ opened: boolean } | 'refused'> {
     const entry = runs.get(request.spends);
     if (entry === undefined || entry.held) return 'refused';
     const now = Math.floor(Date.now() / 1000);
@@ -325,7 +328,10 @@ export const RunTrees = {
 
       return [next, { opened: state === null }];
     });
-    if (held !== 'refused') entry.held = true;
+    if (held !== 'refused') {
+      entry.held = true;
+      entry.heldBy = startRunId;
+    }
 
     return held;
   },
@@ -333,12 +339,17 @@ export const RunTrees = {
   /**
    * Release a hold holdStart() took, for a start that did not go ahead: a
    * record it opened is removed, otherwise its hold is dropped unspent, and
-   * the spending run holds nothing again. Isolated: a failed release leaves
-   * the hold, which is charged in full once it expires (an over-charge).
+   * the spending run holds nothing again. Only the start that took the hold
+   * releases it (`startRunId`): for any other run id, and for a hold whose
+   * spending run is no longer live, it is a no-op (G-387 round 8). Isolated:
+   * a failed release leaves the hold, which is charged in full once it
+   * expires (an over-charge).
    */
-  async releaseStart(child: Session, request: TreeRequest, held: { opened: boolean }): Promise<void> {
+  async releaseStart(child: Session, request: TreeRequest, held: { opened: boolean }, startRunId: string): Promise<void> {
     const entry = runs.get(request.spends);
-    if (entry !== undefined) entry.held = false;
+    if (entry === undefined || !entry.held || entry.heldBy !== startRunId) return;
+    entry.held = false;
+    entry.heldBy = null;
     const store = child.planStore();
     const name = key(request.tree);
     try {

@@ -4,6 +4,7 @@ import { HarnessError } from './errors.js';
 import type { Durability, SessionStore } from './stores/session-store.js';
 import { isDurable } from './stores/session-store.js';
 import type { RunBudget, RunLedger } from './subagents.js';
+import { runStopText } from './subagents.js';
 import {
   DEFAULT_LEASE_SECONDS,
   isTerminalState,
@@ -386,13 +387,15 @@ export class StoreTaskSource implements AgentTaskSource {
       // no longer do anything with. `exhaustion()` is the existing stop
       // condition and returns the REASON, so nothing new is invented and the
       // four causes stay distinguishable.
-      const exhausted = ledger.exhaustion(budget);
+      // The CODE, never exhaustion()'s text: that carries a host's own cancel
+      // words, and this refusal reaches the model as a tool's failure.
+      const exhausted = ledger.stopCode(budget);
 
       if (exhausted !== null) {
         if (changed) await this.#write(records, stored.nextId);
 
         throw HarnessError.runNotPermitted(
-          `The lease held by [${worker}] on the task [${raw.id}] cannot be extended: ${exhausted}. ` +
+          `The lease held by [${worker}] on the task [${raw.id}] cannot be extended: ${runStopText(exhausted)}. ` +
             'The run is the bound on how long a worker may hold a task, and extending past it would ' +
             'be a second timeout wearing the first one\'s name.',
         );

@@ -383,23 +383,31 @@ export class Session {
    * A runner start commits the child's records (G-387 round 7), in ONE
    * locked write: its binding, depth, the ceiling the runner gave it with
    * its count started again at 0 and `hold` held under the starting run's
-   * id, and the run tree and plan ledger it belongs to. It re-checks that no
-   * turn on the child holds part of its count (a resume that claimed since
-   * the start read it): then nothing is written and false is returned.
+   * id, the run tree and plan ledger it belongs to, and (round 8) the mode
+   * it runs in. Under that lock it re-checks that no turn on the child holds
+   * part of its count (a resume that claimed since the start read it:
+   * `busy`) and that `waiting` is false (an approval a person could answer
+   * parked since: `waiting`); then nothing is written. Otherwise it returns
+   * what it wrote and what was there before, for undoChildStart().
    *
    * @internal Written by the runtime when a runner start commits.
    */
-  async rememberChildStart(binding: ModelBinding, depth: number, ceiling: number, hold: { runId: string; steps: number; at: number }, ttlSeconds: number, refs: ChildRefs): Promise<boolean> {
-    let written = false;
+  async rememberChildStart(binding: ModelBinding | null, depth: number, ceiling: number, hold: { runId: string; steps: number; at: number }, ttlSeconds: number, refs: ChildRefs, mode: string | null = null, waiting: () => Promise<boolean> = async () => false): Promise<ChildStart | 'busy' | 'waiting'> {
+    let result: ChildStart | 'busy' | 'waiting' = 'busy';
     this.#assertWritable();
     const name = this.#durableKey();
     await this.#durable.withLock(name, async () => {
-      const stored = (await this.#durable.get(name)) ?? {};
-      const { child_ceiling: _old, child_steps: count, ...rest } = stored;
-      if (hasLiveHold(count, hold.at, ttlSeconds)) return;
+      const existing = await this.#durable.get(name);
+      const stored = existing ?? {};
+      if (hasLiveHold(stored.child_steps, hold.at, ttlSeconds)) return;
+      // Under the same lock: an approval a person can answer, parked since
+      // the start's gate read the child (round 8), refuses it too.
+      if (await waiting()) {
+        result = 'waiting';
+        return;
+      }
       const holds: JsonObject = hold.steps < 1 ? {} : { [hold.runId]: { steps: hold.steps, at: hold.at } };
-      await this.#durable.put(name, {
-        ...rest,
+      const written: JsonObject = binding === null ? {} : {
         child_binding: {
           session: { ...binding.session },
           declared: { ...binding.declared },
@@ -412,11 +420,70 @@ export class Session {
           tree: refs.tree === null ? null : { ...refs.tree },
           plan_ledger: refs.planLedger === null ? null : { ...refs.planLedger },
         },
-      });
-      written = true;
+      };
+      const prior: JsonObject = {};
+      for (const key of CHILD_START_KEYS) if (Object.hasOwn(stored, key)) prior[key] = stored[key]!;
+      if (binding !== null) await this.#durable.put(name, { ...stored, ...written });
+      // The mode the child runs in, in the same step: a start that cannot
+      // write it writes nothing at all.
+      let priorMode: string | null | undefined;
+      if (mode !== null) {
+        try {
+          this.#cachedState = null;
+          const state = await this.state();
+          priorMode = Object.hasOwn(state, 'mode') && typeof state.mode === 'string' ? state.mode : null;
+          await this.#write('mode', mode);
+        } catch (error) {
+          if (binding !== null) {
+            if (existing == null) await this.#durable.forget(name);
+            else await this.#durable.put(name, stored);
+          }
+          throw error;
+        }
+      }
+      result = { existed: existing != null, prior, written, mode, priorMode: priorMode ?? null, holdRunId: hold.runId };
     }, 10, 5);
 
-    return written;
+    return result;
+  }
+
+  /**
+   * Undo a runner start's child write (G-387 round 8) when the start fails
+   * before its task row is recorded: in ONE locked write, the child's
+   * records go back to what they were before it, but only while they are
+   * still exactly what the start wrote (a later writer is never clobbered;
+   * then only the start's own hold is settled, at nothing). The mode goes
+   * back too, while it is still the one the start wrote.
+   *
+   * @internal Called by the runtime.
+   */
+  async undoChildStart(start: ChildStart, now: number, ttlSeconds: number): Promise<void> {
+    this.#assertWritable();
+    const name = this.#durableKey();
+    let restored = Object.keys(start.written).length === 0;
+    if (!restored) {
+      await this.#durable.withLock(name, async () => {
+        const stored = (await this.#durable.get(name)) ?? {};
+        if (!CHILD_START_KEYS.every((key) => canonical(stored[key]) === canonical(start.written[key]))) return;
+        const kept: JsonObject = {};
+        for (const [key, value] of Object.entries(stored)) if (!CHILD_START_KEYS.includes(key)) kept[key] = value;
+        const restoredRecord = { ...kept, ...start.prior };
+        if (!start.existed && Object.keys(restoredRecord).length === 0) await this.#durable.forget(name);
+        else await this.#durable.put(name, restoredRecord);
+        restored = true;
+      }, 10, 5);
+    }
+    if (!restored) await this.settleChildSteps(start.holdRunId, 0, now, ttlSeconds);
+    if (start.mode !== null && restored) {
+      this.#cachedState = null;
+      const state = await this.state();
+      if (state.mode === start.mode) {
+        const { mode: _written, ...rest } = state;
+        const next: JsonObject = start.priorMode === null ? rest : { ...rest, mode: start.priorMode };
+        await this.#ephemeral.put(this.#ephemeralKey(), next, this.#ttlSeconds);
+        this.#cachedState = next;
+      }
+    }
   }
 
   /**
@@ -846,4 +913,37 @@ function hasLiveHold(value: JsonValue | undefined, now: number, ttlSeconds: numb
 
 function heldSteps(holds: Record<string, { steps: number }>): number {
   return Object.values(holds).reduce((sum, hold) => sum + hold.steps, 0);
+}
+
+/**
+ * What a runner start wrote on its child (G-387 round 8), and what was there
+ * before, so a start that fails before its task row can put it back.
+ *
+ * @internal
+ */
+export interface ChildStart {
+  /** Whether the child had a durable record at all before the start. */
+  existed: boolean;
+  /** The child records before the start, only the keys that were present. */
+  prior: JsonObject;
+  /** The child records the start wrote ({} when it wrote none). */
+  written: JsonObject;
+  /** The mode the start wrote, or null when it wrote none. */
+  mode: string | null;
+  /** The mode before it, or null when none was set. */
+  priorMode: string | null;
+  /** The run id the start's count hold is under. */
+  holdRunId: string;
+}
+
+/** The child records a runner start writes in its one locked write. */
+const CHILD_START_KEYS: readonly string[] = ['child_binding', 'child_depth', 'child_ceiling', 'child_steps', 'child_refs'];
+
+/** A value as text with its object keys sorted, for comparing stored JSON. */
+function canonical(value: JsonValue | undefined): string {
+  if (value === undefined) return 'undefined';
+  if (Array.isArray(value)) return `[${value.map((entry) => canonical(entry)).join(',')}]`;
+  if (isJsonObject(value)) return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonical(value[key])}`).join(',')}}`;
+
+  return JSON.stringify(value);
 }

@@ -278,7 +278,11 @@ step is taken. A session is a child when its address is one the runner builds
 binding, or a parked row that names a run tree. A turn is charged what it
 took when it ends, even after the lock TTL. A budget that is not a whole,
 non-negative number is refused (`RunBudget` throws `TypeError`) or, from a
-host-built object, leaves no step.
+host-built object, leaves no step. A cost or time limit (`maxCostUsd`,
+`maxSeconds`, and `max_cost_usd` / `max_seconds` in config) must be a finite,
+non-negative number or null: `NaN`, `Infinity` and negatives are refused the
+same way, and a runner start counts a limit that is not a finite number as
+spent.
 
 A host-supplied `RunContext` belongs to ONE session's turn. Its ledger is the
 account every run under it spends from: share one context across sessions and
@@ -308,8 +312,26 @@ refused start writes nothing: not the child's binding, ceiling, count or
 mode, not a run, not a tree hold. Only once the gate says start does it hold
 its run tree's budget, save the child's records in one write, and begin the
 run; once begun, a later stop only stops its model steps (its task is still
-recorded). Any failure while it starts or runs the child comes back as a
-framed `failed` result naming the error's class, never its message. Every other `send()` starts a new run tree with the full
+recorded). Its run is narrowed from the steps its context had when the
+gate read them, so a step spent on a shared context after that read is
+counted against the child. Saving the child's records re-checks, under the
+child's lock, both a turn still running on it and an approval a person could
+answer that parked since the read; either refuses the start with nothing
+written. The child's mode is saved in that same write. A start that fails
+after that write and before its task row is recorded (its run cannot begin,
+a tool registry or plan read throws) puts the child's records and mode back
+as they were, provided nobody else has written them since, and releases its
+holds: a refused or failed start never leaves an approval answerable that
+was not. Whether an approval on the child could be answered is decided by
+the known reasons only (no binding, too deep); a store read that fails
+there fails the start rather than counting the approval unanswerable.
+Any failure while it starts or runs the child comes back as a framed
+`failed` result naming the error's class (and a harness error's code), never
+its message. Everything the parent's model reads of a child is chosen by the
+harness: a fixed reason for each refusal, a fixed reason for each stop (a
+host's cancel reason is never repeated to a model, nor to the provider on a
+later turn; `AgentResponse.stoppedBecause` still carries it for the host), and
+a fixed reason for a child agent's spend ceiling or an unmetered cost. Every other `send()` starts a new run tree with the full
 ceiling, and so does each `plan.advance()` called without a context. To hold
 the steps of a plan to one ceiling, pass the same `RunContext` to every
 `advance(context)`; that context's budget then bounds the whole plan, its step
@@ -398,6 +420,13 @@ sitting next to it. The run row and the `run.failed` event name the CODE, not th
 message — the message quotes the values that missed, and an event carrying those
 would ship model output to every listener, which is the same reason tool
 arguments are names-only here.
+
+The same holds for every failed run: the run row (`session.run().failure`) and
+the `run.failed` event carry a fixed description with the error's class name
+and, for a `HarnessError`, its code (`The run failed (HarnessError
+session_locked).`), never the exception's message. This package has no
+content-capture setting, so that is always the case; the exception itself is
+still thrown to the caller of `send()`.
 
 The check reads the schema's own JSON Schema, so a hand-written schema is held to
 the same terms. `schemaProblems()` is exported if you want it directly. It checks
