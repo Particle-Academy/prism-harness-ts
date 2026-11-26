@@ -105,7 +105,7 @@ describe('failed model steps are terminal', () => {
       expect(context.ledger.steps).toBe(1);
       expect(context.ledger.costUsd).toBe(0.04);
       expect(failure).toMatchObject({ code: 'model_step_failed', finishReason, message: `Model step failed: ${finishReason}.` });
-      expect(await session.run()).toMatchObject({ status: 'failed', failure: `Model step failed: ${finishReason}.` });
+      expect(await session.run()).toMatchObject({ status: 'failed', failure: 'The run failed (HarnessError model_step_failed).' });
       const rows = (await session.thread().messages()).map(entry => entry.message);
       const assistant = rows.find(row => row.type === 'assistant');
       expect(assistant?.tool_approval_requests).toEqual([]);

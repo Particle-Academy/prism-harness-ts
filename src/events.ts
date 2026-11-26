@@ -159,7 +159,12 @@ export interface RunFailed extends HarnessAgentTag {
   type: 'run.failed';
   runId: string;
   sessionKey: string;
-  /** Why it stopped: a budget reason, a cancellation, or a provider failure. */
+  /**
+   * Why it failed, as the harness describes it: a fixed text with the
+   * error's class name and harness code, never the exception's message
+   * (this package has no content-capture setting), or a structured run's
+   * error code.
+   */
   failure: string;
   steps: number;
   at: string;

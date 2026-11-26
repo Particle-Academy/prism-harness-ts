@@ -1,13 +1,14 @@
 import type { JsonObject } from './json.js';
 import type { PrismHarness } from './harness.js';
-import { activeTurn, type AgentRuntime } from './runtime.js';
+import { activeTurn, stopCodeOf, type AgentRuntime } from './runtime.js';
 import type { Session } from './session.js';
-import { MAX_DEPTH, RunBudget, RunContext, type ModelBinding, type Subagent } from './subagents.js';
+import { MAX_DEPTH, RunBudget, RunContext, runStopText, type ModelBinding, type Subagent } from './subagents.js';
 import type { HarnessTool } from './tools.js';
 import { HarnessError } from './errors.js';
+import { errorCode, failureName } from './failures.js';
 import { markRefused } from './refusals.js';
 import { RunTrees } from './run-trees.js';
-import { RunStarts, StartRefused, startRefusalText } from './run-starts.js';
+import { RunStarts, StartRefused, startRefusal, startRefusalText } from './run-starts.js';
 
 export type SubagentOutcome =
   /** It ran and returned. */
@@ -121,16 +122,24 @@ export class SubagentRunner {
     try {
       return await this.#delegate(subagent, parent, context, parentRunId, task, host);
     } catch (error) {
+      // Only harness-written words, chosen by code (G-387 round 8): the
+      // gate's reasons, the fixed stops below, and for anything else the
+      // class name and harness code. Never an error's message, and never an
+      // outcome a thrown object states.
       if (error instanceof StartRefused) {
-        return refused(subagent.name, runId, parentRunId, error.outcome, startRefusalText(error.refused, MAX_DEPTH));
+        const refusal = startRefusal(error);
+        return refusal === null
+          ? refused(subagent.name, runId, parentRunId, 'failed', `it failed (${failureName(error)})`)
+          : refused(subagent.name, runId, parentRunId, refusal.outcome, startRefusalText(refusal.code, MAX_DEPTH));
       }
       // A child agent stopped by its own spend ceiling is the tree refusing
       // to let it spend, not the child breaking: reported as such, so the
-      // parent does not retry it.
-      const ceiling = error instanceof HarnessError
-        && (error.code === 'agent_spend_ceiling_exceeded' || error.code === 'budget_unpriced');
+      // parent does not retry it. The code is read ONCE, guarded.
+      const code = errorCode(error);
+      if (code === 'agent_spend_ceiling_exceeded') return refused(subagent.name, runId, parentRunId, 'exhausted', "its agent's spend ceiling is reached");
+      if (code === 'budget_unpriced') return refused(subagent.name, runId, parentRunId, 'exhausted', "its agent's spend cannot be metered (a cost was not reported)");
 
-      return refused(subagent.name, runId, parentRunId, ceiling ? 'exhausted' : 'failed', `it failed (${failureName(error)})`);
+      return refused(subagent.name, runId, parentRunId, 'failed', `it failed (${failureName(error, code)})`);
     }
   }
 
@@ -157,6 +166,9 @@ export class SubagentRunner {
       .session(subagent.scopeUnder(parent.scope));
 
     const response = await this.runtime.send(child, task as string, undefined, childContext);
+    // Why it stopped, as the harness's fixed words for the stop's code:
+    // `stoppedBecause` carries a host's own cancel words, for the host.
+    const stop = response.stoppedBecause === null ? null : stopCodeOf(response);
 
     return {
       subagent: subagent.name,
@@ -167,7 +179,7 @@ export class SubagentRunner {
       toToolResult(): string {
         return response.stoppedBecause === null
           ? response.text
-          : `The [${subagent.name}] subagent stopped early: ${response.stoppedBecause}. Partial answer: ${response.text}`;
+          : `The [${subagent.name}] subagent stopped early: ${stop === null ? 'its run was stopped' : runStopText(stop)}. Partial answer: ${response.text}`;
       },
     };
   }
@@ -236,28 +248,3 @@ function narrowedTo(turn: RunContext, host: RunContext): RunContext {
 
 /** True when `task` is empty or only blank codepoints (RunStarts' one set). */
 export { isBlankTask } from './run-starts.js';
-
-/**
- * What a framed failure says of its cause: the error's class name, and for a
- * HarnessError its code (a fixed identifier the harness defines). Never the
- * message: a store's or a host's own words do not reach a model.
- */
-function failureName(error: unknown): string {
-  try {
-    if (error instanceof HarnessError) return `HarnessError ${typeof error.code === 'string' && ERROR_CODE.test(error.code) ? error.code : 'error'}`;
-    if (!(error instanceof Error)) return 'Error';
-    // The class as its prototype says, never an own `constructor` the thrown
-    // object carries; a name that is not an identifier is not reported.
-    const name: unknown = (Object.getPrototypeOf(error) as { constructor?: { name?: unknown } } | null)?.constructor?.name;
-
-    return typeof name === 'string' && CLASS_NAME.test(name) ? name : 'Error';
-  } catch {
-    return 'Error';
-  }
-}
-
-/** What a reported class name may look like: an identifier, at most 64 characters. */
-const CLASS_NAME = /^[A-Za-z_$][A-Za-z0-9_$]{0,63}$/;
-
-/** What a reported harness error code may look like (`session_locked`, `plan.budget_context`). */
-const ERROR_CODE = /^[a-z][a-z0-9_.]{0,63}$/;

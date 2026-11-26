@@ -24,6 +24,20 @@ export const MAX_DEPTH = 4;
  * respect its declared limit and still cost more than anyone intended. Cost and
  * wall-clock are the two a person actually cares about when they say "bounded".
  */
+/** Why a run tree may not spend again, as a fixed code (RunLedger.stopCode). */
+export type RunStop = 'cancelled' | 'steps' | 'cost_unenforceable' | 'cost' | 'time';
+
+/** What a model is told of a stop: harness-written, never a host's words. */
+export function runStopText(stop: RunStop): string {
+  switch (stop) {
+    case 'cancelled': return 'its run was cancelled';
+    case 'steps': return 'its run has no steps left';
+    case 'cost_unenforceable': return "its run's cost budget cannot be enforced (a cost was not reported)";
+    case 'cost': return "its run's cost budget is spent";
+    case 'time': return 'its run has no time left';
+  }
+}
+
 export class RunBudget {
   constructor(
     readonly maxSteps: number,
@@ -37,6 +51,11 @@ export class RunBudget {
     // and a fraction is refused as the PHP and Python ports refuse it.
     if (typeof maxSteps !== 'number' || !Number.isSafeInteger(maxSteps) || maxSteps < 0) throw new TypeError('A step budget must be a whole, non-negative number of steps.');
     if (maxOutputTokensPerCall !== null && (!Number.isSafeInteger(maxOutputTokensPerCall) || maxOutputTokensPerCall < 1)) throw new TypeError('Output ceilings must be positive integers or null.');
+    // The same for cost and time (G-387 round 8): NaN compares false against
+    // every spend, and Infinity is no limit at all, so either one would read
+    // as a cap while stopping nothing.
+    if (!limit(maxCostUsd)) throw new TypeError('A cost budget must be a finite, non-negative number of USD or null.');
+    if (!limit(maxSeconds)) throw new TypeError('A time budget must be a finite, non-negative number of seconds or null.');
   }
 
   static fromConfig(config: Record<string, unknown>, defaultSteps = 8): RunBudget {
@@ -46,8 +65,8 @@ export class RunBudget {
     if (steps !== undefined && steps !== null && (typeof steps !== 'number' || !Number.isSafeInteger(steps) || steps < 0)) throw new TypeError('A step budget must be a whole, non-negative number of steps.');
     return new RunBudget(
       (steps as number | null | undefined) ?? defaultSteps,
-      numberOrNull(config.max_cost_usd),
-      numberOrNull(config.max_seconds),
+      limitOrNull(config.max_cost_usd, 'A cost budget must be a finite, non-negative number of USD or null.'),
+      limitOrNull(config.max_seconds, 'A time budget must be a finite, non-negative number of seconds or null.'),
       output ?? null,
     );
   }
@@ -291,6 +310,22 @@ export class RunLedger {
     if (budget.maxSeconds !== null && this.elapsedSeconds() >= budget.maxSeconds) {
       return `time budget exhausted (${Math.trunc(this.elapsedSeconds())}s of ${budget.maxSeconds}s used)`;
     }
+
+    return null;
+  }
+
+  /**
+   * The stop `exhaustion()` reports, as a fixed code chosen by the harness
+   * (G-387 round 8). `exhaustion()` returns a host's own cancel words, for
+   * the host's own API and log; anything a MODEL reads is built from this,
+   * so a cancel reason never reaches a model or a provider.
+   */
+  stopCode(budget: RunBudget): RunStop | null {
+    if (this.#cancelled) return 'cancelled';
+    if (this.#steps >= budget.maxSteps) return 'steps';
+    if (budget.maxCostUsd !== null && this.#unmeteredRuns > 0) return 'cost_unenforceable';
+    if (budget.maxCostUsd !== null && this.#costUsd >= budget.maxCostUsd) return 'cost';
+    if (budget.maxSeconds !== null && this.elapsedSeconds() >= budget.maxSeconds) return 'time';
 
     return null;
   }
@@ -581,6 +616,15 @@ function lesser(a: number | null, b: number | null): number | null {
   return Math.min(a, b);
 }
 
-function numberOrNull(value: unknown): number | null {
-  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+/** A cost or time limit: null (none), or a finite, non-negative number. */
+function limit(value: unknown): boolean {
+  return value === null || (typeof value === 'number' && Number.isFinite(value) && value >= 0);
+}
+
+/** A configured cost or time limit: absent or null is none; anything else must be a limit. */
+function limitOrNull(value: unknown, refusal: string): number | null {
+  if (value === undefined || value === null) return null;
+  if (!limit(value)) throw new TypeError(refusal);
+
+  return value as number;
 }
