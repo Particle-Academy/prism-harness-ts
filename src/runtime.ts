@@ -447,7 +447,9 @@ export class AgentRuntime {
    */
   async #resumeLocked<T>(session: Session, prompt: string, context: RunContext | undefined, turn: (live: Session, stepping: Stepping | undefined) => Promise<T>): Promise<T> {
     const observer = this.#observerStepping(context);
-    if (prompt !== '' || executionContext(context) !== undefined || (await session.resumedRunTree()) === null) return turn(session, observer);
+    // The same test the turn uses for a bare context: none (null included) or metadata only.
+    const kind = RunTrees.contextKind(context);
+    if (prompt !== '' || (kind !== 'none' && kind !== 'metadata') || (await session.resumedRunTree()) === null) return turn(session, observer);
 
     return this.#holdingTurnLock(session, (live) => turn(live, { ...observer, locked: true }));
   }
@@ -799,7 +801,7 @@ export class AgentRuntime {
 
     try {
       // Recorded before any tool can run, so a child this run starts finds it.
-      RunTrees.enter(session, runId, membership, run.ledger);
+      RunTrees.enter(session, runId, membership, run);
       // G-360: the plan, in the system prompt of this turn and never in the
       // thread, read after the run begins and before any model call. A turn
       // with a new user message ends every pending approval, so the plan is
@@ -828,7 +830,7 @@ export class AgentRuntime {
       // A root run opens a tree; any turn on a child session the runner did
       // not start continues the run tree it was started in, a host context
       // narrowed to what that tree has left (G-366).
-      run = await RunTrees.rootRun(session, runId, run, membership, holdTtl);
+      run = await RunTrees.rootRun(session, runId, run, membership, holdTtl, paused?.stepsLeft ?? null);
       // What a subagent child carries into every later turn the runner does
       // not start: the run tree it belongs to and the shared plan budget that
       // tree spends from, kept on the session and on the row it pauses on.
@@ -1035,6 +1037,10 @@ export class AgentRuntime {
       const row: JsonObject = assistantRow(response.text, toolCalls, metadata, requests);
       if (requests.length > 0) {
         row.harness_tool_names = offered.map(tool => tool.name);
+        // What a root that opened its tree has left of its own step budget,
+        // so a decision on it is checked as its resume will be (G-381).
+        const stepsLeft = RunTrees.ownStepsLeft(runId);
+        if (stepsLeft !== null) row.harness_steps_left = stepsLeft;
         // What the resume continues from (pausedRunState): the agent's spend
         // so far, and a subagent child's model binding.
         if (session.agent !== null) {
@@ -1514,7 +1520,8 @@ async function writeDecisions(session: Session, decisions: readonly ApprovalDeci
   // And for a subagent child resumed outside the runner, a run tree with
   // nothing left: the tree it was saved with, a host context included.
   const kept = (await session.childRefs()) ?? { tree: pausedRunState(rows)?.tree ?? null, planLedger: null };
-  await RunTrees.assertDecisionsFunded(session, kept, context, session.planRuntime()?.holdTtl(session) ?? RESOLUTION_LOCK_SECONDS, await session.resumedRunTree());
+  await RunTrees.assertDecisionsFunded(session, kept, context, session.planRuntime()?.holdTtl(session) ?? RESOLUTION_LOCK_SECONDS,
+    await session.resumedRunTree(), pausedRunState(rows)?.stepsLeft ?? null);
 
   const run = await session.run();
 

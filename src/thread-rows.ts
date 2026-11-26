@@ -306,6 +306,8 @@ export function pausedRunState(rows: readonly JsonObject[]): {
   binding: PausedBinding | null;
   tree: { session: string; run: string } | null;
   planLedger: { session: string; plan: string } | null;
+  /** What a root that opened its tree had left of its own step budget when it parked (G-381); null when not recorded. */
+  stepsLeft: number | null;
 } | null {
   if (approvalToolScope(rows) === null) return null;
   const paused = [...rows].reverse().find((row) => row.type === 'assistant');
@@ -327,6 +329,7 @@ export function pausedRunState(rows: readonly JsonObject[]): {
     binding: storedBinding(paused.harness_binding),
     tree: storedPair(paused.harness_tree, 'session', 'run') as { session: string; run: string } | null,
     planLedger: storedPair(paused.harness_plan_ledger, 'session', 'plan') as { session: string; plan: string } | null,
+    stepsLeft: typeof paused.harness_steps_left === 'number' && Number.isSafeInteger(paused.harness_steps_left) ? paused.harness_steps_left : null,
   };
 }
 
