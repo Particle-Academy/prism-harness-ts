@@ -281,7 +281,8 @@ turn.
 
 A decision its resume could not act on is refused before it is written: a
 child whose binding is missing, a run nested too deep, a supplied run context
-that was cancelled or is out of time. A spent step or cost budget never
+that was cancelled, or is out of time (a batch of denials only is accepted
+there: acting on a denial runs nothing). A spent step or cost budget never
 refuses one: the resume runs the approved call and takes no model step. An
 approved subagent call on a run with no step left is acted on, and its result
 is the runner's refusal (the child did not run). The runner also refuses a

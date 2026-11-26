@@ -1633,7 +1633,7 @@ async function writeDecisions(session: Session, decisions: readonly ApprovalDeci
   // model step. A decision the resuming turn could not act on at all is
   // refused here, with nothing written; so is a plan step handed a run tree
   // of its own.
-  await assertActionable(session, rows, context);
+  await assertActionable(session, rows, context, decisions.every((decision) => !decision.approved));
   await session.planService()?.assertDecisionsFunded(session, decisions.map((decision) => decision.approvalId), context);
 
   const run = await session.run();
@@ -1653,7 +1653,8 @@ async function writeDecisions(session: Session, decisions: readonly ApprovalDeci
  * Refuse a decision the turn that resumes it could not act on, with the
  * checks that turn runs, before anything is recorded (G-387): a subagent
  * child whose binding is missing, a run nested too deep, and a supplied run
- * context whose ledger was cancelled or whose time is spent. A recorded
+ * context whose ledger was cancelled or (for a batch with an approval in it)
+ * whose time is spent. A recorded
  * decision no turn can act on would be an approval accepted and never run.
  * (This port has no per-run tool-call limit to check.)
  *
@@ -1677,7 +1678,7 @@ export async function decisionsAnswerable(session: Session): Promise<boolean> {
   }
 }
 
-async function assertActionable(session: Session, rows: readonly JsonObject[], context: RunContext | undefined): Promise<void> {
+async function assertActionable(session: Session, rows: readonly JsonObject[], context: RunContext | undefined, onlyDenials = false): Promise<void> {
   const execution = executionContext(context);
   const tail = RunTrees.contextKind(context) === 'runner' ? null : pausedRunState(rows);
   const savedBinding = (await session.childBinding()) ?? tail?.binding ?? null;
@@ -1692,8 +1693,11 @@ async function assertActionable(session: Session, rows: readonly JsonObject[], c
   if (execution.ledger.cancelled) {
     throw HarnessError.runNotPermitted('This decision may not be recorded: the run tree it would resume in was cancelled.');
   }
+  // Acting on a denial runs nothing, so a batch of denials only is not
+  // refused for a spent time limit; a cancelled context still refuses it,
+  // and a batch with an approval in it keeps the check.
   const seconds = execution.budget.maxSeconds;
-  if (seconds !== null && execution.ledger.elapsedSeconds() >= seconds) {
+  if (!onlyDenials && seconds !== null && execution.ledger.elapsedSeconds() >= seconds) {
     throw HarnessError.runNotPermitted('This decision may not be recorded: the run it would resume in has no time left.');
   }
 }

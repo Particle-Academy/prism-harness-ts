@@ -67,7 +67,9 @@ Includes every fix released on the 0.11 line in 0.11.1 and 0.11.2.
   written, on every decision path (`recordApproval()`, `recordDecisions()`,
   `decide()`, `streamDecision()`): a subagent child whose binding is missing
   (`child_binding_missing`), a run nested too deep, and a supplied run context
-  whose ledger was cancelled or whose time is spent (`run_not_permitted`); and
+  whose ledger was cancelled or whose time is spent (`run_not_permitted`; a
+  batch of denials only is not refused for spent time, as acting on a denial
+  runs nothing, but is for a cancelled context); and
   a plan step handed a run tree of its own (`plan.budget_context`). A resume
   under a cancelled run context runs none of the approved calls.
 - The subagent runner refuses (`denied`, a framed result, nothing written to

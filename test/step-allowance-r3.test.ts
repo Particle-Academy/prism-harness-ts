@@ -567,3 +567,58 @@ describe('new channels considered (round 3)', () => {
     expect(r.requests).toHaveLength(2);           // 3 used: one more of 4
   });
 });
+
+// Item 9, set for all three ports: acting on a denial runs nothing, so a
+// batch of denials only is not refused for a spent time limit of the
+// supplied context; a cancelled context still refuses it, and a batch with
+// an approval in it keeps the full check.
+describe('a batch of denials and the supplied context\'s limits (item 9)', () => {
+  async function parkedOnTwo(r: Rig): Promise<[string, string]> {
+    r.calls([['echo', { n: 1 }], ['echo', { n: 2 }]]);   // one step asking for two approvals
+    await r.runtime.send(r.session(), 'Go');
+    const pending = await r.pending(r.session());
+    expect(pending).toHaveLength(2);
+
+    return [pending[0]!, pending[1]!];
+  }
+
+  it('records a batch of denials under a context whose time is spent, and runs nothing', async () => {
+    const r = new Rig({ lead: 4 });
+    const [a, b] = await parkedOnTwo(r);
+    const late = RunContext.root('host', new RunBudget(8, null, 0));
+
+    await drain(r.runtime.streamDecision(r.session(), [{ approvalId: a, approved: false }, { approvalId: b, approved: false }], late));
+
+    expect(await r.pending(r.session())).toEqual([]);
+    expect(r.ran.echo ?? 0).toBe(0);
+    expect(r.requests).toHaveLength(1);
+  });
+
+  it('still refuses a batch of denials under a cancelled context, recording nothing', async () => {
+    const r = new Rig({ lead: 4 });
+    const [a, b] = await parkedOnTwo(r);
+    const rows = await rowCount(r.session());
+    const cancelled = RunContext.root('host', new RunBudget(8));
+    cancelled.ledger.cancel('stopped by host');
+
+    await expect(drain(r.runtime.streamDecision(r.session(), [{ approvalId: a, approved: false }, { approvalId: b, approved: false }], cancelled)))
+      .rejects.toMatchObject({ code: 'run_not_permitted' });
+
+    expect(await rowCount(r.session())).toBe(rows);
+    expect(await r.pending(r.session())).toEqual([a, b]);
+  });
+
+  it('still refuses a batch with one approval in it under a context whose time is spent, recording nothing', async () => {
+    const r = new Rig({ lead: 4 });
+    const [a, b] = await parkedOnTwo(r);
+    const rows = await rowCount(r.session());
+    const late = RunContext.root('host', new RunBudget(8, null, 0));
+
+    await expect(drain(r.runtime.streamDecision(r.session(), [{ approvalId: a, approved: false }, { approvalId: b, approved: true }], late)))
+      .rejects.toMatchObject({ code: 'run_not_permitted' });
+
+    expect(await rowCount(r.session())).toBe(rows);
+    expect(await r.pending(r.session())).toEqual([a, b]);
+    expect(r.ran.echo ?? 0).toBe(0);
+  });
+});
