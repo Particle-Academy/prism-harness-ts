@@ -19,8 +19,9 @@ import {
 
 // A subagent child that stops on an approval is resumed later on its own
 // session, outside the runner. That run continues the run tree it was started
-// in: it spends what the tree has left, never a fresh root budget, and an
-// approval the spent tree could not run is refused with nothing recorded.
+// in: it spends what the tree has left, never a fresh root budget. A spent
+// tree leaves it the approvals already decided and no model step (G-387):
+// the approved call runs and nothing more.
 // Driven through the public API (runtime.send, recordApproval) with a scripted
 // model client; fetch is refused and every store is in memory.
 
@@ -138,15 +139,16 @@ describe('a subagent child resumed outside the runner', () => {
     expect(r.requests.length - before).toBe(1);
   });
 
-  it('refuses, recording nothing, an approval for a child whose run tree is spent', async () => {
+  it('acts on an approval for a child whose run tree is spent, with no model step', async () => {
     const { r, child, id } = await pausedChild(3);
     const before = r.requests.length;
-    const recorded = await r.results(child);
 
-    await expect(recordApproval(child, id, true)).rejects.toMatchObject({ code: 'run_not_permitted' });
-    expect(await r.pending(child)).toEqual([id]);
-    expect(await r.results(child)).toBe(recorded);
-    expect(r.weatherRan).toBe(0);
+    await recordApproval(child, id, true);
+    const response = await r.runtime.send(child, '');
+
+    expect(response.finishReason).toBe('budget_exhausted');
+    expect(await r.pending(child)).toEqual([]);
+    expect(r.weatherRan).toBe(1);
     expect(r.requests.length).toBe(before);
   });
 
@@ -210,15 +212,14 @@ describe('a turn on a subagent child session outside the runner', () => {
     expect(r.requests.length - before).toBe(1);
   });
 
-  it('refuses, recording nothing, a host-supplied run context on a child whose run tree is spent', async () => {
+  it('acts on a streamed decision under a host-supplied run context on a child whose run tree is spent, with no model step', async () => {
     const { r, child, id } = await pausedChild(3);
     const before = r.requests.length;
-    const recorded = await r.results(child);
 
-    await expect(drain(r.runtime.streamDecision(child, [{ approvalId: id, approved: true }], host()))).rejects.toMatchObject({ code: 'run_not_permitted' });
-    expect(await r.pending(child)).toEqual([id]);
-    expect(await r.results(child)).toBe(recorded);
-    expect(r.weatherRan).toBe(0);
+    await drain(r.runtime.streamDecision(child, [{ approvalId: id, approved: true }], host()));
+
+    expect(await r.pending(child)).toEqual([]);
+    expect(r.weatherRan).toBe(1);
     expect(r.requests.length).toBe(before);
   });
 

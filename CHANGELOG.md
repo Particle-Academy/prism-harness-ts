@@ -4,6 +4,48 @@
 
 Includes every fix released on the 0.11 line in 0.11.1 and 0.11.2.
 
+### Changed: one authority for a run's step allowance (G-387)
+
+- How many model steps a run may take is decided once, when it begins, by one
+  pure function, `RunBudgets.allowance()`, pinned across languages by the
+  harness-plans corpus 0.1.9 (`step_allowance`, hpl-0072..hpl-0083), and
+  recorded beside the run's tree membership. The run is narrowed to it once;
+  the step gate, the row it parks on, the subagent runner's pre-check, the
+  run-tree and plan holds and both decision checks read that record or that
+  budget. Before, about twenty sites each computed "steps left" from a
+  different pair of sources.
+- A subagent's declared `max_steps` is saved with the child's binding (the
+  ceiling the runner started it under) and applied on every turn the runner
+  did not start: a resume with no context, with a metadata context, or with a
+  host context, and a new message. Before, a declared subagent ceiling was
+  not re-applied on turns the runner did not start. A host context can only
+  lower the saved ceiling, never raise it.
+- The row a run parks on now records `harness_steps_used`: the steps the run
+  had used, its subagent children's included. Its resume continues from that
+  count, never from fewer than the model steps the session's own rows show; a
+  row written before the field existed is counted from its rows, and a value
+  that is not a non-negative whole number fails closed (no model step), as
+  does a missing value on a child session that saved its ceiling.
+  `harness_steps_left` is still written (it now includes plan narrowing), but
+  nothing reads it to decide a budget.
+- `max_steps_ceiling` bounds a run's whole count under every context. Before,
+  a resume under a host context restarted it from the host's ledger.
+- A spent budget, steps or cost (the run's own, its run tree's or a shared
+  plan's), never refuses a decision and never refuses a resume: acting on an
+  approved call makes no provider call. The decision is recorded, the resume
+  runs the approved call and finishes with `budget_exhausted` without a model
+  call, on `send()`, `streamDecision()` and `sendStructured()` alike. A
+  subagent call approved on such a run is refused by the runner before its
+  child takes a step. A decision is still refused for a missing binding,
+  depth and `plan.budget_context`. This replaces the `run_not_permitted` /
+  `plan_budget_exhausted` decision refusals described below.
+- A turn with a NEW prompt (it resumes no decisions) that is left no model
+  step is refused before anything is recorded, as before:
+  `plan_budget_exhausted` when the shared plan budget is what has nothing left
+  for it (also a fresh `advance()` whose remainder a live turn holds), and
+  `run_not_permitted` otherwise (its own saved ceiling, its run tree or a cost
+  budget spent).
+
 ### Added
 
 - `bindingRoute()`: the one rule for which provider/model binding a turn runs

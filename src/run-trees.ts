@@ -1,6 +1,7 @@
 import { HarnessError } from './errors.js';
 import type { JsonObject } from './json.js';
 import { PlanBudget, type PlanBudgetGrant, type PlanBudgetState, type RunContextKind } from './plans/budget.js';
+import { RunBudgets, type AllowanceFacts, type StepAllowance } from './run-budgets.js';
 import type { ChildRefs, Session } from './session.js';
 import type { SessionStore } from './stores/session-store.js';
 import { RunBudget, type RunContext, type RunLedger } from './subagents.js';
@@ -47,13 +48,12 @@ interface RootRun {
 interface Member extends TreeMembership {
   session: string;
   ledger: RunLedger;
-  /** The run's own step ceiling, before any tree narrows it. */
-  ownMaxSteps: number;
   /**
-   * An open root's own steps left when it started (the measure rootRun
-   * computes) and its ledger's steps then; null until rootRun has run.
+   * The facts its step allowance was computed from when it began (G-387),
+   * the tree and plan grants included, and its ledger's steps then; null
+   * until the allowance is decided.
    */
-  base: { left: number; steps: number } | null;
+  allowance: { facts: AllowanceFacts; startSteps: number } | null;
 }
 
 /** Runs of this process holding a run tree's budget, by run id, until they end. */
@@ -160,31 +160,38 @@ export const RunTrees = {
     return RunTrees.membership(kind, session.key(), runId, parent, saved?.tree ?? null, savedDepth, contextDepth, bare ? resumedTree : null);
   },
 
-  /** Record a live run's membership, once its run context exists and before any tool runs, with its own step ceiling (before any tree narrows it). */
+  /** Record a live run's membership, once its run context exists and before any tool runs. */
   enter(session: Session, runId: string, membership: TreeMembership, run: RunContext): void {
-    members.set(runId, { ...membership, session: session.key(), ledger: run.ledger, ownMaxSteps: run.budget.maxSteps, base: null });
+    members.set(runId, { ...membership, session: session.key(), ledger: run.ledger, allowance: null });
   },
 
   /**
-   * What a live root that opened its tree has left of its own step budget,
-   * its ledger (a runner child's steps included) against its own ceiling:
-   * written on the row it parks on, so a decision on it is checked by the
-   * measure its resume will use (G-381). Null for any other run.
+   * Record a live run's step allowance (G-387), decided once when it began,
+   * beside its membership. `run` is the run narrowed to it: a run holding a
+   * tree's budget keeps that budget, the allowance its children's holds are
+   * drawn from.
    */
-  ownStepsLeft(runId: string): number | null {
+  allowed(runId: string, facts: AllowanceFacts, startSteps: number, run: RunContext): void {
     const member = members.get(runId);
-    if (member === undefined || member.route !== 'open') return null;
-    // What this run had left of its own budget when it started, less the
-    // steps it took since. At a resume the ledger is rebuilt from the root's
-    // own rows, so a runner child's steps from before an earlier pause are
-    // not on it; the starting allowance already counts them (it is the
-    // smaller of the rebuilt measure and the previous row), so the row stays
-    // exact at every pause. Never what the tree record could grant: a
-    // sibling holding part of the record makes that partial, and the tree
-    // is checked on its own.
-    if (member.base !== null) return Math.max(0, member.base.left - (member.ledger.steps - member.base.steps));
+    if (member !== undefined) member.allowance = { facts: { ...facts }, startSteps };
+    const entry = runs.get(runId);
+    if (entry !== undefined) {
+      entry.budget = run.budget;
+      entry.ledger = run.ledger;
+    }
+  },
 
-    return Math.max(0, member.ownMaxSteps - member.ledger.steps);
+  /**
+   * A live run's step allowance as recorded when it began, with what it has
+   * taken since (its ledger's gain, a runner child's steps included): what
+   * it writes on the row it parks on. Null for a run with none recorded.
+   */
+  allowanceOf(runId: string): StepAllowance | null {
+    const member = members.get(runId);
+    if (member === undefined || member.allowance === null) return null;
+    const { facts, startSteps } = member.allowance;
+
+    return RunBudgets.allowance({ ...facts, took: Math.max(0, member.ledger.steps - startSteps) });
   },
 
   /** The recorded membership of a live run of this process, or null. */
@@ -195,73 +202,61 @@ export const RunTrees = {
   },
 
   /**
-   * A run is starting, its membership decided: a run that opens a tree is
-   * kept in memory until it starts a child; a run that continues a saved tree
-   * holds what that tree has left, and its run is narrowed to the hold, so a
-   * host context can only lower what the tree allows. Any other run is left
-   * alone.
-   *
-   * @throws HarnessError `run_not_permitted` when the tree the child belongs to is spent
+   * A run is starting, its membership decided and its own steps left known
+   * (`ownLeft`, RunBudgets.allowance): a run that opens a tree is kept in
+   * memory until it starts a child; a run that continues a saved tree, or an
+   * open root whose tree already has a record, holds what it may spend of
+   * that tree, requested as `ownLeft`, in one locked write. Returns the run,
+   * its cost narrowed to the hold, and the tree's step grant: null when no
+   * durable tree bounds the run, 0 when the tree's steps or cost are spent,
+   * its record is gone, or the run has no step of its own left. A spent
+   * tree is never a refusal here (G-387): a resume still acts on the
+   * decisions it resumes and takes no model step; the runtime refuses a new
+   * prompt that is left no step. Any other run is left alone.
    */
-  async rootRun(session: Session, runId: string, run: RunContext, membership: TreeMembership, ttl: number, stepsLeft: number | null = null): Promise<RunContext> {
-    if (membership.route === 'none' || typeof membership.tree !== 'object') return run;
+  async holdTree(session: Session, runId: string, run: RunContext, membership: TreeMembership, ttl: number, ownLeft: number): Promise<{ run: RunContext; treeLeft: number | null }> {
+    if (membership.route === 'none' || typeof membership.tree !== 'object') return { run, treeLeft: null };
     const tree = membership.tree;
-    // A run whose own step budget is already spent is left to its own
-    // ceiling, checked first: it still acts on the decisions it resumes,
-    // then stops with budget_exhausted, as it always has. There is nothing of
-    // the tree's for it to hold. "Own steps left" is ONE measure, the one the
-    // decision check reads: for a resumed root, what its parked row says it
-    // had left of its own budget (its ledger, a runner child's steps
-    // included), when the row says so.
-    let left = run.budget.maxSteps - run.ledger.steps;
-    if (membership.route === 'open' && stepsLeft !== null) left = Math.min(left, stepsLeft);
-    const ownLeft = left > 0;
-    const member = members.get(runId);
-    if (membership.route === 'open' && member !== undefined) member.base = { left: Math.max(0, left), steps: run.ledger.steps };
-    if (membership.route === 'open' && !ownLeft && run.budget.maxSteps > run.ledger.steps) {
-      // Spent by that measure: it acts on the decisions and takes no further step.
-      run = run.withBudget(new RunBudget(run.ledger.steps, run.budget.maxCostUsd, run.budget.maxSeconds, run.budget.maxOutputTokensPerCall));
-    }
-    // An open run whose tree already has a record is held to it, whatever
-    // its run id: a root resumed on the stream path continues under the
-    // parked run's own id, and the tree's allowance holds across the pause
-    // there exactly as on a resume under a new id.
-    let route = membership.route;
-    if (route === 'open' && ownLeft && record(await session.planStore().get(key(tree)), tree) !== null) route = 'continue';
-    // A resumed root whose tree has no record yet stays open: it opens the
-    // record when it first delegates (childStarted). Two resumes of one
-    // parked root never overlap: the runtime starts a resumed root under the
-    // session lock, so the second sees the first's record.
     const entry: RootRun = {
       session: session.key(), tree,
       budget: run.budget, ledger: run.ledger, steps: run.ledger.steps, cost: run.ledger.costUsd,
       unmetered: run.ledger.unmeteredRuns, held: false, ttl,
     };
-    if (route === 'open') {
-      runs.set(runId, entry);
+    if (membership.route === 'open') {
+      // An open run whose tree already has a record is held to it, whatever
+      // its run id: a root resumed on the stream path continues under the
+      // parked run's own id, and the tree's allowance holds across the pause
+      // there exactly as on a resume under a new id. One whose tree has no
+      // record yet stays open: it opens the record when it first delegates
+      // (childStarted). Two resumes of one parked root never overlap: the
+      // runtime starts a resumed root under the session lock, so the second
+      // sees the first's record. One with no step of its own left has
+      // nothing of the tree's to hold.
+      if (ownLeft < 1 || record(await session.planStore().get(key(tree)), tree) === null) {
+        runs.set(runId, entry);
 
-      return run;
-    }
+        return { run, treeLeft: null };
+      }
+    } else if (ownLeft < 1) return { run, treeLeft: 0 };
 
     const budget = run.budget;
-    const turnSteps = Math.max(0, budget.maxSteps - entry.steps);
     const turnCost = budget.maxCostUsd === null ? null : PlanBudget.micros(Math.max(0, budget.maxCostUsd - entry.cost));
     const now = Math.floor(Date.now() / 1000);
     const grant = await write(session.planStore(), tree, (state) => state === null
       // The tree's record is gone: closed, never a fresh budget.
       ? [null, { refused: PlanBudget.EXHAUSTED, limit: 'steps' } as PlanBudgetGrant]
-      : PlanBudget.reserve(state, runId, turnSteps, turnCost, now, ttl));
-    if ('refused' in grant) throw spent(grant.limit);
+      : PlanBudget.reserve(state, runId, ownLeft, turnCost, now, ttl));
+    if ('refused' in grant) return { run, treeLeft: 0 };
 
     const narrowed = run.withBudget(new RunBudget(
-      entry.steps + grant.steps,
+      budget.maxSteps,
       grant.cost_micros === null ? budget.maxCostUsd : entry.cost + grant.cost_micros / 1_000_000,
       budget.maxSeconds,
       budget.maxOutputTokensPerCall,
     ));
     runs.set(runId, { ...entry, budget: narrowed.budget, ledger: narrowed.ledger, held: true });
 
-    return narrowed;
+    return { run: narrowed, treeLeft: grant.steps };
   },
 
   /**
@@ -305,6 +300,8 @@ export const RunTrees = {
     const spends = membership.spends;
     const entry = runs.get(spends);
     if (entry !== undefined && !entry.held) {
+      // The tree's allowance is the spending run's own step allowance, as
+      // recorded when it began: its budget was narrowed to it (allowed()).
       const settings = {
         mode: 'shared' as const,
         max_steps: Math.max(0, entry.budget.maxSteps - entry.steps),
@@ -323,35 +320,6 @@ export const RunTrees = {
     }
 
     return membership.tree;
-  },
-
-  /**
-   * Refuse, before anything is recorded, a decision on a child session whose
-   * run tree has nothing left: recorded, it would be consumed by a resume the
-   * tree then refuses, and the approved call would never run. The decision
-   * turn's membership is decided as the turn's own would be.
-   *
-   * @throws HarnessError `run_not_permitted`
-   */
-  async assertDecisionsFunded(session: Session, saved: ChildRefs | null, context: RunContext | undefined, ttl: number, resumedTree: RunTreeRef | null = null, stepsLeft: number | null = null): Promise<void> {
-    const kind = RunTrees.contextKind(context);
-    const bare = kind === 'none' || kind === 'metadata';
-    const membership = RunTrees.membership(kind, session.key(), 'decision', null, saved?.tree ?? null, 0, 0, bare ? resumedTree : null);
-    const tree = membership.tree;
-    if (typeof tree !== 'object') return;
-    const state = record(await session.planStore().get(key(tree)), tree);
-    if (membership.route === 'open') {
-      // A root resuming its parked run is held to its tree's record only
-      // when the parked run delegated and opened one, and only when its own
-      // step budget has steps left (the measure rootRun reads): a resume that
-      // can take no step only acts on the decisions, which costs the tree
-      // nothing.
-      if (tree.run === 'decision' || state === null) return;
-      if (stepsLeft !== null && stepsLeft < 1) return;
-    } else if (membership.route !== 'continue') return;
-    if (state === null) throw spent('steps');
-    const [, grant] = PlanBudget.reserve(state, 'decision', 1, null, Math.floor(Date.now() / 1000), ttl);
-    if ('refused' in grant) throw spent(grant.limit);
   },
 
   /** A run is over: its membership is dropped, and a run that holds part of a tree settles what the tree spent under it. */

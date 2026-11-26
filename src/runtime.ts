@@ -28,6 +28,8 @@ import type { ChildRefs, Session } from './session.js';
 import { schemaName, schemaProblems } from './structured.js';
 import { RunBudget, RunContext, RunLedger, bindingRoute, type ModelBinding } from './subagents.js';
 import { RunTrees, type RunTreeRef } from './run-trees.js';
+import { RunBudgets, type AllowanceFacts } from './run-budgets.js';
+import { PLAN_BUDGET_EXHAUSTED, type RunContextKind } from './plans/budget.js';
 import type { HarnessTool, ToolAuthorizer, ToolRegistry } from './tools.js';
 import { settleWithRefusalScope } from './refusals.js';
 import { RunStepTagger, StepChannel, type RunStep, type ToolCallOutcome } from './steps.js';
@@ -348,14 +350,58 @@ export class AgentRuntime {
     return options && Object.hasOwn(options, key) ? options[key] : this.#config[key];
   }
 
+  /**
+   * The run under the agent's output ceiling. Its STEP ceiling,
+   * max_steps_ceiling, is never applied here: it is one input of the run's
+   * step allowance (RunBudgets.allowance, G-387), absolute on the run's
+   * whole count under every context.
+   */
   #boundedRun(session: Session, run: RunContext): RunContext {
-    const steps = this.#setting(session, 'max_steps_ceiling'), output = this.#setting(session, 'max_output_tokens_per_call'), budget = run.budget;
-    if (steps == null && output == null) return run;
+    const output = this.#setting(session, 'max_output_tokens_per_call'), budget = run.budget;
+    if (output == null) return run;
     return run.withBudget(new RunBudget(
-      steps == null ? budget.maxSteps : Math.min(budget.maxSteps, run.ledger.steps + steps),
-      budget.maxCostUsd, budget.maxSeconds,
-      output == null ? budget.maxOutputTokensPerCall : Math.min(budget.maxOutputTokensPerCall ?? output, output),
+      budget.maxSteps, budget.maxCostUsd, budget.maxSeconds,
+      Math.min(budget.maxOutputTokensPerCall ?? output, output),
     ));
+  }
+
+  /**
+   * What a run's step allowance is computed from (RunBudgets.allowance,
+   * G-387), as it begins. `resumed` is the state of the parked run this turn
+   * resumes, null for a turn that resumes nothing.
+   *
+   * - The ceiling saved with a subagent child applies on every turn the
+   *   runner did not start.
+   * - What a runner or host context has left is that context's own budget.
+   * - The steps used are what the parked run wrote on the row it parked on
+   *   (`harness_steps_used`, its children's steps included), never fewer
+   *   than the model steps its own rows show: a row cannot be forged below
+   *   the transcript it sits in, and a row written before the field existed
+   *   is counted from its rows. A field that is present and malformed fails
+   *   closed: the run has used its whole ceiling.
+   */
+  async #allowanceFacts(session: Session, mode: AgentMode, kind: RunContextKind, execution: RunContext | undefined, resumed: ReturnType<typeof pausedRunState>, rows: readonly JsonObject[]): Promise<AllowanceFacts> {
+    const facts: AllowanceFacts = {
+      kind,
+      modeSteps: mode.maxSteps,
+      savedCeiling: kind === 'runner' ? null : await session.childCeiling(),
+      contextLeft: execution == null ? null : Math.max(0, execution.budget.maxSteps - execution.ledger.steps),
+      stepsCeiling: this.#setting(session, 'max_steps_ceiling') ?? null,
+      used: 0,
+      treeLeft: null,
+      planLeft: null,
+      took: 0,
+    };
+    if (kind === 'runner' || resumed === null) return facts;
+    // A session that saved a child's ceiling was written by a version that
+    // also writes the count: an absent one there is not a legacy row.
+    if (resumed.stepsUsed === 'invalid' || (resumed.stepsUsed === null && facts.savedCeiling !== null)) {
+      const ceiling = RunBudgets.allowance(facts).ceiling;
+
+      return { ...facts, savedCeiling: ceiling, used: ceiling };
+    }
+
+    return { ...facts, used: Math.max(resumed.stepsUsed ?? 0, approvalRunSteps(rows) ?? 0) };
   }
 
   /** The mode a session's next run resolves to, as the runtime would resolve it. */
@@ -822,15 +868,23 @@ export class AgentRuntime {
       } else offered = (await this.#offer(session, mode, toolNames, planTools)).tools;
       const stored = (await thread.messages()).map(entry => entry.message);
       const scope = approvalToolScope(stored);
-      // A resume continues the paused run's step count; it never opens a new
-      // allowance. Only for a root run: a child's steps are already on the
-      // tree ledger its caller hands back in.
-      if (prompt === '' && execution == null) run.ledger.recordSteps(approvalRunSteps(stored) ?? 0);
+      // G-387: how many model steps this run may take is decided ONCE, here,
+      // beside its membership, and recorded with it (RunTrees.allowed); the
+      // run is narrowed to it once, and every consumer reads that record or
+      // that budget. A turn resuming a parked run continues the count the
+      // parked run wrote (its children's steps included), never below the
+      // steps its own rows show; a runner start is a new run.
+      const facts = await this.#allowanceFacts(session, mode, contextKind, execution, prompt === '' ? tail : null, stored);
+      // A turn with no run context continues the count on its own ledger.
+      if (execution == null) run.ledger.recordSteps(facts.used);
+      const startSteps = run.ledger.steps;
+      const own = RunBudgets.allowance(facts);
       const holdTtl = this.#setting(session, 'lock_ttl') ?? RESOLUTION_LOCK_SECONDS;
       // A root run opens a tree; any turn on a child session the runner did
-      // not start continues the run tree it was started in, a host context
-      // narrowed to what that tree has left (G-366).
-      run = await RunTrees.rootRun(session, runId, run, membership, holdTtl, paused?.stepsLeft ?? null);
+      // not start continues the run tree it was started in, holding what it
+      // may spend of it (G-366).
+      const held = await RunTrees.holdTree(session, runId, run, membership, holdTtl, own.own_left);
+      run = held.run;
       // What a subagent child carries into every later turn the runner does
       // not start: the run tree it belongs to and the shared plan budget that
       // tree spends from, kept on the session and on the row it pauses on.
@@ -852,14 +906,34 @@ export class AgentRuntime {
           : { tree: typeof membership.tree === 'object' ? membership.tree : null, planLedger: savedRefs.planLedger };
         this.#childRefs.set(runId, refs);
         if (runnerStart) {
+          // With the ceiling the runner gave it (G-387), re-applied on every
+          // turn on the child the runner does not start.
           if (JSON.stringify(await session.childBinding()) !== JSON.stringify(runnerBinding)
-            || await session.childDepth() !== membership.depth) await session.rememberChildBinding(runnerBinding, membership.depth);
+            || await session.childDepth() !== membership.depth
+            || await session.childCeiling() !== own.ceiling) await session.rememberChildBinding(runnerBinding, membership.depth, own.ceiling);
           if (JSON.stringify(await session.childRefs()) !== JSON.stringify(refs)) await session.rememberChildRefs(refs);
         }
       }
       // G-366: a turn serving a plan step with a shared budget holds what the
-      // plan has left, after the paused steps it continues are counted.
-      if (plans !== null) run = await plans.planTurn(session, runId, run, context, prompt);
+      // plan has left of the steps its own and its tree's allowance leave it.
+      const planned = plans === null ? { run, planLeft: null }
+        : await plans.planTurn(session, runId, run, context, prompt, Math.min(own.own_left, held.treeLeft ?? Number.POSITIVE_INFINITY));
+      run = planned.run;
+      const allowance = RunBudgets.allowance({ ...facts, treeLeft: held.treeLeft, planLeft: planned.planLeft });
+      // Narrowed ONCE: the loop's step gate, a subagent's pre-check and every
+      // hold it takes read this budget. A host or runner context can only
+      // lower what it offered, never raise it.
+      run = run.withBudget(new RunBudget(startSteps + allowance.allowance, run.budget.maxCostUsd, run.budget.maxSeconds, run.budget.maxOutputTokensPerCall));
+      RunTrees.allowed(runId, { ...facts, treeLeft: held.treeLeft, planLeft: planned.planLeft }, startSteps, run);
+      // A NEW prompt resumes no recorded decisions: with no step to take it
+      // is refused before anything is recorded. Only a resume (an empty
+      // prompt) left no step acts on its decisions without a model step.
+      if (prompt !== '' && allowance.acts_without_step) {
+        const planIsZero = allowance.plan_left === 0 && allowance.own_left > 0 && allowance.tree_left !== 0;
+        throw planIsZero
+          ? new HarnessError(PLAN_BUDGET_EXHAUSTED, 'This plan step may not proceed (plan_budget_exhausted): the shared plan budget has nothing left for it.')
+          : HarnessError.runNotPermitted('This run may not start: its step budget has nothing left (its own ceiling, its run tree or a cost budget is spent).');
+      }
       if (scope !== null) {
         if (scope.legacy) console.warn('Pending approval has no valid stored tool scope; offering approved requests only.');
         offered = offered.filter(tool => scope.names.includes(tool.name)
@@ -1037,10 +1111,14 @@ export class AgentRuntime {
       const row: JsonObject = assistantRow(response.text, toolCalls, metadata, requests);
       if (requests.length > 0) {
         row.harness_tool_names = offered.map(tool => tool.name);
-        // What a root that opened its tree has left of its own step budget,
-        // so a decision on it is checked as its resume will be (G-381).
-        const stepsLeft = RunTrees.ownStepsLeft(runId);
-        if (stepsLeft !== null) row.harness_steps_left = stepsLeft;
+        // The steps this run has used, its children's included, which its
+        // resume continues from; and what it has left of its allowance, plan
+        // narrowing included, which nothing reads to decide a budget (G-387).
+        const allowance = RunTrees.allowanceOf(runId);
+        if (allowance !== null) {
+          row.harness_steps_used = allowance.used_at_park;
+          row.harness_steps_left = allowance.left_at_park;
+        }
         // What the resume continues from (pausedRunState): the agent's spend
         // so far, and a subagent child's model binding.
         if (session.agent !== null) {
@@ -1513,15 +1591,10 @@ async function writeDecisions(session: Session, decisions: readonly ApprovalDeci
   for (const decision of decisions) {
     if (!pending.delete(decision.approvalId)) throw HarnessError.approvalNotPending(decision.approvalId);
   }
-  // A decision a spent shared plan budget could not run is refused here, with
-  // nothing recorded, rather than consumed by a resume the budget then
-  // refuses (G-366).
+  // No budget, steps or cost, refuses a decision (G-387): acting on an
+  // approved call makes no provider call, so the resume runs it and takes no
+  // model step. Refused only for a plan step handed a run tree of its own.
   await session.planService()?.assertDecisionsFunded(session, decisions.map((decision) => decision.approvalId), context);
-  // And for a subagent child resumed outside the runner, a run tree with
-  // nothing left: the tree it was saved with, a host context included.
-  const kept = (await session.childRefs()) ?? { tree: pausedRunState(rows)?.tree ?? null, planLedger: null };
-  await RunTrees.assertDecisionsFunded(session, kept, context, session.planRuntime()?.holdTtl(session) ?? RESOLUTION_LOCK_SECONDS,
-    await session.resumedRunTree(), pausedRunState(rows)?.stepsLeft ?? null);
 
   const run = await session.run();
 

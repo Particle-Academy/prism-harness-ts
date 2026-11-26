@@ -237,13 +237,27 @@ context the host built, which is narrowed to what the tree (and the plan budget
 below) has left and can never widen it. The first time a root run starts a child, the tree's step and
 cost allowance is kept in the durable store, and the root run settles what the
 whole tree spent when it ends. The resumed child holds what the tree has left
-before it calls a provider, settles what it spent when it ends, and is refused
-with `run_not_permitted` once the tree's allowance is spent; a decision on the
-child's approval is then refused the same way with nothing recorded, so the
-approval is never consumed by a resume that cannot run. A hold whose run never
-settled is charged in full once the run lock's TTL has passed. When the child was
-started by a turn that spent from a shared plan budget, the resumed child spends
-from that plan budget too (`plan_budget_exhausted`). A child started under a run
+before it calls a provider and settles what it spent when it ends. Once the
+tree is spent (steps or cost), a decision on the child's approval is still
+accepted: acting on it makes no provider call, so the resume runs the approved
+call and finishes with `budget_exhausted` without calling a provider. A new
+message to the child is refused with `run_not_permitted`, recording nothing.
+A hold whose run never settled is charged in full once the run lock's
+TTL has passed. When the child was started by a turn that spent from a shared
+plan budget, the resumed child spends from that plan budget too.
+
+How many model steps any run may take is decided once, when it begins, and
+never re-derived (G-387): the least of its own ceiling less the steps it has
+used, what a host context offers, and what its run tree and shared plan budget
+grant it. Its own ceiling is, for a child the runner starts, what the runner's
+context leaves it (its declared `max_steps` within its parent's remainder);
+for any later turn on that child the runner did not start, that same ceiling,
+saved with the child; otherwise the mode's `max_steps`. `max_steps_ceiling`
+caps it under every context. The steps used are written on the row a run parks
+on (`harness_steps_used`, its subagent children's steps included) and its
+resume continues from them; a value there that is not a non-negative whole
+number fails closed, as does a missing value on a child session that saved
+its ceiling. A child started under a run
 context the host built itself, outside any turn, has no tree record and is
 resumed on its own root budget. Every other `send()` starts a new run tree with the full
 ceiling, and so does each `plan.advance()` called without a context. To hold
@@ -674,18 +688,21 @@ first chosen or first used: after that its mode cannot change
 handed a run tree of its own is refused (`plan.budget_context`) rather than run
 outside the ledger. A turn on a subagent child that a plan's turn started, handed
 a host-built context, is narrowed to what the plan budget has left instead. An invalid mode or limit throws `PlanBudgetInvalid` when
-plans are used, before anything runs. A turn the ledger refuses fails with
-`plan_budget_exhausted`.
+plans are used, before anything runs. A resume whose ledger has nothing left
+(steps or cost) acts on its decisions and takes no model step; a turn with a
+new prompt, such as the one `advance()` runs, fails with
+`plan_budget_exhausted` before anything is recorded.
 
 The plan's own turns are the turn `advance()` runs for the step it claimed and
 the resume of an approval that step asked for. Any other turn on the session,
 such as the person chatting while a step waits on their approval, spends
 nothing from the plan's budget and is never refused for it. A decision on an
 approval the step asked for (`recordApproval()`, `recordDecisions()`,
-`runtime.decide()` or `streamDecision()`) is refused with
-`plan_budget_exhausted`, recording nothing, when the shared budget is already
-spent, and the next `advance()` blocks the plan, so an approval is never
-consumed by a resume that cannot run.
+`runtime.decide()` or `streamDecision()`) is accepted even when the shared
+budget's steps are spent: the resume runs the approved call and takes no model
+step, so an approval is never accepted and then not acted on. The next
+`advance()` then blocks the plan. The same holds when the budget's cost is
+spent.
 
 ### Hosts with queues
 

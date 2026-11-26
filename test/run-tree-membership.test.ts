@@ -12,6 +12,7 @@ import {
   Session,
   ToolRegistry,
   recordApproval,
+  type AgentResponse,
   type Durability,
   type JsonObject,
   type LlmRequest,
@@ -458,23 +459,26 @@ describe('a root that resumes its parked run and delegates again', () => {
     expect(record).not.toBeNull();
     expect(record!.steps).toBe(record!.max_steps);
     const ran = r.weatherRan, requests = r.requests.length;
-    const rows = (await child.thread().messages()).length;
 
-    // Spent, the tree refuses the parked child before anything is recorded.
-    await expect(recordApproval(child, pending, true)).rejects.toMatchObject({ code: 'run_not_permitted' });
-    expect(await r.pending(child)).toEqual([pending]);
-    expect((await child.thread().messages()).length).toBe(rows);
-    expect(r.weatherRan).toBe(ran);
+    // Spent, the tree leaves the parked child its approved call and no model
+    // step (G-387): the decision is accepted, the call runs, nothing more.
+    await recordApproval(child, pending, true);
+    const resumed = await r.runtime.send(child, '');
+
+    expect(resumed.finishReason).toBe('budget_exhausted');
+    expect(await r.pending(child)).toEqual([]);
+    expect(r.weatherRan).toBe(ran + 1);
     expect(r.requests.length).toBe(requests);
+    const after = (await treeRecord(r.session(1), firstRun))!;
+    expect(after.steps).toBe(after.max_steps);
   });
 
   // A root resumed into a tree its sibling spent while the root waited still
-  // has steps of its own, so its decision is refused before anything is
-  // recorded and its resume is refused by the tree. A refused resume still
-  // begins a run, and the session keeps the trees of its newest runs only:
-  // the run the thread is parked on is never dropped, so retrying the
-  // refused resume never escapes the tree.
-  it('keeps refusing a resume of a tree its sibling spent however often it is retried', async () => {
+  // has steps of its own, but the tree has none (G-387): its decision is
+  // accepted and acted on, it takes no model step, and the tree is never
+  // spent past its allowance. Approving it again is refused: the decision
+  // was acted on, and nothing is pending.
+  it('acts on the decision of a root whose sibling spent its tree, with no model step', async () => {
     const r = new Rig(6);
     const root = r.session(1);
     r.calls([['research', { task: 'Find the weather.' }]]); // root
@@ -492,21 +496,17 @@ describe('a root that resumes its parked run and delegates again', () => {
     expect(record.steps).toBe(record.max_steps);
     const [rootId] = await r.pending(root);
     const ran = r.weatherRan, requests = r.requests.length;
-    const rows = (await root.thread().messages()).length;
 
-    await expect(recordApproval(root, rootId!, true)).rejects.toMatchObject({ code: 'run_not_permitted' });
-    expect((await root.thread().messages()).length).toBe(rows);
-    r.text('Should not run.');
-    let refusals = 0;
-    for (let attempt = 0; attempt < 23; attempt++) {
-      await r.runtime.send(r.session(1), '').then(() => undefined, (error: unknown) => {
-        if ((error as { code?: string }).code === 'run_not_permitted') refusals += 1;
-      });
-    }
+    await recordApproval(root, rootId!, true);
+    const resumed = await r.runtime.send(r.session(1), '');
 
-    expect(refusals).toBe(23);
-    expect(r.weatherRan).toBe(ran);
+    expect(resumed.finishReason).toBe('budget_exhausted');
+    expect(r.weatherRan).toBe(ran + 1);
     expect(r.requests.length).toBe(requests);
+    expect(await r.pending(root)).toEqual([]);
+    await expect(recordApproval(root, rootId!, true)).rejects.toMatchObject({ code: 'approval_not_pending' });
+    const after = (await treeRecord(root, first.runId))!;
+    expect(after.steps).toBe(after.max_steps);
   });
 });
 
@@ -926,57 +926,61 @@ async function stepsLeftOnRow(session: Session): Promise<unknown> {
   return [...rows].reverse().find((row) => row.type === 'assistant' && Array.isArray(row.tool_approval_requests))?.harness_steps_left;
 }
 
-// Review round 5, F-1: what a re-park row says is left is the resume's OWN
-// starting allowance less the steps it took, never what the tree record could
-// grant at that moment. A sibling holding part of the record while the root
-// resumes makes the grant partial; the root's own budget is not spent, so
-// after the next approval it carries on with a model step.
-describe('a root resumed while a sibling holds part of its tree', () => {
-  it('records its own steps left on its next pause, and continues after the decision', async () => {
+// G-387: the row a root parks on records the steps it used, a runner child's
+// included. A sibling holding the rest of the tree while the root resumes
+// leaves the root a tree grant of 0: it acts on its decision, takes no model
+// step and finishes budget_exhausted, and the tree is never spent past its
+// allowance.
+describe('a root resumed while a sibling holds the rest of its tree', () => {
+  it('acts on its decision with no model step', async () => {
     const r = new Rig(6, 3);
     const root = r.session(1);
     r.calls([['research', { task: 'Find the weather.' }]]); // root: step 1
     r.calls([['weather', { city: 'Paris' }]]);              // research child: step 2, parks
     r.calls([['weather', { city: 'Rome' }]]);               // root: step 3, parks
     const first = (await r.runtime.send(root, 'Go')).runId;
+    expect(await stepsUsedOnRow(root)).toBe(3);
+    expect(await stepsLeftOnRow(root)).toBe(3);
     const child = r.session(1, 'chat::sub::research');
     const [childId] = await r.pending(child);
     const [rootId] = await r.pending(root);
     await recordApproval(child, childId!, true);
     await recordApproval(root, rootId!, true);
 
-    // The child resumes and holds part of the tree; inside its model call the
-    // root resumes, is granted what is left, and parks again.
+    // The child resumes and holds the rest of the tree; inside its model call
+    // the root resumes.
+    let resumed: AgentResponse | null = null;
+    const ran = r.weatherRan;
     r.beforeRequest = async () => {
-      await r.runtime.send(r.session(1), '');
+      resumed = await r.runtime.send(r.session(1), '');
     };
-    r.calls([['weather', { city: 'Oslo' }]]);               // root, resumed: parks again
     r.text('Child done.');                                  // the child
     await r.runtime.send(child, '');
-    expect(await stepsLeftOnRow(root)).toBe(2);
-    const [again] = await r.pending(root);
-    expect(again).toBeDefined();
-    const requests = r.requests.length;
 
-    r.text('Would continue.');
-    await recordApproval(root, again!, true);
-    const resumed = await r.runtime.send(root, '');
-
-    expect(r.requests.length).toBe(requests + 1);
-    expect(resumed.text).toBe('Would continue.');
+    expect(resumed!.finishReason).toBe('budget_exhausted');
+    expect(r.weatherRan).toBe(ran + 2);
+    expect(r.queue).toHaveLength(0);
+    expect(await r.pending(root)).toEqual([]);
     const record = (await treeRecord(root, first))!;
     expect(record.steps as number).toBeLessThanOrEqual(record.max_steps as number);
   });
 });
 
-// A row written without harness_steps_left (by a harness before 0.12) says
-// nothing of the root's own budget: its decision takes the tree record's
-// check, and a spent tree refuses it before anything is recorded.
-describe('a legacy parked row with no step field', () => {
-  it('keeps the tree refusal', async () => {
+/** The steps the row `session` is parked on says its run used. */
+async function stepsUsedOnRow(session: Session): Promise<unknown> {
+  const rows = (await session.thread().messages()).map((entry) => entry.message);
+
+  return [...rows].reverse().find((row) => row.type === 'assistant' && Array.isArray(row.tool_approval_requests))?.harness_steps_used;
+}
+
+// A row written without harness_steps_used (by a harness before G-387) is
+// counted from the root's own rows. On a spent tree its decision is accepted
+// and acted on, with no model step.
+describe('a legacy parked row with no step count', () => {
+  it('is acted on with no model step when its tree is spent', async () => {
     const r = new Rig(3);
     const root = r.session(1);
-    const legacy = vi.spyOn(RunTrees, 'ownStepsLeft').mockReturnValue(null);
+    const legacy = vi.spyOn(RunTrees, 'allowanceOf').mockReturnValue(null);
     try {
       r.calls([['research', { task: 'Find the weather.' }]]); // root: step 1
       r.text('Child answer.');                                // child: step 2
@@ -987,12 +991,15 @@ describe('a legacy parked row with no step field', () => {
     } finally {
       legacy.mockRestore();
     }
-    expect(await stepsLeftOnRow(root)).toBeUndefined();
+    expect(await stepsUsedOnRow(root)).toBeUndefined();
     const [id] = await r.pending(root);
-    const rows = (await root.thread().messages()).length;
+    const requests = r.requests.length, ran = r.weatherRan;
 
-    await expect(recordApproval(root, id!, true)).rejects.toMatchObject({ code: 'run_not_permitted' });
-    expect(await r.pending(root)).toEqual([id]);
-    expect((await root.thread().messages()).length).toBe(rows);
+    await recordApproval(root, id!, true);
+    const resumed = await r.runtime.send(root, '');
+
+    expect(resumed.finishReason).toBe('budget_exhausted');
+    expect(r.weatherRan).toBe(ran + 1);
+    expect(r.requests.length).toBe(requests);
   });
 });

@@ -260,13 +260,14 @@ export function pausedApprovalIds(rows: readonly JsonObject[]): string[] {
 }
 
 /**
- * The model steps the run paused at the transcript tail has already taken, or
- * null when nothing at the tail is waiting on an approval.
+ * The model steps the session's own rows show the run paused at the
+ * transcript tail has taken, or null when nothing at the tail is waiting on
+ * an approval: one assistant row per model step since the turn's user row.
  *
- * A run that pauses for a person and is resumed is the SAME run, so its step
- * limit continues rather than starting again. Counted from the stored rows
- * (one assistant row per model step since the turn's user row), so the count
- * survives a reload, a different worker and a deploy, with no extra state.
+ * NOT the run's step count (G-387): a subagent child's steps are on the
+ * child's rows, never here. That count is `harness_steps_used` on the row the
+ * run parked on. This is the floor a resume never counts below, and what a
+ * row written before that field existed is counted by.
  */
 export function approvalRunSteps(rows: readonly JsonObject[]): number | null {
   if (approvalToolScope(rows) === null) return null;
@@ -306,8 +307,13 @@ export function pausedRunState(rows: readonly JsonObject[]): {
   binding: PausedBinding | null;
   tree: { session: string; run: string } | null;
   planLedger: { session: string; plan: string } | null;
-  /** What a root that opened its tree had left of its own step budget when it parked (G-381); null when not recorded. */
-  stepsLeft: number | null;
+  /**
+   * The steps the parked run had used, its subagent children's included
+   * (`harness_steps_used`, G-387): null on a row written before the field
+   * existed, `invalid` when it is present and not a non-negative safe
+   * integer (the resume then fails closed).
+   */
+  stepsUsed: number | null | 'invalid';
 } | null {
   if (approvalToolScope(rows) === null) return null;
   const paused = [...rows].reverse().find((row) => row.type === 'assistant');
@@ -329,7 +335,8 @@ export function pausedRunState(rows: readonly JsonObject[]): {
     binding: storedBinding(paused.harness_binding),
     tree: storedPair(paused.harness_tree, 'session', 'run') as { session: string; run: string } | null,
     planLedger: storedPair(paused.harness_plan_ledger, 'session', 'plan') as { session: string; plan: string } | null,
-    stepsLeft: typeof paused.harness_steps_left === 'number' && Number.isSafeInteger(paused.harness_steps_left) ? paused.harness_steps_left : null,
+    stepsUsed: !Object.hasOwn(paused, 'harness_steps_used') ? null
+      : (typeof paused.harness_steps_used === 'number' && Number.isSafeInteger(paused.harness_steps_used) && paused.harness_steps_used >= 0 ? paused.harness_steps_used : 'invalid'),
   };
 }
 

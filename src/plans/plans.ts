@@ -392,10 +392,10 @@ export class Plans {
 
   /**
    * Refuse, before anything is recorded, a decision on an approval the plan's
-   * held step asked for when the shared budget its resume would spend from is
-   * already spent, or when it is handed a run tree of its own. Recorded, it
-   * would be consumed by a resume the budget then refuses, and the approved
-   * call would never run.
+   * held step asked for when it is handed a run tree of its own
+   * (`plan.budget_context`). A spent shared budget, steps or cost, never
+   * refuses a decision (G-387): acting on an approved call makes no provider
+   * call, so the resume runs it and takes no model step.
    *
    * @internal Called by every path that records decisions.
    */
@@ -408,15 +408,17 @@ export class Plans {
     const target = await this.#routedLedger(session, plan, '', false, stepApproval, context);
     if (target === null) return;
     if (target.refused) throw PlanRefused.because('plan.budget_context');
-    const record = await this.#budgetRecordAt(session.planStore(), target.session, target.plan);
-    const spent = record === null ? null : PlanBudget.exhaustion(PlanBudget.expire(record, this.now(), this.#lockTtl));
-    if (spent !== null) throw budgetSpent(spent);
   }
 
   /**
-   * The run a turn executes under, when the turn is one of the plan's own and
-   * its budget is shared: the per-turn budget, narrowed to what the plan's
-   * ledger holds for it. Any other run is returned unchanged.
+   * The plan's step grant for a turn, when the turn is one of the plan's own
+   * and its budget is shared (G-387): what the plan's ledger holds for it of
+   * the `steps` it asks for (the least of its own and its tree's allowance),
+   * in one locked write, and the run with its cost narrowed to the hold. A
+   * spent budget, steps or cost, grants 0, never a refusal here: a resume
+   * still acts on its decisions and takes no model step; the runtime refuses
+   * a new prompt that is left no step. `planLeft` is null, and the run
+   * unchanged, for any other turn.
    *
    * The plan's own turns are the one advance() runs for the step it claimed
    * and the resume of an approval that step asked for. Any other turn on the
@@ -430,12 +432,13 @@ export class Plans {
    * what it has left. The plan's own turn handed a run tree of its own
    * cannot also spend from the plan's ledger, so it is refused.
    *
-   * @internal Called by the runtime once a run's own budget is known.
+   * @internal Called by the runtime once a run's own and tree allowances are known.
    */
-  async planTurn(session: Session, runId: string, run: RunContext, context: RunContext | undefined, prompt = ''): Promise<RunContext> {
+  async planTurn(session: Session, runId: string, run: RunContext, context: RunContext | undefined, prompt: string, steps: number): Promise<{ run: RunContext; planLeft: number | null }> {
     const target = await this.#ledgerFor(session, prompt, context);
-    if (target === null) return run;
+    if (target === null) return { run, planLeft: null };
     if (target.refused) throw PlanRefused.because('plan.budget_context');
+    if (steps < 1) return { run, planLeft: 0 };
 
     const { ledger, budget } = run;
     const baseSteps = ledger.steps;
@@ -444,17 +447,17 @@ export class Plans {
     const now = this.now();
     const ttl = this.#lockTtl;
     const [, grant] = await this.#budgetWriteAt(session.planStore(), target.session, target.plan, this.budgetSettings(),
-      (state) => PlanBudget.reserve(state, runId, Math.max(0, budget.maxSteps - baseSteps), turnCost, now, ttl));
-    if (grant === null || 'refused' in grant) throw budgetSpent(grant?.limit ?? 'steps');
+      (state) => PlanBudget.reserve(state, runId, steps, turnCost, now, ttl));
+    if (grant === null || 'refused' in grant) return { run, planLeft: 0 };
     const narrowed = run.withBudget(new RunBudget(
-      baseSteps + grant.steps,
+      budget.maxSteps,
       grant.cost_micros === null ? budget.maxCostUsd : baseCost + grant.cost_micros / 1_000_000,
       budget.maxSeconds,
       budget.maxOutputTokensPerCall,
     ));
     this.#budgetTurns.set(runId, { session: session.key(), ledger: target.session, plan: target.plan, context: narrowed, steps: baseSteps, cost: baseCost, unmetered: ledger.unmeteredRuns });
 
-    return narrowed;
+    return { run: narrowed, planLeft: grant.steps };
   }
 
   /**
@@ -931,11 +934,6 @@ function activeAgentStep(plan: Plan | null): PlanStep | null {
   const step = plan.steps[head]!;
 
   return step.owner === 'agent' && ['running', 'held'].includes(step.state) ? step : null;
-}
-
-function budgetSpent(limit: string): HarnessError {
-  return new HarnessError(PLAN_BUDGET_EXHAUSTED,
-    `This plan step may not proceed (plan_budget_exhausted): the plan's shared ${limit} budget is spent.`);
 }
 
 function budgetKey(sessionKey: string): string {

@@ -325,17 +325,43 @@ export class Session {
     return typeof depth === 'number' && Number.isSafeInteger(depth) && depth > 0 ? depth : 0;
   }
 
-  /** @internal Written by the runtime when the subagent runner starts a child run. */
-  async rememberChildBinding(binding: ModelBinding, depth = 0): Promise<this> {
-    return this.#writeDurable((stored) => ({
-      ...stored,
-      child_binding: {
-        session: { ...binding.session },
-        declared: { ...binding.declared },
-        parent_mode: { ...binding.parentMode },
-      },
-      child_depth: Number.isSafeInteger(depth) && depth > 0 ? depth : 0,
-    }));
+  /**
+   * The step ceiling the subagent runner gave this session's child run when
+   * it last started it (G-387): the least of its declared max_steps, what
+   * its parent had left and max_steps_ceiling. Every turn on the child the
+   * runner does not start is held to it. Null for a session the runner never
+   * started, or one started before the ceiling was kept here. A stored value
+   * that is not a non-negative whole number reads as 0: fails closed.
+   *
+   * @internal Read by the runtime.
+   */
+  async childCeiling(): Promise<number | null> {
+    const stored = (await this.#durable.get(this.#durableKey())) ?? {};
+    if (!Object.hasOwn(stored, 'child_ceiling') || stored.child_ceiling === undefined) return null;
+    const ceiling = stored.child_ceiling;
+
+    return typeof ceiling === 'number' && Number.isSafeInteger(ceiling) && ceiling >= 0 ? ceiling : 0;
+  }
+
+  /**
+   * @internal Written by the runtime when the subagent runner starts a child
+   * run, with the step ceiling it started it under (null keeps none).
+   */
+  async rememberChildBinding(binding: ModelBinding, depth = 0, ceiling: number | null = null): Promise<this> {
+    return this.#writeDurable((stored) => {
+      const { child_ceiling: _old, ...rest } = stored;
+
+      return {
+        ...rest,
+        child_binding: {
+          session: { ...binding.session },
+          declared: { ...binding.declared },
+          parent_mode: { ...binding.parentMode },
+        },
+        child_depth: Number.isSafeInteger(depth) && depth > 0 ? depth : 0,
+        ...(ceiling === null ? {} : { child_ceiling: Number.isSafeInteger(ceiling) && ceiling > 0 ? ceiling : 0 }),
+      };
+    });
   }
 
   /** @internal Written by the runtime when the subagent runner starts a child run. */
