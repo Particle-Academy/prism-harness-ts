@@ -69,7 +69,14 @@ export class SubagentRunner {
         const task = typeof args.task === 'string' ? args.task : '';
 
         const turn = activeTurn(parent.key());
-        const result = await this.run(subagent, parent, turn === null ? context : narrowedTo(turn.run, context), turn?.runId ?? parentRunId, task);
+        // The narrowing reads the host's context, so it is framed like the
+        // rest: a host failure here never reaches the model as text.
+        let result: SubagentResult;
+        try {
+          result = await this.run(subagent, parent, turn === null ? context : narrowedTo(turn.run, context), turn?.runId ?? parentRunId, task);
+        } catch (error) {
+          result = refused(subagent.name, `run_${Math.random().toString(16).slice(2, 14)}`, turn?.runId ?? parentRunId, 'failed', `it failed (${failureName(error)})`);
+        }
 
         // The tree refusing to let a child run is a gate, not the child's
         // failure: said here, so a run step reports it as one.

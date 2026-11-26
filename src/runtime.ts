@@ -961,6 +961,13 @@ export class AgentRuntime {
       // A NEW prompt resumes no recorded decisions: with no step to take it
       // is refused before anything is recorded. Only a resume (an empty
       // prompt) left no step acts on its decisions without a model step.
+      // So is one on a parked session under a context that was cancelled or
+      // whose time is spent: it would act on none of the parked turn's
+      // decisions, and its user row would end that turn, so they would never
+      // be acted on. (On a session with nothing parked it stops as before.)
+      if (prompt !== '' && scope !== null && (run.ledger.cancelled || (run.budget.maxSeconds !== null && run.ledger.elapsedSeconds() >= run.budget.maxSeconds))) {
+        throw HarnessError.runNotPermitted('This run may not start: its run context was cancelled or has no time left.');
+      }
       if (prompt !== '' && allowance.acts_without_step) {
         const planIsZero = allowance.plan_left === 0 && allowance.own_left > 0 && allowance.tree_left !== 0;
         throw planIsZero
@@ -984,10 +991,12 @@ export class AgentRuntime {
         // Decisions recorded since the run stopped are acted on FIRST, before a
         // new prompt is recorded, so the results land after the calls they answer
         // rather than after the new turn. Never in a run tree that was
-        // cancelled: an approved call does not run after its tree was stopped
-        // (the loop then stops the run before any model step), and its
-        // approval is left as it is.
-        if (!turn.ledger.cancelled) offered = await this.#resolveApprovals(session, mode, offered, runId, called, scope?.legacy === true, steps, stepping?.locked === true);
+        // cancelled, nor under a context whose time is spent: an approved
+        // call does not run after its tree was stopped or its time ran out
+        // (the loop then stops the run before any model step), and the
+        // decisions are left recorded for a later resume that can act.
+        const outOfTime = turn.budget.maxSeconds !== null && turn.ledger.elapsedSeconds() >= turn.budget.maxSeconds;
+        if (!turn.ledger.cancelled && !outOfTime) offered = await this.#resolveApprovals(session, mode, offered, runId, called, scope?.legacy === true, steps, stepping?.locked === true);
 
         if (prompt !== '') {
           // With attachments, the shape prism-ts's UserMessage.toObject() writes:

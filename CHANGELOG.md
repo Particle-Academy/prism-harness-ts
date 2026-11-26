@@ -35,7 +35,9 @@ Includes every fix released on the 0.11 line in 0.11.1 and 0.11.2.
   is recorded. A session is a child when its address is one the runner
   builds (`::sub::` in its scope), including a child a released version
   parked, or when it has saved run tree references, a saved binding, or a
-  parked row that names a run tree. Any other session runs on its mode's
+  parked row that names a run tree. `::sub::` in a scope is reserved for
+  subagent children: a host scope containing it is treated as a child. Any
+  other session runs on its mode's
   `max_steps`, or on a host context's budget.
 - A step budget that is not a whole, non-negative number is refused:
   `new RunBudget(NaN)`, `Infinity`, `undefined`, `-1` or `1.5`, and
@@ -68,10 +70,14 @@ Includes every fix released on the 0.11 line in 0.11.1 and 0.11.2.
   `decide()`, `streamDecision()`): a subagent child whose binding is missing
   (`child_binding_missing`), a run nested too deep, and a supplied run context
   whose ledger was cancelled or whose time is spent (`run_not_permitted`; a
-  batch of denials only is not refused for spent time, as acting on a denial
+  batch of denials only is not refused for spent time, as recording a denial
   runs nothing, but is for a cancelled context); and
   a plan step handed a run tree of its own (`plan.budget_context`). A resume
-  under a cancelled run context runs none of the approved calls.
+  under a cancelled run context, or one whose time is spent, acts on none of
+  the recorded decisions (that a denial-only batch started, too): they stay
+  recorded for a later resume that can act on them. A new prompt under such a
+  context, on a session parked on approvals, is refused (`run_not_permitted`)
+  before anything is recorded, so it cannot end the parked turn.
 - The subagent runner refuses (`denied`, a framed result, nothing written to
   the child) a task that is not text, or that consists only of the blank
   codepoints U+0009-U+000D, U+0020, U+0085, U+00A0, U+1680, U+2000-U+200D,
