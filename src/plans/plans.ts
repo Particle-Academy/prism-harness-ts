@@ -461,6 +461,43 @@ export class Plans {
   }
 
   /**
+   * What planTurn() would grant a runner start now (G-387 round 7), read
+   * without a write: null when no plan step budget applies, 0 when it has
+   * nothing left for it.
+   *
+   * @throws PlanRefused `plan.budget_context` where planTurn() would
+   */
+  async startGrant(session: Session, runId: string, run: RunContext, context: RunContext | undefined, prompt: string, steps: number): Promise<number | null> {
+    const target = await this.#ledgerFor(session, prompt, context);
+    if (target === null) return null;
+    if (target.refused) throw PlanRefused.because('plan.budget_context');
+    if (steps < 1) return 0;
+    const budget = run.budget;
+    const turnCost = budget.maxCostUsd === null ? null : PlanBudget.micros(Math.max(0, budget.maxCostUsd - run.ledger.costUsd));
+    const stored = await session.planStore().get(budgetKey(target.session));
+    const state = stored !== null && stored.planId === target.plan ? stored as unknown as PlanBudgetState : PlanBudget.open(target.plan, this.budgetSettings());
+    const [, grant] = PlanBudget.reserve(state, runId, steps, turnCost, this.now(), this.#lockTtl);
+
+    return 'refused' in grant ? 0 : grant.steps;
+  }
+
+  /**
+   * Drop the hold planTurn() took for a run that did not go ahead (a runner
+   * start refused while it committed), unspent. Isolated: a failed release
+   * leaves the hold, which is charged in full once it expires.
+   */
+  async release(session: Session, runId: string): Promise<void> {
+    const turn = this.#budgetTurns.get(runId);
+    if (turn === undefined || turn.session !== session.key()) return;
+    this.#budgetTurns.delete(runId);
+    try {
+      await this.#budgetWriteAt(session.planStore(), turn.ledger, turn.plan, this.budgetSettings(), (state) => [PlanBudget.settle(state, runId, 0, 0), null]);
+    } catch (error) {
+      reportQuietly(error);
+    }
+  }
+
+  /**
    * The shared ledger a turn spends from, as PlanBudget.route() decides: its
    * own plan's, when the turn is the plan's own; else, for a turn on a
    * subagent child the runner did not start, the ledger of the plan turn that

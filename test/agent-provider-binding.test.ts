@@ -197,8 +197,9 @@ describe('per-agent spend ceilings on the shared root ledger', () => {
     expect(response.text).toBe('answer 1');
     expect(world.context.ledger.agentCostUsd('planner')).toBe(1);
     expect(world.context.ledger.costUsd).toBeCloseTo(1.05);
-    const failed = world.events.find((event) => event.type === 'run.failed');
-    expect(failed).toMatchObject({ harnessAgent: 'researcher', failure: expect.stringContaining('spend ceiling') });
+    // G-387 round 7: the ceiling is a cost stop of the start's one gate, so
+    // the researcher's run never begins: no run event for it at all.
+    expect(world.events.some((event) => 'harnessAgent' in event && event.harnessAgent === 'researcher')).toBe(false);
   });
 
   it('lets an agent under its ceiling spend, then refuses its next call', async () => {

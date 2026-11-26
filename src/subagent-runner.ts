@@ -1,13 +1,13 @@
 import type { JsonObject } from './json.js';
 import type { PrismHarness } from './harness.js';
-import { activeTurn, decisionsAnswerable, type AgentRuntime } from './runtime.js';
+import { activeTurn, type AgentRuntime } from './runtime.js';
 import type { Session } from './session.js';
 import { MAX_DEPTH, RunBudget, RunContext, type ModelBinding, type Subagent } from './subagents.js';
 import type { HarnessTool } from './tools.js';
 import { HarnessError } from './errors.js';
 import { markRefused } from './refusals.js';
 import { RunTrees } from './run-trees.js';
-import { pendingApprovalIds } from './thread-rows.js';
+import { RunStarts, StartRefused, startRefusalText } from './run-starts.js';
 
 export type SubagentOutcome =
   /** It ran and returned. */
@@ -66,22 +66,18 @@ export class SubagentRunner {
         if (parent.agent !== null && Object.keys(args).some(key => key !== 'task')) {
           throw HarnessError.runNotPermitted('Named subagent input may contain only task. Identity changes require an explicit host-owned delegation binding.');
         }
-        const task = typeof args.task === 'string' ? args.task : '';
+        // As it arrived: the start's one gate decides what a task that is
+        // not text, or is blank, means (G-387 round 7).
+        const task: unknown = args.task;
 
         const turn = activeTurn(parent.key());
-        // The narrowing reads the host's context, so it is framed like the
-        // rest: a host failure here never reaches the model as text.
         let result: SubagentResult;
         try {
-          // The host context this tool was wired with is checked FIRST, before
-          // it is narrowed to the turn (which keeps the turn's ledger): an
-          // operator's cancel, or a host budget with nothing left (an
-          // unenforceable cost cap included), stops a delegation the model
-          // asks for inside a turn too.
-          const stop = context.ledger.exhaustion(context.budget);
-          result = stop !== null
-            ? refused(subagent.name, `run_${Math.random().toString(16).slice(2, 14)}`, turn?.runId ?? parentRunId, context.ledger.cancelled ? 'cancelled' : 'exhausted', stop)
-            : await this.run(subagent, parent, turn === null ? context : narrowedTo(turn.run, context), turn?.runId ?? parentRunId, task);
+          // Inside a turn the child spends from the turn, narrowed by what
+          // the host context this tool was wired with has left (pure). That
+          // host context's cancel, time, steps and cost are facts of the
+          // start's one gate, never a separate refusal here.
+          result = await this.#run(subagent, parent, turn === null ? context : narrowedTo(turn.run, context), turn?.runId ?? parentRunId, task, turn === null ? null : context);
         } catch (error) {
           result = refused(subagent.name, `run_${Math.random().toString(16).slice(2, 14)}`, turn?.runId ?? parentRunId, 'failed', `it failed (${failureName(error)})`);
         }
@@ -102,25 +98,32 @@ export class SubagentRunner {
     parentRunId: string,
     task: string,
   ): Promise<SubagentResult> {
+    return this.#run(subagent, parent, context, parentRunId, task, null);
+  }
+
+  /**
+   * A runner start. Every way it can be refused is ONE gate (RunStarts.gate,
+   * G-387 round 7), asked by the runtime before the start writes anything:
+   * the task (not text, or blank: an empty prompt on the child is how a
+   * parked child is RESUMED), depth, the cancel, time, steps and cost of the
+   * context the child would run under and of the tool's host context, a turn
+   * on the child still running, an approval on it a person can still answer,
+   * the run tree and the plan. A refusal comes back as StartRefused, framed
+   * here with the harness's own words; nothing was written.
+   *
+   * EVERY other way the child can fail to start or to finish, a store or
+   * host failure included, is framed too. The parent's model reads the
+   * result, so it carries the failure's class name and never its message.
+   */
+  async #run(subagent: Subagent, parent: Session, context: RunContext, parentRunId: string, task: unknown, host: RunContext | null): Promise<SubagentResult> {
     const runId = `run_${Math.random().toString(16).slice(2, 14)}`;
 
-    // A delegation with no task is not one: an empty prompt on the child is
-    // how a parked child is RESUMED, so the model could otherwise use it to
-    // act on a person's decisions on the child's behalf. A task arrives from
-    // the model's tool arguments, so it is checked at runtime: anything that
-    // is not text, or is blank by the one codepoint set every port spells
-    // out (isBlankTask), is refused before the child session is built.
-    const given: unknown = task;
-    if (typeof given !== 'string') return refused(subagent.name, runId, parentRunId, 'denied', 'the task is not text');
-    if (isBlankTask(given)) return refused(subagent.name, runId, parentRunId, 'denied', 'the task is empty');
-
-    // EVERY way the child can fail to start or to finish, a store or host
-    // failure included, is framed here. The parent's model reads the result,
-    // so it carries the failure's class name and never its message: a
-    // store's or a host's own words do not reach a model.
     try {
-      return await this.#delegate(subagent, parent, context, parentRunId, given, runId);
+      return await this.#delegate(subagent, parent, context, parentRunId, task, host);
     } catch (error) {
+      if (error instanceof StartRefused) {
+        return refused(subagent.name, runId, parentRunId, error.outcome, startRefusalText(error.refused, MAX_DEPTH));
+      }
       // A child agent stopped by its own spend ceiling is the tree refusing
       // to let it spend, not the child breaking: reported as such, so the
       // parent does not retry it.
@@ -131,72 +134,29 @@ export class SubagentRunner {
     }
   }
 
-  async #delegate(subagent: Subagent, parent: Session, context: RunContext, parentRunId: string, task: string, runId: string): Promise<SubagentResult> {
-    // Checked BEFORE spawning, so an exhausted tree does not pay for a session,
-    // a thread write and a provider call to discover it is exhausted.
-    const stop = context.ledger.exhaustion(context.budget);
-
-    if (stop !== null) {
-      return refused(
-        subagent.name,
-        runId,
-        parentRunId,
-        context.ledger.cancelled ? 'cancelled' : 'exhausted',
-        stop,
-      );
-    }
-
+  async #delegate(subagent: Subagent, parent: Session, context: RunContext, parentRunId: string, task: unknown, host: RunContext | null): Promise<SubagentResult> {
     // The child runs as the agent its declaration names (which the parent mode
     // had to list), else as the parent's.
     const agent = subagent.agent ?? parent.agent;
     const binding = await this.#binding(subagent, parent, agent);
     // Marked as the runner's own, with the run whose turn is calling it (never
     // a run id the caller states): the child joins that run's tree only when
-    // `context` is that turn's own (its ledger), G-381.
+    // `context` is that turn's own (its ledger), G-381. The mode it runs in and
+    // the host context are read by the start's gate; the mode is written on
+    // the child only once the start commits.
     const turn = activeTurn(parent.key());
-    const childContext = RunTrees.startingChild(context.forChild(subagent, parentRunId, binding), turn?.runId ?? null, parent.key());
+    const childContext = RunStarts.starting(
+      RunTrees.startingChild(context.forChild(subagent, parentRunId, binding), turn?.runId ?? null, parent.key()),
+      subagent.mode,
+      host,
+    );
 
-    // Refused BEFORE the child's address is built. Two modes naming each other
-    // as subagents form a cycle budgets would eventually stop — but only after
-    // each level had appended `::sub::<name>` to an address that may truncate
-    // rather than error, and two children truncated to the same string are one
-    // conversation.
-    if (childContext.tooDeep()) {
-      return refused(
-        subagent.name,
-        runId,
-        parentRunId,
-        'denied',
-        `subagent nesting reached the maximum depth of ${MAX_DEPTH}`,
-      );
-    }
-
+    // Built, never written: a refused start reads the child and leaves it as it was.
     const child = this.harness
       .pending(parent.participant, agent, parent.actor)
       .session(subagent.scopeUnder(parent.scope));
 
-    // A child a person can still answer is theirs until they do: a new task
-    // would end the approvals it is waiting on, so the model could dismiss a
-    // person's approval by delegating again. An approval nobody could answer
-    // (its binding is gone, it is too deep) blocks nothing: the parent may
-    // start the child again. Read only, with nothing written to the child.
-    if (pendingApprovalIds((await child.thread().messages()).map((entry) => entry.message)).length > 0
-      && await decisionsAnswerable(child)) {
-      return refused(subagent.name, runId, parentRunId, 'denied', 'it is waiting on a person to answer its approval');
-    }
-    // A turn on the child that is still running holds part of its
-    // delegation's step budget; starting the child again would reset that
-    // count under it.
-    if (await child.childTurnLive(Math.floor(Date.now() / 1000), this.runtime.holdTtl(child))) {
-      return refused(subagent.name, runId, parentRunId, 'denied', 'a turn on it is still running');
-    }
-
-    // The child's authority comes from ITS mode, not the parent's. Its
-    // provider and model come from the binding on its context: the parent's
-    // session override is NOT copied onto the child session (G-321 E).
-    await child.usingMode(subagent.mode);
-
-    const response = await this.runtime.send(child, task, undefined, childContext);
+    const response = await this.runtime.send(child, task as string, undefined, childContext);
 
     return {
       subagent: subagent.name,
@@ -274,27 +234,8 @@ function narrowedTo(turn: RunContext, host: RunContext): RunContext {
     lower(turn.budget.maxOutputTokensPerCall, host.budget.maxOutputTokensPerCall)));
 }
 
-/**
- * The codepoints a blank task consists of, spelled as an explicit set (the
- * G-36 pattern): identical in every port, never a language's own trim(),
- * whose idea of whitespace differs between languages and versions.
- * U+0009-U+000D, U+0020, U+0085, U+00A0, U+1680, U+2000-U+200D, U+2028,
- * U+2029, U+202F, U+205F, U+2060, U+3000, U+FEFF.
- */
-const BLANK_CODEPOINTS: ReadonlySet<number> = new Set([
-  0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x20, 0x85, 0xa0, 0x1680,
-  0x2000, 0x2001, 0x2002, 0x2003, 0x2004, 0x2005, 0x2006, 0x2007, 0x2008, 0x2009, 0x200a, 0x200b, 0x200c, 0x200d,
-  0x2028, 0x2029, 0x202f, 0x205f, 0x2060, 0x3000, 0xfeff,
-]);
-
-/** True when `task` is empty or consists only of BLANK_CODEPOINTS. */
-export function isBlankTask(task: string): boolean {
-  for (const character of task) {
-    if (!BLANK_CODEPOINTS.has(character.codePointAt(0)!)) return false;
-  }
-
-  return true;
-}
+/** True when `task` is empty or only blank codepoints (RunStarts' one set). */
+export { isBlankTask } from './run-starts.js';
 
 /**
  * What a framed failure says of its cause: the error's class name, and for a

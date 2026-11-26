@@ -738,12 +738,14 @@ describe('a host revoke on a child session while the parent delegates', () => {
     await child.usingCapability('grant', { on: true });
 
     // Inside the refs save, right after its read, another worker revokes.
-    const original = Session.prototype.rememberChildRefs;
+    // (G-387 round 7: the refs are saved with the child's other records in
+    // ONE write when a runner start commits, rememberChildStart.)
+    const original = Session.prototype.rememberChildStart;
     const get = r.durable.get.bind(r.durable);
     let armed = false, revoked: Promise<unknown> | null = null;
-    const spyRefs = vi.spyOn(Session.prototype, 'rememberChildRefs').mockImplementation(async function (this: Session, refs) {
+    const spyRefs = vi.spyOn(Session.prototype, 'rememberChildStart').mockImplementation(async function (this: Session, ...args: Parameters<Session['rememberChildStart']>) {
       armed = true;
-      return original.call(this, refs);
+      return original.apply(this, args);
     });
     const spyGet = vi.spyOn(r.durable, 'get').mockImplementation(async (key: string) => {
       const value = await get(key);

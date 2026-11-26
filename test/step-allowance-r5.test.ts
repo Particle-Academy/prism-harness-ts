@@ -249,12 +249,17 @@ async function deadApproval(r: Rig): Promise<void> {
   await child.thread().record([row], 'run_child');
 }
 
+// G-387 round 7: a runner start is decided by ONE gate before it writes, so
+// there is no longer a gap between a pre-check and send for a stop to land
+// in. The stop is applied before the start; the gate refuses it with nothing
+// written. (A stop after the start committed only stops model steps:
+// start-gate.test.ts, "a committed start".)
 describe('a refused runner start writes nothing durable (item 1)', () => {
-  for (const [label, stop] of [
-    ['cancelled', (context: RunContext) => { context.ledger.cancel('stopped by host'); }],
-    ['out of time', (_context: RunContext) => { advanceClock(120); }],
+  for (const [label, outcome, stop] of [
+    ['cancelled', 'cancelled', (context: RunContext) => { context.ledger.cancel('stopped by host'); }],
+    ['out of time', 'exhausted', (_context: RunContext) => { advanceClock(120); }],
   ] as const) {
-    it(`leaves the child's durable record byte-identical when its run is ${label} between the pre-check and send`, async () => {
+    it(`leaves the child's durable record byte-identical when its run is ${label} as it starts`, async () => {
       const r = new Rig({ declared: { a: 2 } });
       await r.session().usingMode('lead');
       await deadApproval(r);
@@ -262,16 +267,12 @@ describe('a refused runner start writes nothing durable (item 1)', () => {
       const key = `${r.child().key()}:durable`;
       const before = JSON.stringify(await r.durable.get(key));
       const context = RunContext.root('root', new RunBudget(8, null, 60));
-      const usingMode = Session.prototype.usingMode;
-      vi.spyOn(Session.prototype, 'usingMode').mockImplementation(async function (this: Session, ...args: Parameters<Session['usingMode']>) {
-        if (this.scope.includes('::sub::')) stop(context);
-        return usingMode.apply(this, args);
-      });
+      stop(context);
 
       const result = await new SubagentRunner(r.harness, r.runtime).run(r.modes.resolve('lead').subagents.a!, r.session(), context, 'root', 'Start over');
       vi.restoreAllMocks();
 
-      expect(result.outcome).toBe('failed');
+      expect(result.outcome).toBe(outcome);
       expect(JSON.stringify(await r.durable.get(key))).toBe(before);
       await expect(recordApproval(r.child(), 'apr_dead', true)).rejects.toMatchObject({ code: 'child_binding_missing' });
       expect(r.requests).toHaveLength(0);

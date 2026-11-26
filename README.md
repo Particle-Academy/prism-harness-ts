@@ -293,12 +293,23 @@ or one whose time is spent, acts on no recorded decision; they stay recorded
 for a later resume. A spent step or cost budget never
 refuses one: the resume runs the approved call and takes no model step. An
 approved subagent call on a run with no step left is acted on, and its result
-is the runner's refusal (the child did not run). The runner also refuses a
-task that is not text or is blank (only the codepoints listed in the
-CHANGELOG, the same set in every port), a delegation into a child that is
-waiting on an answer a person could still give, and one into a child a turn
-is still running on. Any failure while it starts or runs the child comes back
-as a framed `failed` result naming the error's class, never its message. Every other `send()` starts a new run tree with the full
+is the runner's refusal (the child did not run).
+
+A runner start (`SubagentRunner.run()`, and the subagent tool that calls it)
+is decided by one gate, before it writes anything. In this order it refuses:
+a task that is not text or is blank (only the codepoints listed in the
+CHANGELOG, the same set in every port), a child nested too deep, a cancelled
+run, a run out of time, out of steps, or out of cost (the child agent's
+`spend_ceiling` included, and a cost cap that cannot be metered), a child a
+turn is still running on, a child waiting on an answer a person could still
+give, and a run tree or plan budget with nothing left for it. The cancel,
+time, steps and cost of the context the tool was wired with count too. A
+refused start writes nothing: not the child's binding, ceiling, count or
+mode, not a run, not a tree hold. Only once the gate says start does it hold
+its run tree's budget, save the child's records in one write, and begin the
+run; once begun, a later stop only stops its model steps (its task is still
+recorded). Any failure while it starts or runs the child comes back as a
+framed `failed` result naming the error's class, never its message. Every other `send()` starts a new run tree with the full
 ceiling, and so does each `plan.advance()` called without a context. To hold
 the steps of a plan to one ceiling, pass the same `RunContext` to every
 `advance(context)`; that context's budget then bounds the whole plan, its step
