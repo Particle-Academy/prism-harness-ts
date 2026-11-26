@@ -126,6 +126,12 @@ Matching exactly is what lets a PHP app and a TypeScript agent **share one store
 and resolve the same session**. A different digest would give two conversations
 that look identical and never meet.
 
+`::sub::` in a session scope is reserved for subagent children: the runner
+builds a child's scope as `<parent scope>::sub::<name>`. A session the host
+opens with a scope that contains it is treated as a child, so with no saved
+ceiling it fails closed (no model step; a new message is refused). Do not use
+`::sub::` in scopes of your own.
+
 ## Threads
 
 `record()` assigns positions inside the store lock, reading the current length
@@ -282,7 +288,9 @@ turn.
 A decision its resume could not act on is refused before it is written: a
 child whose binding is missing, a run nested too deep, a supplied run context
 that was cancelled, or is out of time (a batch of denials only is accepted
-there: acting on a denial runs nothing). A spent step or cost budget never
+there: recording a denial runs nothing). A resume under a cancelled context,
+or one whose time is spent, acts on no recorded decision; they stay recorded
+for a later resume. A spent step or cost budget never
 refuses one: the resume runs the approved call and takes no model step. An
 approved subagent call on a run with no step left is acted on, and its result
 is the runner's refusal (the child did not run). The runner also refuses a
