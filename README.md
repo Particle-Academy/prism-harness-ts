@@ -238,11 +238,11 @@ below) has left and can never widen it. The first time a root run starts a child
 cost allowance is kept in the durable store, and the root run settles what the
 whole tree spent when it ends. The resumed child holds what the tree has left
 before it calls a provider and settles what it spent when it ends. Once the
-tree's steps are spent, a decision on the child's approval is still accepted:
-acting on it costs no model step, so the resume runs the approved call and
-finishes with `budget_exhausted` without calling a provider. A tree whose COST
-budget is spent refuses the decision (`run_not_permitted`) with nothing
-recorded. A hold whose run never settled is charged in full once the run lock's
+tree is spent (steps or cost), a decision on the child's approval is still
+accepted: acting on it makes no provider call, so the resume runs the approved
+call and finishes with `budget_exhausted` without calling a provider. A new
+message to the child is refused with `run_not_permitted`, recording nothing.
+A hold whose run never settled is charged in full once the run lock's
 TTL has passed. When the child was started by a turn that spent from a shared
 plan budget, the resumed child spends from that plan budget too.
 
@@ -256,7 +256,8 @@ saved with the child; otherwise the mode's `max_steps`. `max_steps_ceiling`
 caps it under every context. The steps used are written on the row a run parks
 on (`harness_steps_used`, its subagent children's steps included) and its
 resume continues from them; a value there that is not a non-negative whole
-number fails closed. A child started under a run
+number fails closed, as does a missing value on a child session that saved
+its ceiling. A child started under a run
 context the host built itself, outside any turn, has no tree record and is
 resumed on its own root budget. Every other `send()` starts a new run tree with the full
 ceiling, and so does each `plan.advance()` called without a context. To hold
@@ -687,9 +688,10 @@ first chosen or first used: after that its mode cannot change
 handed a run tree of its own is refused (`plan.budget_context`) rather than run
 outside the ledger. A turn on a subagent child that a plan's turn started, handed
 a host-built context, is narrowed to what the plan budget has left instead. An invalid mode or limit throws `PlanBudgetInvalid` when
-plans are used, before anything runs. A turn whose ledger has no step left
-takes no model step and acts on its decisions only; one whose ledger's cost is
-spent fails with `plan_budget_exhausted`.
+plans are used, before anything runs. A resume whose ledger has nothing left
+(steps or cost) acts on its decisions and takes no model step; a turn with a
+new prompt, such as the one `advance()` runs, fails with
+`plan_budget_exhausted` before anything is recorded.
 
 The plan's own turns are the turn `advance()` runs for the step it claimed and
 the resume of an approval that step asked for. Any other turn on the session,
@@ -699,8 +701,7 @@ approval the step asked for (`recordApproval()`, `recordDecisions()`,
 `runtime.decide()` or `streamDecision()`) is accepted even when the shared
 budget's steps are spent: the resume runs the approved call and takes no model
 step, so an approval is never accepted and then not acted on. The next
-`advance()` then blocks the plan. A decision is refused with
-`plan_budget_exhausted`, recording nothing, only when the budget's COST is
+`advance()` then blocks the plan. The same holds when the budget's cost is
 spent.
 
 ### Hosts with queues

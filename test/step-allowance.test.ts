@@ -444,3 +444,62 @@ describe('the steps a parked run used, as its row records them', () => {
     expect(r.requests).toHaveLength(0);
   });
 });
+
+describe('a new prompt with no step allowance', () => {
+  // A NEW prompt resumes no recorded decisions, so an allowance of 0 is
+  // refused before anything is recorded (run_not_permitted), as before
+  // G-387. Only a resume with an allowance of 0 acts without a model step.
+  async function refusedQuietly(r: Rig, session: Session): Promise<void> {
+    const rows = (await session.thread().messages()).length;
+    const before = r.requests.length;
+
+    await expect(r.runtime.send(session, 'New question')).rejects.toMatchObject({ code: 'run_not_permitted' });
+
+    expect((await session.thread().messages()).length).toBe(rows);
+    expect(r.requests.length).toBe(before);
+  }
+
+  it('is refused on a child whose saved ceiling is spent', async () => {
+    const r = new Rig({ declared: { a: 2 } });
+    await r.runner('a');
+    const binding = (await r.child().childBinding())!;
+    await r.child().rememberChildBinding(binding, await r.child().childDepth(), 0);
+
+    await refusedQuietly(r, r.child());
+  });
+
+  it('is refused on a child whose run tree a sibling spent', async () => {
+    const r = new Rig({ lead: 5, declared: { a: 4, b: 4 } });
+    r.calls([['a', { task: 'One.' }], ['b', { task: 'Two.' }]]);
+    r.calls([['echo', { n: 'a' }]]);
+    r.calls([['echo', { n: 'b' }]]);
+    r.text('Asked both.');
+    await r.runtime.send(r.session(), 'Go');
+    await r.approveLoop(() => r.child('a'), none, 1);   // a spends the tree's last step
+
+    await refusedQuietly(r, r.child('b'));
+  });
+});
+
+describe('a parked row without a step count', () => {
+  // Written by the same version that saves a child's ceiling: on a session
+  // with a saved ceiling, an absent count is not a legacy row. Fails closed.
+  it('fails closed on a child session that saved a ceiling', async () => {
+    const r = new Rig({ declared: { a: 4 } });
+    const legacy = vi.spyOn(RunTrees, 'allowanceOf').mockReturnValue(null);
+    try {
+      await r.runner('a');
+    } finally {
+      legacy.mockRestore();
+    }
+    expect((await r.parkedRow(r.child())).harness_steps_used).toBeUndefined();
+    const echoes = r.ran.echo ?? 0;
+    await recordApproval(r.child(), (await r.pending(r.child()))[0]!, true);
+
+    const response = await r.runtime.send(r.child(), '');
+
+    expect(r.ran.echo).toBe(echoes + 1);
+    expect(r.requests).toHaveLength(1);
+    expect(response.finishReason).toBe('budget_exhausted');
+  });
+});

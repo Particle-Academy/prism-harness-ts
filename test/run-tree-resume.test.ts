@@ -191,13 +191,11 @@ describe('a turn on a subagent child session outside the runner', () => {
     expect(r.requests.length - before).toBe(1);
   });
 
-  it('takes no model step for a new message to a child session whose run tree is spent', async () => {
+  it('refuses a new message to a child session whose run tree is spent', async () => {
     const { r, child } = await pausedChild(3);
     const before = r.requests.length;
 
-    const response = await r.runtime.send(child, 'New question');
-
-    expect(response.finishReason).toBe('budget_exhausted');
+    await expect(r.runtime.send(child, 'New question')).rejects.toMatchObject({ code: 'run_not_permitted' });
     expect(r.requests.length).toBe(before);
   });
 

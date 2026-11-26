@@ -3,8 +3,10 @@ import {
   AgentRuntime,
   MemorySessionStore,
   ModeRegistry,
+  PlanMachine,
   Plans,
   PrismHarness,
+  RunBudget,
   RunContext,
   ToolRegistry,
   recordApproval,
@@ -84,13 +86,18 @@ class Rig {
     this.queue.push({ text, finishReason: 'stop' });
   }
 
-  /** An active plan of two agent steps; the first step's turn takes `lookups` steps, then parks on weather. */
-  async held(lookups: number): Promise<string> {
+  /** An active plan of two agent steps. */
+  async active(): Promise<void> {
     this.calls([['plan_draft', { goal: 'Plan the trip', steps: [1, 2].map((i) => ({ title: `Step ${i}`, instruction: `Do part ${i}.`, owner: 'agent' })) }]]);
     const draft = (await this.runtime.send(this.session(), 'Plan the trip')).pendingApprovals[0]!;
     this.text('Plan approved.');
     await recordApproval(this.session(), draft.id, true);
     await this.runtime.send(this.session(), '');
+  }
+
+  /** An active plan of two agent steps; the first step's turn takes `lookups` steps, then parks on weather. */
+  async held(lookups: number): Promise<string> {
+    await this.active();
     for (let i = 0; i < lookups; i += 1) this.calls([['lookup', { q: i }]]);
     this.calls([['weather', { city: 'Paris' }]]);
     await (await this.session().plan()).advance();
@@ -151,16 +158,49 @@ describe('the row a plan step parks on', () => {
 });
 
 describe('a decision on a plan step whose shared COST budget is spent', () => {
-  // Accepting decisions on a spent STEP budget must not open the cost
-  // budget: the provider reported no cost, so the cost cap cannot be held
-  // and the decision is refused with nothing recorded, as before.
-  it('is still refused, recording nothing', async () => {
-    const r = new Rig(10, 1);
-    const id = await r.held(0);
-    const rows = (await r.session().thread().messages()).length;
+  // Acting on an approved call makes no provider call, so a spent cost
+  // budget never refuses the decision either: the resume runs the call,
+  // takes no model step and finishes budget_exhausted. (The provider here
+  // reports no cost, so the plan's cost cap cannot be held: spent.)
+  for (const [label, resume] of [
+    ['recordApproval then send', async (r: Rig, id: string) => { await recordApproval(r.session(), id, true); return r.runtime.send(r.session(), '', undefined, RunContext.metadata(null, 'user:ada')); }],
+    ['streamDecision', async (r: Rig, id: string) => drain(r.runtime.streamDecision(r.session(), [{ approvalId: id, approved: true }], RunContext.metadata(null, 'user:ada')))],
+  ] as const) {
+    it(`is accepted and acted on (${label}), with no model step`, async () => {
+      const r = new Rig(10, 1);
+      const id = await r.held(0);
+      const before = r.requests.length;
 
-    await expect(recordApproval(r.session(), id, true)).rejects.toMatchObject({ code: 'plan_budget_exhausted' });
+      const response = await resume(r, id);
+
+      expect(r.weatherRan).toBe(1);
+      expect(r.requests.length).toBe(before);
+      expect(response.finishReason).toBe('budget_exhausted');
+    });
+  }
+});
+
+describe('a fresh plan step whose shared remainder a live sibling holds', () => {
+  // A NEW prompt resumes no decisions, so an allowance of 0 is refused
+  // before anything is recorded: plan_budget_exhausted, as the plan grant is
+  // what is 0.
+  it('is refused with plan_budget_exhausted, recording nothing', async () => {
+    const r = new Rig(3);
+    await r.active();
+    const plans = r.session().planService()!;
+    // A sibling turn serving the same step holds the whole remainder.
+    const plan = (await plans.load(r.session()))!;
+    await plans.write(r.session(), PlanMachine.claim(plan, plan.steps[0]!.id, 'worker', plans.now() + 300, plans.now()), plan.revision);
+    const serving = plans.servingStep(r.session());
+    const sibling = await plans.planTurn(r.session(), 'run_sibling', RunContext.root('run_sibling', new RunBudget(8)), undefined, 'x', 8);
+    serving();
+    expect(sibling.planLeft).toBe(3);
+    const rows = (await r.session().thread().messages()).length;
+    const before = r.requests.length;
+
+    await expect((await r.session().plan()).advance()).rejects.toMatchObject({ code: 'plan_budget_exhausted' });
+
     expect((await r.session().thread().messages()).length).toBe(rows);
-    expect(r.weatherRan).toBe(0);
+    expect(r.requests.length).toBe(before);
   });
 });

@@ -24,20 +24,27 @@ Includes every fix released on the 0.11 line in 0.11.1 and 0.11.2.
   had used, its subagent children's included. Its resume continues from that
   count, never from fewer than the model steps the session's own rows show; a
   row written before the field existed is counted from its rows, and a value
-  that is not a non-negative whole number fails closed (no model step).
+  that is not a non-negative whole number fails closed (no model step), as
+  does a missing value on a child session that saved its ceiling.
   `harness_steps_left` is still written (it now includes plan narrowing), but
   nothing reads it to decide a budget.
 - `max_steps_ceiling` bounds a run's whole count under every context. Before,
   a resume under a host context restarted it from the host's ledger.
-- A spent STEP budget (the run's own, its run tree's or a shared plan's) never
-  refuses a decision and never refuses a resume: acting on recorded decisions
-  costs no model step. The decision is recorded, the resume runs the approved
-  call and finishes with `budget_exhausted` without a model call, on `send()`,
-  `streamDecision()` and `sendStructured()` alike. A subagent call approved on
-  such a run is refused by the runner before its child takes a step. Spent
-  COST budgets, a missing binding and depth are still refused as before. This
-  replaces the `run_not_permitted` / `plan_budget_exhausted` refusals for
-  spent step budgets described below.
+- A spent budget, steps or cost (the run's own, its run tree's or a shared
+  plan's), never refuses a decision and never refuses a resume: acting on an
+  approved call makes no provider call. The decision is recorded, the resume
+  runs the approved call and finishes with `budget_exhausted` without a model
+  call, on `send()`, `streamDecision()` and `sendStructured()` alike. A
+  subagent call approved on such a run is refused by the runner before its
+  child takes a step. A decision is still refused for a missing binding,
+  depth and `plan.budget_context`. This replaces the `run_not_permitted` /
+  `plan_budget_exhausted` decision refusals described below.
+- A turn with a NEW prompt (it resumes no decisions) that is left no model
+  step is refused before anything is recorded, as before:
+  `plan_budget_exhausted` when the shared plan budget is what has nothing left
+  for it (also a fresh `advance()` whose remainder a live turn holds), and
+  `run_not_permitted` otherwise (its own saved ceiling, its run tree or a cost
+  budget spent).
 
 ### Added
 

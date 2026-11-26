@@ -29,7 +29,7 @@ import { schemaName, schemaProblems } from './structured.js';
 import { RunBudget, RunContext, RunLedger, bindingRoute, type ModelBinding } from './subagents.js';
 import { RunTrees, type RunTreeRef } from './run-trees.js';
 import { RunBudgets, type AllowanceFacts } from './run-budgets.js';
-import type { RunContextKind } from './plans/budget.js';
+import { PLAN_BUDGET_EXHAUSTED, type RunContextKind } from './plans/budget.js';
 import type { HarnessTool, ToolAuthorizer, ToolRegistry } from './tools.js';
 import { settleWithRefusalScope } from './refusals.js';
 import { RunStepTagger, StepChannel, type RunStep, type ToolCallOutcome } from './steps.js';
@@ -393,7 +393,9 @@ export class AgentRuntime {
       took: 0,
     };
     if (kind === 'runner' || resumed === null) return facts;
-    if (resumed.stepsUsed === 'invalid') {
+    // A session that saved a child's ceiling was written by a version that
+    // also writes the count: an absent one there is not a legacy row.
+    if (resumed.stepsUsed === 'invalid' || (resumed.stepsUsed === null && facts.savedCeiling !== null)) {
       const ceiling = RunBudgets.allowance(facts).ceiling;
 
       return { ...facts, savedCeiling: ceiling, used: ceiling };
@@ -923,6 +925,15 @@ export class AgentRuntime {
       // lower what it offered, never raise it.
       run = run.withBudget(new RunBudget(startSteps + allowance.allowance, run.budget.maxCostUsd, run.budget.maxSeconds, run.budget.maxOutputTokensPerCall));
       RunTrees.allowed(runId, { ...facts, treeLeft: held.treeLeft, planLeft: planned.planLeft }, startSteps, run);
+      // A NEW prompt resumes no recorded decisions: with no step to take it
+      // is refused before anything is recorded. Only a resume (an empty
+      // prompt) left no step acts on its decisions without a model step.
+      if (prompt !== '' && allowance.acts_without_step) {
+        const planIsZero = allowance.plan_left === 0 && allowance.own_left > 0 && allowance.tree_left !== 0;
+        throw planIsZero
+          ? new HarnessError(PLAN_BUDGET_EXHAUSTED, 'This plan step may not proceed (plan_budget_exhausted): the shared plan budget has nothing left for it.')
+          : HarnessError.runNotPermitted('This run may not start: its step budget has nothing left (its own ceiling, its run tree or a cost budget is spent).');
+      }
       if (scope !== null) {
         if (scope.legacy) console.warn('Pending approval has no valid stored tool scope; offering approved requests only.');
         offered = offered.filter(tool => scope.names.includes(tool.name)
@@ -1580,15 +1591,10 @@ async function writeDecisions(session: Session, decisions: readonly ApprovalDeci
   for (const decision of decisions) {
     if (!pending.delete(decision.approvalId)) throw HarnessError.approvalNotPending(decision.approvalId);
   }
-  // A decision is refused only when its resume could not act on it at all:
-  // a shared plan budget, or the run tree a subagent child was saved with,
-  // whose COST is spent. A spent STEP budget never refuses one (G-387):
-  // acting on recorded decisions costs no model step, and the resume runs
-  // the approved call and takes no further step.
+  // No budget, steps or cost, refuses a decision (G-387): acting on an
+  // approved call makes no provider call, so the resume runs it and takes no
+  // model step. Refused only for a plan step handed a run tree of its own.
   await session.planService()?.assertDecisionsFunded(session, decisions.map((decision) => decision.approvalId), context);
-  const kept = (await session.childRefs()) ?? { tree: pausedRunState(rows)?.tree ?? null, planLedger: null };
-  await RunTrees.assertDecisionsFunded(session, kept, context, session.planRuntime()?.holdTtl(session) ?? RESOLUTION_LOCK_SECONDS,
-    await session.resumedRunTree());
 
   const run = await session.run();
 

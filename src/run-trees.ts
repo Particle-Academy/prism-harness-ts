@@ -208,12 +208,11 @@ export const RunTrees = {
    * open root whose tree already has a record, holds what it may spend of
    * that tree, requested as `ownLeft`, in one locked write. Returns the run,
    * its cost narrowed to the hold, and the tree's step grant: null when no
-   * durable tree bounds the run, 0 when the tree is spent, its record is
-   * gone, or the run has no step of its own left. A spent tree is never a
-   * refusal (G-387): the run still acts on the decisions it resumes and
-   * takes no model step. Any other run is left alone.
-   *
-   * @throws HarnessError `run_not_permitted` when the tree's cost budget is spent
+   * durable tree bounds the run, 0 when the tree's steps or cost are spent,
+   * its record is gone, or the run has no step of its own left. A spent
+   * tree is never a refusal here (G-387): a resume still acts on the
+   * decisions it resumes and takes no model step; the runtime refuses a new
+   * prompt that is left no step. Any other run is left alone.
    */
   async holdTree(session: Session, runId: string, run: RunContext, membership: TreeMembership, ttl: number, ownLeft: number): Promise<{ run: RunContext; treeLeft: number | null }> {
     if (membership.route === 'none' || typeof membership.tree !== 'object') return { run, treeLeft: null };
@@ -247,11 +246,7 @@ export const RunTrees = {
       // The tree's record is gone: closed, never a fresh budget.
       ? [null, { refused: PlanBudget.EXHAUSTED, limit: 'steps' } as PlanBudgetGrant]
       : PlanBudget.reserve(state, runId, ownLeft, turnCost, now, ttl));
-    if ('refused' in grant) {
-      if (grant.limit !== 'steps') throw spent(grant.limit);
-
-      return { run, treeLeft: 0 };
-    }
+    if ('refused' in grant) return { run, treeLeft: 0 };
 
     const narrowed = run.withBudget(new RunBudget(
       budget.maxSteps,
@@ -325,33 +320,6 @@ export const RunTrees = {
     }
 
     return membership.tree;
-  },
-
-  /**
-   * Refuse, before anything is recorded, a decision on a session whose run
-   * tree cannot pay for a resume at all: its COST budget is spent. A spent
-   * STEP budget never refuses a decision (G-387): acting on recorded
-   * decisions costs no model step, so the resume runs the approved call and
-   * takes no further step. The decision turn's membership is decided as the
-   * turn's own would be.
-   *
-   * @throws HarnessError `run_not_permitted`
-   */
-  async assertDecisionsFunded(session: Session, saved: ChildRefs | null, context: RunContext | undefined, ttl: number, resumedTree: RunTreeRef | null = null): Promise<void> {
-    const kind = RunTrees.contextKind(context);
-    const bare = kind === 'none' || kind === 'metadata';
-    const membership = RunTrees.membership(kind, session.key(), 'decision', null, saved?.tree ?? null, 0, 0, bare ? resumedTree : null);
-    const tree = membership.tree;
-    if (typeof tree !== 'object' || membership.route === 'none') return;
-    // A root resuming its parked run is held to its tree's record only when
-    // the parked run delegated and opened one.
-    if (membership.route === 'open' && tree.run === 'decision') return;
-    const state = record(await session.planStore().get(key(tree)), tree);
-    if (state === null || state.max_cost_micros === null) return;
-    const current = PlanBudget.expire(state, Math.floor(Date.now() / 1000), ttl);
-    if (current.unmetered > 0) throw spent('cost_unmetered');
-    const held = Object.values(current.holds).reduce((sum, hold) => sum + hold.cost_micros, 0);
-    if (current.cost_micros + held >= state.max_cost_micros) throw spent('cost');
   },
 
   /** A run is over: its membership is dropped, and a run that holds part of a tree settles what the tree spent under it. */
