@@ -298,13 +298,14 @@ describe('plan budgets (G-366)', () => {
     const session = r.session();
     const plan = (await r.plans.load(session))!;
     await r.plans.write(session, PlanMachine.claim(plan, plan.steps[0]!.id, 'worker', r.plans.now() + 300, r.plans.now()), plan.revision);
-    const turn = (id: string) => r.plans.planTurn(session, id, new RunContext(RunLedger.start(id), new RunBudget(8)), undefined);
+    const turn = (id: string) => r.plans.planTurn(session, id, new RunContext(RunLedger.start(id), new RunBudget(8)), undefined, '', 8);
     // Each as the step's own turn, as advance() runs it.
     const serving = r.plans.servingStep(session);
 
-    expect((await turn('run_a')).budget.maxSteps).toBe(8);
-    expect((await turn('run_b')).budget.maxSteps).toBe(2);
-    await expect(turn('run_c')).rejects.toMatchObject({ code: 'plan_budget_exhausted' });
+    expect((await turn('run_a')).planLeft).toBe(8);
+    expect((await turn('run_b')).planLeft).toBe(2);
+    // Spent: a grant of no step, never a refusal (G-387).
+    expect((await turn('run_c')).planLeft).toBe(0);
     serving();
   });
 
@@ -404,34 +405,35 @@ describe('plan budgets (G-366)', () => {
     expect((await (await r.handle()).budget())!.steps).toBe(0);
   });
 
-  it('refuses an approval a spent shared budget cannot run, records nothing, and blocks the plan once', async () => {
-    const { r, id } = await held(1);
-    const before = r.requests.length;
-    // How many result rows the thread holds: a recorded decision adds one.
-    const results = async () => (await r.session().thread().messages()).filter((entry) => entry.message.type === 'tool_result').length;
-    const recorded = await results();
+  // G-387: acting on a recorded decision costs no model step, so a spent
+  // shared STEP budget never refuses one; the resume runs the approved call
+  // and takes no further step, and the plan then stops once.
+  for (const [label, decide] of [
+    ['recordApproval', (r: Rig, id: string) => recordApproval(r.session(), id, true)],
+    ['decide', (r: Rig, id: string) => r.runtime.decide(r.session(), id, true)],
+    ['recordDecisions', (r: Rig, id: string) => recordDecisions(r.session(), [{ approvalId: id, approved: true }])],
+  ] as const) {
+    it(`accepts a decision (${label}) on a step whose shared budget is spent, runs the call with no model step, and blocks the plan once`, async () => {
+      const { r, id } = await held(1);
+      const before = r.requests.length;
 
-    await expect(recordApproval(r.session(), id, true)).rejects.toMatchObject({ code: 'plan_budget_exhausted' });
-    await expect(r.runtime.decide(r.session(), id, true)).rejects.toMatchObject({ code: 'plan_budget_exhausted' });
-    await expect(recordDecisions(r.session(), [{ approvalId: id, approved: true }])).rejects.toMatchObject({ code: 'plan_budget_exhausted' });
-    expect(await results()).toBe(recorded);
-    expect(r.weatherRan).toBe(0);
-    expect(r.requests.length).toBe(before);
+      await decide(r, id);
+      const resumed = await r.runtime.send(r.session(), '', undefined, actor());
 
-    const outcome = await (await r.handle()).advance();
-    expect(outcome.status).toBe('blocked');
-    expect(outcome.reason).toBe('plan_budget_exhausted');
-    expect(r.events.filter((event) => event.type === 'plan.budget_exhausted')).toHaveLength(1);
-    expect((await (await r.handle()).advance()).status).toBe('not_active');
-    expect(r.events.filter((event) => event.type === 'plan.budget_exhausted')).toHaveLength(1);
+      expect(resumed.finishReason).toBe('budget_exhausted');
+      expect(r.weatherRan).toBe(1);
+      expect(r.requests.length).toBe(before);
+      expect((await (await r.handle()).budget())!.steps).toBe(1);
 
-    // Still refused once the plan is blocked: the call never runs outside the budget.
-    const stream = r.runtime.streamDecision(r.session(), [{ approvalId: id, approved: true }], actor());
-    await expect((async () => { for await (const _ of stream) { /* drain */ } })()).rejects.toMatchObject({ code: 'plan_budget_exhausted' });
-    expect(await results()).toBe(recorded);
-    expect(r.weatherRan).toBe(0);
-    expect(r.requests.length).toBe(before);
-  });
+      const outcome = await (await r.handle()).advance();
+      expect(outcome.status).toBe('blocked');
+      expect(outcome.reason).toBe('plan_budget_exhausted');
+      expect(r.events.filter((event) => event.type === 'plan.budget_exhausted')).toHaveLength(1);
+      expect((await (await r.handle()).advance()).status).toBe('not_active');
+      expect(r.events.filter((event) => event.type === 'plan.budget_exhausted')).toHaveLength(1);
+      expect(r.requests.length).toBe(before);
+    });
+  }
 
   it('closes the run when a shared plan budget cannot be written', async () => {
     const r = new Rig({ config: { budget: { mode: 'shared', max_steps: 10 } } });
@@ -535,16 +537,17 @@ describe('plan budgets (G-366)', () => {
     expect((await (await r.handle()).budget())!.steps).toBe(5);
   });
 
-  it('refuses, recording nothing, an approval for a child whose shared plan budget is spent', async () => {
+  it('acts on an approval for a child whose shared plan budget is spent, with no model step', async () => {
     const { r, child, id } = await pausedChild(4);
     const before = r.requests.length;
-    const results = async () => (await child.thread().messages()).filter((entry) => entry.message.type === 'tool_result').length;
-    const recorded = await results();
 
-    await expect(recordApproval(child, id, true)).rejects.toMatchObject({ code: 'plan_budget_exhausted' });
-    expect(await results()).toBe(recorded);
-    expect(r.weatherRan).toBe(0);
+    await recordApproval(child, id, true);
+    const response = await r.runtime.send(child, '');
+
+    expect(response.finishReason).toBe('budget_exhausted');
+    expect(r.weatherRan).toBe(1);
     expect(r.requests.length).toBe(before);
+    expect((await (await r.handle()).budget())!.steps).toBe(4);
   });
 
   const hostRoot = () => RunContext.root('host_root', new RunBudget(100));
@@ -559,17 +562,15 @@ describe('plan budgets (G-366)', () => {
     expect((await (await r.handle()).budget())!.steps).toBe(5);
   });
 
-  it('refuses, recording nothing, a host-supplied run context on a child whose shared plan budget is spent', async () => {
+  it('acts on a streamed decision under a host-supplied run context on a child whose shared plan budget is spent, with no model step', async () => {
     const { r, child, id } = await pausedChild(4);
     const before = r.requests.length;
-    const results = async () => (await child.thread().messages()).filter((entry) => entry.message.type === 'tool_result').length;
-    const recorded = await results();
 
-    await expect(drained(r.runtime.streamDecision(child, [{ approvalId: id, approved: true }], hostRoot())))
-      .rejects.toMatchObject({ code: 'plan_budget_exhausted' });
-    expect(await results()).toBe(recorded);
-    expect(r.weatherRan).toBe(0);
+    await drained(r.runtime.streamDecision(child, [{ approvalId: id, approved: true }], hostRoot()));
+
+    expect(r.weatherRan).toBe(1);
     expect(r.requests.length).toBe(before);
+    expect((await (await r.handle()).budget())!.steps).toBe(4);
   });
 
   it('charges a new message to a child session to the shared plan budget it was started under', async () => {

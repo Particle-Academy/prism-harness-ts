@@ -19,6 +19,7 @@ import {
   type PendingCall,
 } from '../src/index.js';
 import { RunTrees } from '../src/run-trees.js';
+import { RunBudgets } from '../src/run-budgets.js';
 
 // The cross-language plans corpus (G-360, prism-parity suites/harness-plans).
 // Each case runs its ops through the pure PlanMachine and PlanView, the same
@@ -61,6 +62,7 @@ function runPlansCase(entry: PlansCase): { results: unknown[]; final: unknown; b
       results.push(op.op === 'binding_route' ? plansBindingOp(op, state)
         : op.op === 'binding_context' ? plansBindingContextOp(op, state)
         : op.op === 'tree_membership' || op.op === 'kept_refs' ? plansTreeOp(op)
+        : op.op === 'step_allowance' ? plansAllowanceOp(op)
         : String(op.op).startsWith('budget_') ? plansBudgetOp(op, state, now) : plansOp(op, state, ids, limits, now));
     } catch (error) {
       if (!(error instanceof PlanRefused)) throw error;
@@ -142,6 +144,25 @@ function plansTreeOp(op: Op): unknown {
     const refs = RunTrees.keptRefs(op.membership, op.plan_ledger, op.saved_tree, op.saved_plan_ledger, op.saved_tree_cancelled);
 
     return { refs: { tree: refs.tree, plan_ledger: refs.planLedger } };
+  } catch (error) {
+    if (error instanceof RangeError) return { invalid: true };
+    throw error;
+  }
+}
+
+/**
+ * A run's step allowance (G-387): RunBudgets.allowance, pure, from the
+ * corpus's facts; an invalid context kind or a runner or host context with
+ * nothing stated left is {invalid: true}.
+ */
+function plansAllowanceOp(op: Op): unknown {
+  try {
+    return {
+      allowance: RunBudgets.allowance({
+        kind: op.context, modeSteps: op.mode_steps, savedCeiling: op.saved_ceiling, contextLeft: op.context_left,
+        stepsCeiling: op.steps_ceiling, used: op.used, treeLeft: op.tree_left, planLeft: op.plan_left, took: op.took,
+      }),
+    };
   } catch (error) {
     if (error instanceof RangeError) return { invalid: true };
     throw error;
