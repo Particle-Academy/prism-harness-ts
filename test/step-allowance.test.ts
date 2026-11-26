@@ -379,7 +379,10 @@ describe('a run spent on its last step', () => {
     });
   }
 
-  it('refuses an approved subagent call the spent run would delegate to, before it costs a model step', async () => {
+  // Decided rule: the approval is acted on, and the delegation is refused.
+  // The approved call runs, and its result is the runner's "did not run"
+  // refusal, so its child takes no step.
+  it('acts on an approved subagent call on a spent run: the call runs, and the runner refuses the delegation', async () => {
     const r = new Rig({ lead: 1, declared: { a: 4 }, gated: ['a'] });
     r.calls([['a', { task: 'Work.' }]]);   // parent: parks on the gated subagent
     await r.runtime.send(r.session(), 'Go');
@@ -389,6 +392,10 @@ describe('a run spent on its last step', () => {
 
     expect(r.requests).toHaveLength(1);
     expect(response.finishReason).toBe('budget_exhausted');
+    expect(response.toolCalls).toEqual(['a']);
+    const results = (await r.session().thread().messages()).map((entry) => JSON.stringify(entry.message)).filter((row) => row.includes('subagent did not run'));
+    expect(results).toHaveLength(1);
+    expect(await rowCountOf(r.child())).toBe(0);
   });
 });
 
@@ -503,3 +510,7 @@ describe('a parked row without a step count', () => {
     expect(response.finishReason).toBe('budget_exhausted');
   });
 });
+
+async function rowCountOf(session: Session): Promise<number> {
+  return (await session.thread().messages()).length;
+}

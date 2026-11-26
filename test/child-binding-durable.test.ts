@@ -303,7 +303,7 @@ describe('a child started again under a host-built run tree, and its depth', () 
   it('runs the child on the host tree even when the tree it saved before is spent', async () => {
     const r = new Rig(3);
     r.calls([['research', { task: 'Find the weather.' }]]);
-    r.calls([['weather', { city: 'Paris' }]]);
+    r.text('Child answer.');
     r.text('Parent answer.');
     await r.runtime.send(r.session(), 'Go');
     const child = r.session('chat::sub::research');
