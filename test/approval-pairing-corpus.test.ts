@@ -11,6 +11,7 @@ import {
   type JsonObject,
   type LlmResponse,
 } from '../src/index.js';
+import { ARGUMENTS_AS_SENT, assistantRow, toolResultEntry, toolResultRow } from '../src/thread-rows.js';
 
 /**
  * The cross-language approval-pairing corpus (harness-approval-pairing, G-392).
@@ -22,6 +23,9 @@ import {
  * decides the listed approvals with one recordDecisions() call, then resumes
  * once with an empty prompt; a decision the harness refuses is swallowed.
  * `decided` (0.2.0) is the decision the thread recorded for each approval.
+ * `outcomes` / `later_outcomes` are read BY SEGMENT (round 13b): a step's
+ * results are the tool_result rows after it and before the next assistant
+ * row with tool calls.
  */
 interface PairingCase {
   id: string;
@@ -30,6 +34,19 @@ interface PairingCase {
   rounds: [number, boolean][][];
   /** DECISION B (0.2.0): what supersedes the parked step, after the park and before the rounds. */
   supersede?: 'assistant_tool_step' | 'assistant_text' | 'user' | 'user_owning_run_id' | 'new_message';
+  /**
+   * SEGMENT OWNERSHIP (0.2.0, round 13b): a later step a host records after
+   * the park, each echo call asking its own approval (`apr_later_<k>`, k
+   * counting the step's echo calls), then ONE host-recorded result row right
+   * after it; its `rounds` are decided before the row's, then `resumes`
+   * empty-prompt resumes.
+   */
+  later?: {
+    calls: { id: string; name: string; args: JsonObject }[];
+    result: { id: string; name: string; args: JsonObject; result: string; approved: number[] };
+    rounds: [number, boolean][][];
+    resumes: number;
+  };
   expected: unknown;
 }
 
@@ -82,11 +99,32 @@ async function record(row: PairingCase): Promise<unknown> {
   // A caller passing the parked step's OWN run id: a run id a caller passes is always outside (UPDATE 3).
   if (row.supersede === 'user_owning_run_id') await session.thread().record([{ type: 'user', content: 'A later message.' }], parked.runId);
   if (row.supersede === 'new_message') await runtime.send(session, 'Something else.');
-  // The code each round was refused with, or null (0.2.0, rows with `supersede`).
+  const later = row.later;
+  const laterIds: string[] = [];
+  if (later !== undefined) {
+    const requests = later.calls.flatMap((call) => {
+      if (call.name !== 'echo') return [];
+      const id = `apr_later_${laterIds.length}`;
+      laterIds.push(id);
+      return [{ approval_id: id, tool_call_id: call.id, arguments_format: ARGUMENTS_AS_SENT }];
+    });
+    await session.thread().record([assistantRow('', later.calls.map((call) => ({ id: call.id, name: call.name, arguments: call.args })), {}, requests)]);
+    const result = later.result;
+    await session.thread().record([toolResultRow(
+      [toolResultEntry({ id: result.id, name: result.name, arguments: result.args }, result.result)],
+      result.approved.map((k) => ({ approval_id: laterIds[k]!, approved: true, reason: null })),
+    )]);
+  }
+  // The code each round was refused with, or null (0.2.0, rows with
+  // `supersede` or `later`): the later step's rounds first, then the row's.
   const refusals: (string | null)[] = [];
-  for (const round of row.rounds) {
+  const rounds: [[number, boolean][], string[]][] = [
+    ...(later?.rounds ?? []).map((round): [[number, boolean][], string[]] => [round, laterIds]),
+    ...row.rounds.map((round): [[number, boolean][], string[]] => [round, pending.map((approval) => approval.id)]),
+  ];
+  for (const [round, ids] of rounds) {
     try {
-      await recordDecisions(session, round.map(([index, approved]) => ({ approvalId: pending[index]!.id, approved })));
+      await recordDecisions(session, round.map(([index, approved]) => ({ approvalId: ids[index]!, approved })));
       refusals.push(null);
     } catch (error) {
       // A decision the harness refuses is swallowed; the round still resumes.
@@ -95,6 +133,7 @@ async function record(row: PairingCase): Promise<unknown> {
     }
     await runtime.send(session, '');
   }
+  for (let resume = 0; resume < (later?.resumes ?? 0); resume += 1) await runtime.send(session, '');
 
   // The decision the thread RECORDED for each approval the first step issued,
   // in issue order (0.2.0): the first answer, or null when none was recorded.
@@ -107,26 +146,67 @@ async function record(row: PairingCase): Promise<unknown> {
   }
 
   const outcome: Record<string, unknown> = { approvals: pending.length, free, ran: [...ran].sort((a, b) => a - b), decided: pending.map((approval) => recorded.get(approval.id) ?? null) };
-  if (row.supersede !== undefined) {
-    // The FIRST result each call of the first step ended with, in call
-    // order, or null (rows with `supersede` only).
-    const first = new Map<string, string>();
-    let after = false;
-    for (const { message } of await session.thread().messages()) {
-      if (!after) {
-        after = message.type === 'assistant' && Array.isArray(message.tool_calls) && message.tool_calls.length > 0;
-        continue;
-      }
-      if (message.type !== 'tool_result') continue;
-      for (const entry of (message.tool_results ?? []) as JsonObject[]) {
-        if (!first.has(entry.tool_call_id as string)) first.set(entry.tool_call_id as string, entry.result as string);
-      }
-    }
-    outcome.outcomes = row.calls.map((call) => first.get(call.id) ?? null);
+  if (row.supersede !== undefined || later !== undefined) {
+    // The result each call of a step ended with, in call order: its FIRST
+    // result IN ITS STEP'S SEGMENT (round 13b), or null.
+    const steps = segments((await session.thread().messages()).map((entry) => entry.message));
+    outcome.outcomes = segmentOutcomes(row.calls, steps[0] ?? []);
+    if (later !== undefined) outcome.later_outcomes = segmentOutcomes(later.calls, steps[1] ?? []);
     outcome.refusals = refusals;
   }
 
   return outcome;
+}
+
+/**
+ * The tool_results entries of each step's segment, oldest first: one list
+ * per assistant row with tool calls (the rows after it, before the next
+ * assistant row with tool calls), in thread order.
+ */
+function segments(rows: readonly JsonObject[]): JsonObject[][] {
+  const out: JsonObject[][] = [];
+  for (const row of rows) {
+    if (row.type === 'assistant' && Array.isArray(row.tool_calls) && row.tool_calls.length > 0) out.push([]);
+    else if (out.length > 0 && row.type === 'tool_result') out.at(-1)!.push(...((row.tool_results ?? []) as JsonObject[]));
+  }
+  return out;
+}
+
+type CorpusCall = PairingCase['calls'][number];
+
+/**
+ * The first result each call got in its segment, in call order, or null. An
+ * entry is a call's by exact arguments, then id and tool name, then id: the
+ * first call so matched with no result yet; an entry whose match already has
+ * one is a repeat, and an entry that matches no call counts for nothing.
+ */
+function segmentOutcomes(calls: readonly CorpusCall[], entries: readonly JsonObject[]): (string | null)[] {
+  const first: (string | null)[] = calls.map(() => null);
+  for (const entry of entries) {
+    const args = typeof entry.args === 'object' && entry.args !== null && !Array.isArray(entry.args) ? entry.args : {};
+    const rules: ((call: CorpusCall) => boolean)[] = [
+      (call) => call.id === entry.tool_call_id && call.name === entry.tool_name && sameJson(call.args, args),
+      (call) => call.id === entry.tool_call_id && call.name === entry.tool_name,
+      (call) => call.id === entry.tool_call_id,
+    ];
+    for (const matches of rules) {
+      const matched = calls.flatMap((call, at) => (matches(call) ? [at] : []));
+      if (matched.length === 0) continue;
+      const open = matched.find((at) => first[at] === null);
+      if (open !== undefined) first[open] = String(entry.result);
+      break;
+    }
+  }
+  return first;
+}
+
+/** JSON equality with object keys in any order (as PHP compares arrays with `==`). */
+function sameJson(a: unknown, b: unknown): boolean {
+  const canonical = (value: unknown): unknown => (Array.isArray(value) ? value.map(canonical)
+    : typeof value === 'object' && value !== null
+      ? Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonical((value as Record<string, unknown>)[key])]))
+      : value);
+  return JSON.stringify(canonical(a)) === JSON.stringify(canonical(b));
 }
 
 /** Set to an absolute path to write what this port measures for every row (for the parity recorder). */

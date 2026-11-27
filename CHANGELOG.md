@@ -63,6 +63,15 @@
 - A runner start that fails after its records are written but before its run
   begins (a plan watch for a streamed turn) now ends its own view and is
   undone, as every later failure is.
+- Segment ownership, pinned (G-387 round 13b): a result counts only for the
+  calls of the step whose segment it is in (the rows after that step's
+  assistant row, before the next assistant row with tool calls), matched by
+  exact arguments, then id and tool name, then id. A result whose stored
+  arguments differ from its own call's and happen to equal an earlier
+  same-id call's answers its own step's call, never the earlier one, and an
+  approved call runs once however often the session is resumed. The earlier
+  step's unanswered calls keep their one replaced denial. This line already
+  read results this way; seam tests and the property test's oracle now pin it.
 
 ### Changed: one gate for a runner start (G-387)
 
