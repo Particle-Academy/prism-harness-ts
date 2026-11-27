@@ -519,3 +519,132 @@ describe('added: an approval belongs only to the step that first asked for it', 
     }
   }
 });
+
+// ---------------------------------------------------------------------------
+// Added (Py run19 Info): clearing a thread while a started row has no result.
+// ---------------------------------------------------------------------------
+
+describe('added: Thread.clear() while an approved call runs', () => {
+  it('the cleared thread never reads the call as not run and never runs it again', async () => {
+    const r = new Rig();
+    const [id] = await r.parked();
+    await recordApproval(r.session(), id!, true);
+    r.duringEcho = async () => { await r.session().thread().clear(); };
+    await r.runtime.send(r.session(), '');
+    for (let i = 0; i < 2; i += 1) await r.runtime.send(r.session(), '');
+    const rows = await r.rows();
+    expect(r.echoed).toEqual([1]);
+    expect(rows.flatMap((row) => (row.tool_results ?? []) as JsonObject[]).map((entry) => entry.result)).not.toContain(REPLACED);
+    expect(pendingApprovalIds(rows)).toEqual([]);
+    expect(unresolvedApprovalIds(rows)).toEqual([]);
+    // The result that landed after the clear names a step the thread no longer has: it is nobody's.
+    expect(threadView(rows).filter((row) => row.type === 'tool_result').flatMap((row) => (row.tool_results ?? []) as JsonObject[]).map((entry) => entry.result)).not.toContain(INTERRUPTED());
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Added (PHP 0.26.10 audit): a thread an OLDER version wrote. Rows in the
+// v0.11.2 shapes (its assistantRow, its user row, its decision row, entries
+// with no harness flag; that line wrote no replaced denial at all), stored
+// straight to the store.
+// ---------------------------------------------------------------------------
+
+describe('added: upgrade from a thread v0.11.2 wrote', () => {
+  const step = (id: string, n: number, approval: string): JsonObject => ({
+    type: 'assistant', content: '',
+    tool_calls: [{ id, name: 'echo', arguments: { n }, result_id: null, reasoning_id: null, reasoning_summary: null }],
+    additional_content: {},
+    tool_approval_requests: [{ approval_id: approval, tool_call_id: id, arguments_format: 1 }],
+    harness_tool_names: ['echo', 'free'],
+  });
+  const decided = (approval: string): [JsonObject, null] => [{ type: 'tool_result', tool_results: [], tool_approval_responses: [{ approval_id: approval, approved: true, reason: null }] }, null];
+
+  async function legacy(r: Rig, rows: [JsonObject, string | null][]): Promise<void> {
+    const thread = r.session().thread() as unknown as { store: MemorySessionStore; key: string };
+    await thread.store.put(thread.key, { messages: rows.map(([message, runId], index) => ({ position: index + 1, message, run_id: runId, recorded_at: '2026-11-01T00:00:00.000Z' })) as never });
+  }
+
+  for (const approvedBefore of [true, false]) {
+    it(`a step v0.11.2 replaced with a USER row${approvedBefore ? ', approved before it' : ''}: approved and resumed, nothing runs, ONE outcome, the decision refused`, async () => {
+      const r = new Rig();
+      await legacy(r, [
+        [{ type: 'user', content: 'Go' }, null],
+        [step('c1', 1, 'apr_old'), 'run-x'],
+        ...(approvedBefore ? [decided('apr_old')] : []),
+        [{ type: 'user', content: 'Something else.' }, 'run-y'],
+        [{ type: 'assistant', content: 'Sure.', tool_calls: [], additional_content: {}, tool_approval_requests: [] }, 'run-y'],
+      ]);
+      expect(await recordApproval(r.session(), 'apr_old', true).then(() => 'accepted', code)).toBe('approval_not_pending');
+      for (let i = 0; i < 3; i += 1) await r.runtime.send(r.session(), '');
+      const rows = await r.rows();
+      expect(r.echoed).toEqual([]);
+      expect(echoOutcomes(rows, 1)).toEqual([REPLACED]);
+      expect(approvalDecisions(rows).get('apr_old')).not.toBe(true);
+      expect(await recordApproval(r.session(), 'apr_old', true).then(() => 'accepted', code)).toBe('approval_not_pending');
+    });
+
+    it(`a step v0.11.2 replaced by a LATER step${approvedBefore ? ', approved before it' : ''}: approved and resumed, nothing of it runs, ONE outcome, the decision refused`, async () => {
+      const r = new Rig();
+      await legacy(r, [
+        [{ type: 'user', content: 'Go' }, null],
+        [step('c1', 1, 'apr_old'), 'run-x'],
+        ...(approvedBefore ? [decided('apr_old')] : []),
+        [step('c2', 2, 'apr_new'), 'run-y'],
+      ]);
+      expect(await recordApproval(r.session(), 'apr_old', true).then(() => 'accepted', code)).toBe('approval_not_pending');
+      await recordApproval(r.session(), 'apr_new', false, 'not now');
+      for (let i = 0; i < 3; i += 1) await r.runtime.send(r.session(), '');
+      const rows = await r.rows();
+      expect(r.echoed).toEqual([]);
+      expect(echoOutcomes(rows, 1)).toEqual([REPLACED]);
+      expect(echoOutcomes(rows, 2)).toEqual(['not now']);
+      expect(approvalDecisions(rows).get('apr_old')).not.toBe(true);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Added (PHP 0.26.10 audit): directed decision orders.
+// ---------------------------------------------------------------------------
+
+describe('added: directed decision orders', () => {
+  it('(a) a DENIAL is stored, then a resume is refused session_locked, then an APPROVE arrives: refused, and the call never runs', async () => {
+    const r = new Rig(8, { lock_wait: 0 });
+    const [id] = await r.parked();
+    await recordApproval(r.session(), id!, false, 'no');
+    // Another worker holds the session lock: the resume is refused session_locked.
+    let locked = '';
+    await r.session().lock(async () => { locked = await r.runtime.send(r.session(), '').then(() => 'ran', code); }, 5, 0);
+    expect(locked).toBe('session_locked');
+    expect(await recordApproval(r.session(), id!, true).then(() => 'accepted', code)).toBe('approval_not_pending');
+    for (let i = 0; i < 2; i += 1) await r.runtime.send(r.session(), '');
+    expect(r.echoed).toEqual([]);
+    expect(echoOutcomes(await r.rows(), 1)).toEqual(['no']);
+  });
+
+  it('(d) an APPROVAL is stored, the turn never runs, then a DENY arrives: DENIED (the recommended G-401 option), the call never runs, one outcome', async () => {
+    const r = new Rig();
+    const [id] = await r.parked();
+    await recordApproval(r.session(), id!, true);
+    expect(await recordApproval(r.session(), id!, false, 'changed my mind').then(() => 'accepted', code)).toBe('accepted');
+    // Nothing overrides the denial now.
+    expect(await recordApproval(r.session(), id!, true).then(() => 'accepted', code)).toBe('approval_not_pending');
+    for (let i = 0; i < 2; i += 1) await r.runtime.send(r.session(), '');
+    const rows = await r.rows();
+    expect(r.echoed).toEqual([]);
+    expect(echoOutcomes(rows, 1)).toEqual(['changed my mind']);
+    expect(approvalDecisions(rows).get(id!)).toBe(false);
+  });
+
+  it('(d) once the call has STARTED (its result write then failed), a deny is refused: the approval was acted on', async () => {
+    const r = new Rig();
+    const [id] = await r.parked();
+    await recordApproval(r.session(), id!, true);
+    r.durable.failWhen = (message) => message.type === 'tool_result' && JSON.stringify(message).includes('ran:1');
+    await expect(r.runtime.send(r.session(), '')).rejects.toThrow();
+    expect(await recordApproval(r.session(), id!, false, 'too late').then(() => 'accepted', code)).toBe('approval_not_pending');
+    await r.runtime.send(r.session(), '');
+    expect(r.echoed).toEqual([1]);
+    expect(approvalDecisions(await r.rows()).get(id!)).toBe(true);
+  });
+});
