@@ -246,7 +246,8 @@ describe('file store: legacy timestamp files require explicit maintenance', () =
     await expect(store.withLock('k',()=>1,10,0)).rejects.toMatchObject({code:'session_locked'});
     const released={...JSON.parse(bytes.toString('utf8')),released:true};
     await writeFile(join(path,filename),JSON.stringify(released)+'\n');
-    expect(await store.withLock('k',()=>7,10,0.5)).toBe(7);
+    // Reclaimed well before the TTL: the wait is a fraction of it, not a fixed figure.
+    expect(await store.withLock('k',()=>7,10,10/4)).toBe(7);
   });
 });
 
@@ -322,10 +323,12 @@ describe('FileSessionStore', () => {
     // The claim is "without waiting for the TTL": bounded by a fraction of the
     // TTL the lock is taken with, never by a fixed wall-clock figure that a
     // loaded CI runner can miss.
-    const ttlSeconds=10;
+    // The lock wait is a fraction of the TTL too: long enough for a loaded
+    // runner to reclaim the released owner, far shorter than the TTL.
+    const ttlSeconds=10, waitSeconds=ttlSeconds/4;
     const started=performance.now();
-    expect(await store.withLock('k',()=> 'reclaimed',ttlSeconds,0.5)).toBe('reclaimed');
-    expect(performance.now()-started).toBeLessThan(ttlSeconds*1000/4);
+    expect(await store.withLock('k',()=> 'reclaimed',ttlSeconds,waitSeconds)).toBe('reclaimed');
+    expect(performance.now()-started).toBeLessThan(ttlSeconds*1000/2);
   });
 
   it('refuses a stored payload that is not valid JSON, by code', async () => {

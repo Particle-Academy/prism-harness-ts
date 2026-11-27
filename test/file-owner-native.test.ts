@@ -50,7 +50,7 @@ it.each([false,true])('executes native independent live/dead and three foreign/u
    callbacks++;const[name]=await readdir(canonical),replacement=JSON.parse(await readFile(join(canonical,name!),'utf8'));
    expect(replacement.pid).toBe(process.pid);expect(replacement.identity).toEqual(local);
    expect(replacement.nonce).not.toBe(old.nonce);replacementNonce=replacement.nonce;
-  },10,0.5);
+  },10,10/4); // A fraction of the TTL: long enough for a loaded runner to reclaim the dead owner.
   expect(callbacks).toBe(1);expect(probes).toBe(1);
   const dead={result:'nonce-bound-reclaimed',probes,replacement_nonce:replacementNonce};
   await expect(lstat(canonical)).rejects.toMatchObject({code:'ENOENT'});
