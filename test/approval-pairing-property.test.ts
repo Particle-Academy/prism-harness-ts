@@ -1083,7 +1083,7 @@ async function replaySentAnswersEveryCall(session: Session, c: Case, label: stri
   // The paused step (the last assistant row, no user row after it) is the
   // resume's to answer: the replay gives its open calls nothing (the
   // reference's rule, parity-r16 item 3a).
-  const last = sent.findLastIndex((row) => row.type === 'assistant');
+  const last = sent.map((row) => row.type).lastIndexOf('assistant');
   const paused = last !== -1 && !sent.slice(last + 1).some((row) => row.type === 'user');
   for (const [index, row] of sent.entries()) {
     if (row.type !== 'assistant' || (index === last && paused)) continue;
