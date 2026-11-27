@@ -315,14 +315,38 @@ function normalise(row: JsonObject, view: JsonObject[]): JsonObject | null {
   }
 }
 
-function fold(earlier: ToolResultRow, later: ToolResultRow): ToolResultRow {
-  const results = new Map<string, ToolResultEntry>();
-  const decisions = new Map<string, ApprovalDecisionEntry>();
+/**
+ * Which result an entry is, for folding (G-402): its call id and tool name,
+ * each length-prefixed, and its arguments as canonical JSON. Two calls that
+ * share an id but not their arguments are two results.
+ */
+function resultKey(entry: ToolResultEntry): string {
+  return `${entry.tool_call_id.length}:${entry.tool_call_id}${entry.tool_name.length}:${entry.tool_name}${canonicalJson(entry.args)}`;
+}
 
-  for (const entry of [...earlier.tool_results, ...later.tool_results]) results.set(entry.tool_call_id, entry);
+function fold(earlier: ToolResultRow, later: ToolResultRow): ToolResultRow {
+  // A later result replaces only the same result, occurrence by occurrence:
+  // the k-th with a key in the later row replaces the k-th with that key so
+  // far, in its position; any other is added after.
+  const results = [...earlier.tool_results];
+  const keys = results.map(resultKey);
+  const seen = new Map<string, number>();
+  for (const entry of later.tool_results) {
+    const key = resultKey(entry);
+    const occurrence = seen.get(key) ?? 0;
+    seen.set(key, occurrence + 1);
+    let at = -1;
+    for (let index = 0, found = 0; index < keys.length; index += 1) {
+      if (keys[index] !== key) continue;
+      if (found === occurrence) { at = index; break; }
+      found += 1;
+    }
+    if (at === -1) { results.push(entry); keys.push(key); } else results[at] = entry;
+  }
+  const decisions = new Map<string, ApprovalDecisionEntry>();
   for (const entry of [...earlier.tool_approval_responses, ...later.tool_approval_responses]) decisions.set(entry.approval_id, entry);
 
-  return toolResultRow([...results.values()], [...decisions.values()]);
+  return toolResultRow(results, [...decisions.values()]);
 }
 
 function decision(value: JsonObject): ApprovalDecisionEntry {

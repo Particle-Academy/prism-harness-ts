@@ -907,7 +907,7 @@ export class AgentRuntime {
       }) as JsonObject);
       await live.thread().record([
         ...replaced,
-        ...(work.calls.length === 0 ? [] : [toolResultRow([...work.results.values(), ...resolved], [...work.decisions.values()])]),
+        ...(work.calls.length === 0 ? [] : [toolResultRow([...work.results, ...resolved], [...work.decisions.values()])]),
       ], runId, HARNESS_RECORDING);
       // Only replaced steps were answered: this turn's tools are not narrowed.
       return work.calls.length === 0 ? offered : bounded;
@@ -928,7 +928,8 @@ export class AgentRuntime {
    */
   async #unresolved(session: Session, mode: AgentMode): Promise<{
     calls: AssistantRow['tool_calls'];
-    results: Map<string, ToolResultEntry>;
+    /** Every result recorded after the step, as the replay view holds them (each occurrence). */
+    results: ToolResultEntry[];
     decisions: Map<string, ApprovalDecisionEntry>;
     approvalIds: Map<string, string>;
     /** The step repeats a tool call id: none of its gated calls may run (G-392). */
@@ -957,7 +958,8 @@ export class AgentRuntime {
     // system row) must not hide a result and let its call run again
     // (G-397, G-399). A later entry for an id replaces an earlier one.
     const answered = view.slice(index + 1).filter((row) => row.type === 'tool_result') as ToolResultRow[];
-    const results = new Map(answered.flatMap((row) => row.tool_results).map((entry) => [entry.tool_call_id, entry]));
+    // Each result as the replay view holds it, never folded by call id alone (G-402).
+    const results = answered.flatMap((row) => row.tool_results);
     const decisions = new Map(answered.flatMap((row) => row.tool_approval_responses).map((entry) => [entry.approval_id, entry]));
     const approvalIds = new Map(assistant.tool_approval_requests.map((request) => [request.tool_call_id, request.approval_id]));
 

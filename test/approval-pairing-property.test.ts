@@ -15,7 +15,7 @@ import {
   type RunStep,
   type Session,
 } from '../src/index.js';
-import { ARGUMENTS_AS_SENT, toolResultEntry, toolResultRow } from '../src/thread-rows.js';
+import { ARGUMENTS_AS_SENT, threadView, toolResultEntry, toolResultRow } from '../src/thread-rows.js';
 
 // G-392 QC: property tests for the approval pairing invariants.
 //
@@ -865,6 +865,7 @@ async function runCase(c: Case): Promise<void> {
   }
 
   await settledOutcomes(r, recorded, oracle, '5');
+  await replayKeepsEveryResult(r.session, '6');
 
   // Repeat resumes, with later decisions in between: nothing runs twice and
   // no outcome changes.
@@ -881,6 +882,7 @@ async function runCase(c: Case): Promise<void> {
   check(r.freeRan.length === c.calls.filter((call) => call.tool === 'free').length || c.source === 'stored', '3: an ungated call runs once', r.freeRan);
   if (c.source === 'stored') check(r.freeRan.length === 0, 'a stored ungated call with a result never runs', r.freeRan);
   await settledOutcomes(r, recorded, oracle, '5 (after repeat resumes)');
+  await replayKeepsEveryResult(r.session, '6 (after repeat resumes)');
 }
 
 /** Invariants 5 and 6 on the thread rows: every call has exactly one outcome, the oracle's. */
@@ -893,6 +895,41 @@ async function settledOutcomes(r: Rig, recorded: RecordedStep[], oracle: Expecte
   }
   // An earlier answered step's calls and an inserted ungated call are not the case's.
   check([...seen.keys()].every((key) => oracle.outcome.has(key) || key.startsWith('h') || key.startsWith('x')), `${label}: no outcome for a call that is not in the step`, [...seen.keys()]);
+}
+
+/**
+ * Invariant 6 on the replay the model is shown (G-402): in each step's
+ * segment, every result the thread stores is still there in the replay view,
+ * by its id, tool name and arguments, as often as it occurs in one row. A
+ * later row replaces only the same result (same id, name and arguments,
+ * occurrence by occurrence), never another call's that shares its id.
+ */
+async function replayKeepsEveryResult(session: Session, label: string): Promise<void> {
+  const stored = await rows(session);
+  const isStep = (row: JsonObject): boolean => row.type === 'assistant' && Array.isArray(row.tool_calls) && row.tool_calls.length > 0;
+  const segments = (list: JsonObject[], view: boolean): Map<string, number>[] => {
+    const out: Map<string, number>[] = [];
+    for (const row of list) {
+      if (isStep(row)) { out.push(new Map()); continue; }
+      if (out.length === 0 || row.type !== 'tool_result' || row.harness_replaced_step !== undefined) continue;
+      // Per row as stored, the most often a result occurs in one row; per view row, as shown.
+      const here = new Map<string, number>();
+      for (const entry of (row.tool_results as JsonObject[] | undefined) ?? []) {
+        const key = canonical([entry.tool_call_id, entry.tool_name, entry.args]);
+        here.set(key, (here.get(key) ?? 0) + 1);
+      }
+      const segment = out.at(-1)!;
+      for (const [key, count] of here) segment.set(key, view ? (segment.get(key) ?? 0) + count : Math.max(segment.get(key) ?? 0, count));
+    }
+    return out;
+  };
+  const want = segments(stored, false);
+  const got = segments(threadView(stored), true);
+  want.forEach((segment, at) => {
+    for (const [key, count] of segment) {
+      check((got[at]?.get(key) ?? 0) >= count, `${label}: the replay view keeps every result of a step, by id, name and arguments`, { step: at, key, stored: count, shown: got[at]?.get(key) ?? 0 });
+    }
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1064,6 +1101,9 @@ describe('G-392 property: approval pairing invariants over generated steps', () 
     expect(has((c) => c.later !== null && c.insert?.kind === 'tool_result' && c.insert.segment === 'later' && c.insert.step === 'later'), 'forged, later segment, later call').toBe(true);
     expect(has((c) => c.later !== null && c.insert?.kind === 'tool_result' && c.insert.segment === 'later' && c.insert.step === 'earlier'), 'forged, later segment, earlier call').toBe(true);
     expect(has((c) => c.later !== null && c.insert?.kind === 'tool_result' && c.insert.step === 'later' && decideStep('l', c.later.calls, c.later.requests, []).repeated), 'forged in a later step that repeats ids').toBe(true);
+    // G-402: a step with repeated ids whose results carry different arguments, with a later result row in the same segment.
+    expect(has((c) => c.calls.some((call, i) => c.calls.some((other, j) => j !== i && other.id === call.id && other.token !== call.token
+      && (call.tool === 'free' || c.prior.includes(i))))), 'repeated ids, results with different arguments').toBe(true);
     // G-397, absolute segment ownership: results recorded with arguments that differ from their call's own; identical arguments across calls.
     expect(has((c) => c.lossy.length > 0 && c.requests.some((q) => c.lossy.includes(q.call) && q.verdict === 'approve')), 'lossy result for an approved call').toBe(true);
     expect(has((c) => c.calls.some((call) => call.tool === 'free' && c.calls.some((other) => other.tool === 'echo' && other.token === call.token))), 'identical arguments within a step').toBe(true);
