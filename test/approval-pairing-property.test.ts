@@ -964,7 +964,10 @@ async function runCase(c: Case): Promise<void> {
     // A stream records and resumes at once, so it is used only for the last
     // thing the case does before its resume.
     const last = plan.slice(at + 1).every((next) => (next === 'old' ? oldDecisions : next === 'new' ? newDecisions : [1]).length === 0);
-    if (c.recorder === 'streamDecision' && last && !resumedYet && c.junk === null) {
+    // (A stream resumes at once: a second decision recorded after its batch,
+    // or a host row recorded after the decisions, would come after the
+    // resume, so such a batch is recorded, not streamed.)
+    if (c.recorder === 'streamDecision' && last && !resumedYet && later.length === 0 && c.junk === null) {
       let run: Turn | null = null;
       // A refused stream fails before it records or resumes anything, so it is
       // not the resume a scripted model failure is expected on.
