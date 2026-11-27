@@ -1,5 +1,5 @@
 import type { JsonObject, JsonValue } from '../json.js';
-import { endedByStart, pairStepApprovals, pausedStepIndex, pendingApprovalIds, repeatedIdDenials, ownRequests, stepCalls, stepResultsByPosition, supersededApprovals, isReplacedStepRow } from '../thread-rows.js';
+import { endedByStart, pairStepApprovals, pausedStepIndex, pendingApprovalIds, repeatedIdDenials, ownRequests, prevails, replacedStepApprovals, stepCalls, stepResultsByPosition, supersededApprovals, isReplacedStepRow } from '../thread-rows.js';
 import { argsDigest } from '../tool-policy.js';
 import type { PendingCall } from './machine.js';
 
@@ -56,11 +56,12 @@ export function approvalDecisions(rows: readonly JsonObject[]): Map<string, bool
   // Calls denied because their step repeats a call id (G-392) were never
   // acted on either: never approved work.
   // Superseded by a later step with the call open (DECISION B): never acted on.
-  const ended = new Set([...endedByStart(rows), ...repeatedIdDenials(rows), ...supersededApprovals(rows)]);
+  // So were a 0.11.x replaced-step answer's calls (an older thread, round 15).
+  const ended = new Set([...endedByStart(rows), ...repeatedIdDenials(rows), ...supersededApprovals(rows), ...replacedStepApprovals(rows)]);
   for (const row of rows) {
     if (row.type !== 'tool_result') continue;
     for (const response of list(row.tool_approval_responses)) {
-      if (typeof response.approval_id === 'string' && !decided.has(response.approval_id) && !ended.has(response.approval_id)) {
+      if (typeof response.approval_id === 'string' && prevails(decided.get(response.approval_id), response.approved === true) && !ended.has(response.approval_id)) {
         decided.set(response.approval_id, response.approved === true);
       }
     }
@@ -91,7 +92,7 @@ export function approvedCallsAwaitingResult(rows: readonly JsonObject[], name: s
       if (typeof result.tool_call_id === 'string') finished.add(result.tool_call_id);
     }
     for (const response of list(later.tool_approval_responses)) {
-      if (typeof response.approval_id === 'string' && !decided.has(response.approval_id)) decided.set(response.approval_id, response.approved === true);
+      if (typeof response.approval_id === 'string' && prevails(decided.get(response.approval_id), response.approved === true)) decided.set(response.approval_id, response.approved === true);
     }
   }
 

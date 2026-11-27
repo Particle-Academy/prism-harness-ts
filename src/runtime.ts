@@ -35,6 +35,7 @@ import {
   isToolStep,
   askedBefore,
   ownRequests,
+  revocableApprovalIds,
   stepResultsByPosition as answeredCalls,
   startedRow,
 } from './thread-rows.js';
@@ -2094,11 +2095,19 @@ async function writeDecisions(session: Session, decisions: readonly ApprovalDeci
   return inOwnTurnScope(() => writeDecisionsIn(session, decisions, context));
 }
 
-/** Every decision names a pending approval, each once, or the whole batch is refused `approval_not_pending`. */
+/**
+ * Every decision names a pending approval, each once, or the whole batch is
+ * refused `approval_not_pending`. A DENIAL may also revoke an approval whose
+ * call has not started (G-401's recommended option, revocableApprovalIds);
+ * an approval never overrides a decision.
+ */
 function assertPending(rows: readonly JsonObject[], given: readonly ApprovalDecision[]): void {
   const pending = new Set(pendingApprovalIds(rows));
+  const revocable = new Set(revocableApprovalIds(rows));
   for (const decision of given) {
-    if (!pending.delete(decision.approvalId)) throw HarnessError.approvalNotPending(decision.approvalId);
+    if (pending.delete(decision.approvalId)) continue;
+    if (!decision.approved && revocable.delete(decision.approvalId)) continue;
+    throw HarnessError.approvalNotPending(decision.approvalId);
   }
 }
 

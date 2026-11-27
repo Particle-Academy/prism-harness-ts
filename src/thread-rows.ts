@@ -551,10 +551,12 @@ export function pausedStepIndex(rows: readonly JsonObject[]): number | null {
  * The decisions recorded for the turn being resumed (the paused step,
  * pausedStepIndex()), by approval id, read from the stored rows.
  *
- * An approval has ONE answer: the first one recorded. A second decision for
- * the same id (two reviewers, a retry racing the original, a row written by
- * hand) is never the one that counts, here or in the plan's reading of the
- * thread, so what runs and what the plan records cannot disagree.
+ * An approval has ONE answer: the first one recorded, except that a later
+ * DENIAL revokes an approval whose call has not started (prevails(), G-401).
+ * Any other second decision for the same id (two reviewers, a retry racing
+ * the original, a row written by hand) is never the one that counts, here or
+ * in the plan's reading of the thread, so what runs and what the plan
+ * records cannot disagree.
  */
 export function turnDecisions(rows: readonly JsonObject[]): Map<string, ApprovalDecisionEntry> {
   const decisions = new Map<string, ApprovalDecisionEntry>();
@@ -567,11 +569,38 @@ export function turnDecisions(rows: readonly JsonObject[]): Map<string, Approval
       : row.type === 'tool_approval_response' ? [row] : [];
     for (const answer of answers) {
       const entry = decision(answer);
-      if (!decisions.has(entry.approval_id)) decisions.set(entry.approval_id, entry);
+      if (prevails(decisions.get(entry.approval_id), entry.approved)) decisions.set(entry.approval_id, entry);
     }
   }
 
   return decisions;
+}
+
+/**
+ * Whether a decision recorded after `earlier` is the answer (G-401, the
+ * recommended option until the owner decides): the FIRST answer stands,
+ * except that a later DENIAL revokes an earlier approval of a call that has
+ * not started (the decision path accepts it only then, revocableApprovalIds).
+ * An approval never overrides anything.
+ *
+ * @internal
+ */
+export function prevails(earlier: { approved: boolean } | boolean | undefined, approved: boolean): boolean {
+  if (earlier === undefined) return true;
+  const was = typeof earlier === 'boolean' ? earlier : earlier.approved;
+  return was && !approved;
+}
+
+/**
+ * The approval ids a person APPROVED whose call has not started (no started
+ * row, no result): a denial may still revoke each (G-401's recommended
+ * option). Nothing else may be decided again.
+ *
+ * @internal
+ */
+export function revocableApprovalIds(rows: readonly JsonObject[]): string[] {
+  const decisions = turnDecisions(rows);
+  return unresolvedApprovalIds(rows).filter((id) => decisions.get(id)?.approved === true);
 }
 
 /** Stored approval authority, kept separate from the provider replay view. */
@@ -790,6 +819,28 @@ export function supersededRow(rows: readonly JsonObject[], alsoResults: readonly
  * @internal
  */
 export const REPLACED_STEP_KEY = 'harness_replaced_step';
+
+/**
+ * The approval ids of the calls a 0.11.x-shape replaced-step answer denied
+ * (REPLACED_STEP_KEY): each request of the step it names (the row at index
+ * position - 1 of the whole thread) whose call the row answers. Never acted
+ * on, so never approved work.
+ *
+ * @internal
+ */
+export function replacedStepApprovals(rows: readonly JsonObject[]): Set<string> {
+  const out = new Set<string>();
+  for (const row of rows) {
+    if (!isReplacedStepRow(row)) continue;
+    const step = ((row[REPLACED_STEP_KEY] as JsonObject).position as number) - 1;
+    if (!Number.isSafeInteger(step) || step < 0 || !isToolStep(rows[step])) continue;
+    const answered = new Set(list(row.tool_results).map((entry) => text(entry.tool_call_id)));
+    for (const request of ownRequests(rows, step)) {
+      if (typeof request.approval_id === 'string' && answered.has(text(request.tool_call_id))) out.add(request.approval_id);
+    }
+  }
+  return out;
+}
 
 /** Whether a stored row answers a replaced step (the 0.11.x shape). @internal */
 export function isReplacedStepRow(row: JsonObject): boolean {
