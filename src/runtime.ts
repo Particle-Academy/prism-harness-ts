@@ -1914,7 +1914,10 @@ export class AgentRuntime {
     // and a step only by the one rule (G-408).
     const stored = pausedStepIndex(rows);
     if (stored === null || !isToolStep(rows[stored])) return null;
-    const view = replayView(rows);
+    // As placed, WITHOUT the replay's synthesised answers (an interrupted or
+    // replaced result for a call with none stored): only stored results are
+    // carried into the resolution row.
+    const view = replayView(rows, false);
     // The same row in the replay view (which folds a 0.3.0 request row into it).
     const ordinal = rows.slice(0, stored + 1).filter((row) => row.type === 'assistant').length;
     const index = view.findIndex((row, at) => row.type === 'assistant' && view.slice(0, at + 1).filter((candidate) => candidate.type === 'assistant').length === ordinal);

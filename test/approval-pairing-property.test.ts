@@ -835,20 +835,42 @@ async function runCase(c: Case): Promise<void> {
     ]);
   }
 
-  // The decisions, in a shuffled order.
-  const decisions = c.order.filter((index) => c.requests[index]!.verdict !== 'none').map((index) => ({
+  // The decisions, in a shuffled order. One for a call that already has its
+  // outcome (a stored prior result) is refused on its own (round 16, TS
+  // run19 F2: its approval is not pending), so it is checked alone and kept
+  // out of every batch (a refused batch records none of its decisions).
+  // (A step whose call ids repeat cannot say whose result is whose: every
+  // request stays open until the step is settled, G-392.)
+  const distinctStep = !decideStep(c.calls, c.requests, c.prior).repeated;
+  // So is one whose call a forged result (its own segment's) answered before
+  // the decisions are recorded.
+  const target = c.insert?.when === 'before_decision' || c.insert?.segment === 'earlier' ? forgedTarget(c) : null;
+  // (A repeated-id step whose every call already has a result is settled.)
+  const settled = !distinctStep && c.calls.every((call, index) => call.tool === 'free' || c.prior.includes(index) || (target?.step === 'earlier' && target.index === index));
+  const closedCall = (index: number): boolean => settled || (distinctStep && ((c.source === 'stored' && c.prior.includes(c.requests[index]!.call))
+    || (target?.step === 'earlier' && target.index === c.requests[index]!.call)));
+  const closed = c.order.filter((index) => c.requests[index]!.verdict !== 'none' && closedCall(index)).map((index) => approvalIds[index]!);
+  const decisions = c.order.filter((index) => c.requests[index]!.verdict !== 'none' && !closedCall(index)).map((index) => ({
     approvalId: approvalIds[index]!,
     approved: c.requests[index]!.verdict === 'approve',
     reason: c.requests[index]!.reason,
   }));
+  const laterRepeated = c.later !== null && decideStep(c.later.calls, c.later.requests, []).repeated;
+  const laterSettled = laterRepeated && c.later!.calls.every((call, index) => call.tool === 'free' || (target?.step === 'later' && target.index === index));
+  const laterClosed = (index: number): boolean => laterSettled || (!laterRepeated && target?.step === 'later' && target.index === c.later!.requests[index]!.call);
   // A later step's decisions follow; the replaced step's decisions are still recorded.
   c.later?.requests.forEach((request, index) => {
     const id = `apr_later_${c.seed}_${index}`;
     approvalIds.push(id);
-    if (request.verdict !== 'none') decisions.push({ approvalId: id, approved: request.verdict === 'approve', reason: request.reason });
+    if (request.verdict !== 'none' && laterClosed(index)) closed.push(id);
+    else if (request.verdict !== 'none') decisions.push({ approvalId: id, approved: request.verdict === 'approve', reason: request.reason });
   });
   // G-397: a row the host records between the park and the decision.
   if (c.insert?.when === 'before_decision' && c.insert.segment !== 'earlier') await insertRow(r, c);
+  for (const id of closed) {
+    const accepted = await recordApproval(r.session, id, true).then(() => true, () => false);
+    check(!accepted, 'A: a decision on a call that already has its outcome is refused', { id });
+  }
   // A decision for the parked step after a row that superseded it is refused
   // (approval_not_pending), on every path; a later step's decisions are not.
   const oldIds = new Set(approvalIds.slice(0, c.requests.length));
@@ -971,7 +993,7 @@ async function runCase(c: Case): Promise<void> {
   // Round 16 (TS run19 F2): every call has its outcome now, so no approval
   // is pending, by the reader every decision is checked against.
   check(pendingApprovalIds(await r.session.thread().readerRows()).length === 0, 'A: a pending approval names a call with no outcome', pendingApprovalIds(await r.session.thread().readerRows()));
-  await replaySentAnswersEveryCall(r.session, '7b');
+  await replaySentAnswersEveryCall(r.session, c, '7b');
 
   // Repeat resumes, with later decisions in between: nothing runs twice and
   // no outcome changes, and no result entry is written again (round 15).
@@ -1052,7 +1074,10 @@ async function replayShowsEachResultOnce(session: Session, label: string): Promi
  * or user row, so a provider request is always valid; a call with no stored
  * result reads interrupted.
  */
-async function replaySentAnswersEveryCall(session: Session, label: string): Promise<void> {
+async function replaySentAnswersEveryCall(session: Session, c: Case, label: string): Promise<void> {
+  // A result a host forged that answers NO call is still shown where it
+  // sits (TS run19 I-9, Info): with one, a call may read answered twice.
+  const forged = c.insert?.kind === 'tool_result';
   const readers = await session.thread().readerRows();
   const sent = replayView(readers);
   const last = sent.findLastIndex((row) => row.type === 'assistant');
@@ -1069,7 +1094,7 @@ async function replaySentAnswersEveryCall(session: Session, label: string): Prom
     for (const call of calls) counts.set(String(call.id), (counts.get(String(call.id)) ?? 0) + 1);
     for (const [id, want] of counts) {
       const got = answers.filter((answer) => answer === id).length;
-      check(got === want, `${label}: the sent replay answers every call of a step exactly once`, { step: index, id, got, want });
+      check(forged ? got >= want : got === want, `${label}: the sent replay answers every call of a step exactly once`, { step: index, id, got, want });
     }
   }
 }

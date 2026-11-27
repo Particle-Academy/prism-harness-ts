@@ -264,8 +264,8 @@ export function threadView(rows: readonly JsonObject[]): JsonObject[] {
  *
  * @internal
  */
-export function replayView(rows: readonly JsonObject[]): JsonObject[] {
-  return threadView(placedRows(rows));
+export function replayView(rows: readonly JsonObject[], synthesise = true): JsonObject[] {
+  return threadView(placedRows(rows, synthesise));
 }
 
 /**
@@ -280,10 +280,10 @@ export function replayView(rows: readonly JsonObject[]): JsonObject[] {
  *
  * @internal
  */
-export function placedRows(rows: readonly JsonObject[]): JsonObject[] {
+export function placedRows(rows: readonly JsonObject[], synthesise = true): JsonObject[] {
   const standing = standingDecisions(rows);
   const asked = new Set<string>();
-  return replayOrder(rows).map((row) => {
+  return replayOrder(rows, synthesise).map((row) => {
     if (isToolStep(row) && Array.isArray(row.tool_approval_requests)) {
       const own = row.tool_approval_requests.filter((request) => !isObject(request) || !asked.has(text(request.approval_id)));
       for (const request of stepRequests(row)) asked.add(text(request.approval_id));
@@ -312,7 +312,7 @@ export function placedRows(rows: readonly JsonObject[]): JsonObject[] {
  * ONE result there, INTERRUPTED_RESULT, so a provider sees an answer for
  * every call. Unmarked threads are returned as they are.
  */
-function replayOrder(rows: readonly JsonObject[]): readonly JsonObject[] {
+function replayOrder(rows: readonly JsonObject[], synthesise = true): readonly JsonObject[] {
   const marked = (row: JsonObject): boolean => row.harness === true && row.type === 'tool_result'
     && (Object.hasOwn(row, ANSWERS_STEP_KEY) || Object.hasOwn(row, STARTED_KEY));
   const paused = pausedStepIndex(rows);
@@ -326,16 +326,20 @@ function replayOrder(rows: readonly JsonObject[]): readonly JsonObject[] {
   // call order.
   const synthesised = new Map<number, JsonObject>();
   for (const [index, row] of rows.entries()) {
-    if (!isToolStep(row)) continue;
+    if (!synthesise || !isToolStep(row)) continue;
     const requests = ownRequests(rows, index);
     const answers = stepAnswers(rows, index);
-    if (index === paused && !answers.includes('started')) continue;
-    if (index !== paused && !answers.includes(null) && !answers.includes('started')) continue;
+    if (!answers.includes(null) && !answers.includes('started')) continue;
     const calls = stepCalls(row);
     const requested = pairStepApprovals(calls, requests, (_call, position) => answers[position] === null).approvalIds;
+    // The paused step's calls still waiting on a person are the resume's to
+    // answer; any other call of it with no result (one nobody ran: a host's
+    // step, a write that failed) reads interrupted too.
     const entries = answers.flatMap((answer, position) => {
       const result = answer === 'started' ? INTERRUPTED_RESULT
-        : answer === null && index !== paused ? (requested[position] !== undefined ? SUPERSEDED_RESULT : INTERRUPTED_RESULT) : null;
+        : answer !== null ? null
+          : index !== paused ? (requested[position] !== undefined ? SUPERSEDED_RESULT : INTERRUPTED_RESULT)
+            : requested[position] === undefined ? INTERRUPTED_RESULT : null;
       if (result === null) return [];
       const call = calls[position]!;
       return [{
@@ -1523,7 +1527,9 @@ export function repeatedStepSettled(rows: readonly JsonObject[], index: number):
   const needed = new Map<string, number>();
   for (const id of calls) needed.set(id, (needed.get(id) ?? 0) + 1);
 
-  return calls.length > 0 && [...needed].every(([id, count]) => (counts.get(id) ?? 0) >= count);
+  // Or every call has an outcome by the outcome reader's pairing (round 16:
+  // the same reading as unresolvedApprovalIds() and the replay).
+  return calls.length > 0 && ([...needed].every(([id, count]) => (counts.get(id) ?? 0) >= count) || stepAnswers(rows, index).every((answer) => answer !== null));
 }
 
 /**
