@@ -266,6 +266,9 @@ function normalise(row: JsonObject, view: JsonObject[]): JsonObject | null {
       );
 
     case 'tool_result':
+      // The answer to a replaced step is stored after the step that replaced
+      // it: never shown as that step's results (G-397).
+      if (isReplacedStepRow(row)) return null;
       if (Array.isArray(row.tool_results) || Array.isArray(row.tool_approval_responses)) {
         return toolResultRow(
           list(row.tool_results).map((entry) => ({
@@ -336,17 +339,96 @@ export const REPEATED_CALL_ID_RESULT = 'Tool call was not run because another ca
 
 /**
  * Whether one assistant step repeats a tool call id, among its calls (an
- * empty id is an id like any other) or among its approval requests. A decision
- * reaches a call through the call id its request names, so such a step cannot
- * say which call a decision belongs to (G-392).
+ * empty id is an id like any other) or among its approval requests, or
+ * whose approval requests repeat an APPROVAL id. A decision reaches a call
+ * through the approval id and the call id its request names, so such a step
+ * cannot say which call a decision belongs to (G-392, G-397).
  *
  * @internal
  */
 export function repeatsCallIds(calls: readonly JsonObject[], requests: readonly JsonObject[]): boolean {
   const ids = calls.map((call) => text(call.id));
   const asked = requests.map((request) => text(request.tool_call_id));
+  const approvals = requests.map((request) => text(request.approval_id));
 
-  return new Set(ids).size !== ids.length || new Set(asked).size !== asked.length;
+  return new Set(ids).size !== ids.length || new Set(asked).size !== asked.length || new Set(approvals).size !== approvals.length;
+}
+
+/**
+ * The result each gated call of a parked step gets when a later tool-call
+ * step follows it before the parked step was answered (G-397): not run,
+ * whatever was decided for it.
+ *
+ * @internal
+ */
+export const REPLACED_STEP_RESULT = 'Tool call was not run because a later step replaced it';
+
+/**
+ * The key of the mark on the row that answers a replaced step's calls:
+ * `{position}`, the thread position of the step it answers. The row is
+ * stored after the later step, so it is kept out of the replay view and out
+ * of the later step's results: its entries name the replaced step's calls,
+ * whose ids the later step may reuse.
+ *
+ * @internal
+ */
+export const REPLACED_STEP_KEY = 'harness_replaced_step';
+
+/** Whether a stored row is the answer to a replaced step (G-397). @internal */
+export function isReplacedStepRow(row: JsonObject): boolean {
+  const mark = row[REPLACED_STEP_KEY];
+  return row.type === 'tool_result' && isObject(mark) && typeof mark.position === 'number';
+}
+
+/**
+ * The gated calls of every parked step a later tool-call step replaced that
+ * have no result of their own (G-397), by the replaced step's thread
+ * position. A call's own results are the ones recorded after its step and
+ * before the next tool-call step; a step already answered as replaced is
+ * left alone. A result names its call only by id, so for an id the step
+ * repeats, only as many of its calls are open as results are missing: gated
+ * calls first, the last ones first.
+ *
+ * `gated` says which calls needed approval; a call with a request counts too.
+ *
+ * @internal
+ */
+export function replacedStepCalls(
+  messages: readonly { position: number; message: JsonObject }[],
+  gated: (name: string) => boolean,
+): { position: number; calls: JsonObject[] }[] {
+  const steps: number[] = [];
+  for (const [index, { message }] of messages.entries()) {
+    if (message.type === 'assistant' && list(message.tool_calls).length > 0) steps.push(index);
+  }
+  const answered = new Set(messages.filter(({ message }) => isReplacedStepRow(message))
+    .map(({ message }) => (message[REPLACED_STEP_KEY] as JsonObject).position as number));
+  const replaced: { position: number; calls: JsonObject[] }[] = [];
+  for (let at = 0; at < steps.length - 1; at += 1) {
+    const { position, message: step } = messages[steps[at]!]!;
+    if (answered.has(position)) continue;
+    const own = messages.slice(steps[at]! + 1, steps[at + 1]!)
+      .filter(({ message }) => message.type === 'tool_result' && !isReplacedStepRow(message))
+      .flatMap(({ message }) => list(message.tool_results));
+    const requested = new Set(list(step.tool_approval_requests).map((request) => text(request.tool_call_id)));
+    const calls = list(step.tool_calls);
+    const open = new Set<number>();
+    for (const id of new Set(calls.map((call) => text(call.id)))) {
+      const positions = calls.flatMap((call, index) => (text(call.id) === id ? [index] : []));
+      let missing = positions.length - own.filter((entry) => text(entry.tool_call_id) === id).length;
+      // Gated calls first, so an ungated call that shares the id (and ran
+      // when the step was taken) is never taken for the gated one.
+      for (const pass of [(name: string) => gated(name), () => requested.has(id)]) {
+        for (const index of [...positions].reverse()) {
+          if (missing <= 0) break;
+          if (!open.has(index) && pass(text(calls[index]!.name))) { open.add(index); missing -= 1; }
+        }
+      }
+    }
+    if (open.size > 0) replaced.push({ position, calls: calls.filter((_call, index) => open.has(index)) });
+  }
+
+  return replaced;
 }
 
 function list(value: JsonValue | undefined): JsonObject[] {
