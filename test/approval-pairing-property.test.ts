@@ -326,7 +326,7 @@ function copiedContent(copy: ProviderCopy | null): JsonObject {
   switch (copy) {
     case null: return {};
     case 'openai': return { output_items: [{ type: 'reasoning', id: 'rs_copied', summary: [] }, { type: 'function_call', id: 'copied', call_id: 'c_copied', name: 'echo', arguments: '{"n":1}' }, { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Copied.' }] }] };
-    case 'anthropic': return { content_blocks: [{ type: 'text', text: 'Copied.' }, { type: 'tool_use', id: 'copied', name: 'echo', input: { n: 1 } }] };
+    case 'anthropic': return { content_blocks: [{ type: 'thinking', thinking: 'copied', signature: 'sig' }, { type: 'text', text: 'Copied.' }, { type: 'tool_use', id: 'copied', name: 'echo', input: { n: 1 } }], thinking: 'copied', thinking_signature: 'sig' };
     case 'fallback': return { content_blocks: [{ type: 'fallback' }, { type: 'tool_use', id: 'copied', name: 'echo', input: { n: 1 } }, { type: 'text', text: 'Copied.' }] };
   }
 }
@@ -1148,6 +1148,10 @@ function providerContentIsOwn(row: JsonObject): boolean {
   const pairs = (items: JsonObject[]): string => items.map((item) => `${String(item.id)}/${String(item.name)}`).sort().join(',');
   const own = pairs(Array.isArray(row.tool_calls) ? (row.tool_calls as JsonObject[]).filter((call) => typeof call === 'object' && call !== null) : []);
   const content = typeof row.content === 'string' ? row.content : '';
+  // Reasoning cannot be checked: a row carrying any is never sent with it (no harness row here has any).
+  if (['thinking', 'thinking_signature', 'thinking_blocks'].some((key) => extra[key] !== undefined && extra[key] !== null)
+    || (Array.isArray(extra.output_items) && (extra.output_items as JsonObject[]).some((item) => item.type === 'reasoning'))
+    || (Array.isArray(extra.content_blocks) && (extra.content_blocks as JsonObject[]).some((block) => block.type === 'thinking' || block.type === 'redacted_thinking'))) return false;
   if (Array.isArray(extra.output_items)) {
     const items = extra.output_items as JsonObject[];
     const last = items.at(-1)?.content;
