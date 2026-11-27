@@ -1,9 +1,11 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   AgentRuntime,
   HarnessEvents,
   MemorySessionStore,
   ModeRegistry,
+  Plans,
   PrismHarness,
   RunBudget,
   RunContext,
@@ -12,21 +14,26 @@ import {
   ToolRegistry,
   recordApproval,
   type Durability,
+  type HarnessEvent,
   type JsonObject,
   type LlmRequest,
   type LlmResponse,
   type ModeConfig,
 } from '../src/index.js';
+import { pausedApprovalIds } from '../src/thread-rows.js';
 
 /*
- * G-387 round 11, item 7: THE INVARIANT MATRIX.
+ * G-387 round 11 item 7, extended in round 12 (items 3 and 8): THE INVARIANT
+ * MATRIX.
  *
  * Every reader of a child's state, through every phase of a runner start,
  * from INSIDE the start's own run (the Session object the start runs on, and
  * the read-only view a tool provider is handed) and from OUTSIDE it (a fresh
  * Session object on the same child, as a host turn, a resume or a person's
- * decision builds one). The expected table is written FIRST, as data, from
- * the rules of BRIEF-R7..R11; the test then measures every cell.
+ * decision builds one), plus, in round 12, the start's OWN object used from
+ * outside its run (a deferred registered in the test's own async context).
+ * The expected table is written FIRST, as data, from the rules of
+ * BRIEF-R7..R12; the test then measures every cell.
  *
  * Every future fix must keep this table green. A cell may only change with
  * the rule that decides it.
@@ -34,50 +41,138 @@ import {
  * Tokens:
  *   PRIOR  the value the child had before this start (its last confirmed state)
  *   NEW    the value this start committed
- *   ABSENT no value (binding null, depth 0, ceiling null): fail closed
+ *   ABSENT no value (binding null, depth 0, ceiling null, no tree): fail closed
  *   BOUND  a binding is present (the start reuses the declaration, so the
  *          binding's VALUE is the same before and after; presence is the fact)
- *   approval cells hold the code recordApproval answers for the approval the
- *   child was parked on before the start (one nobody can answer: too deep).
+ *   yes/no a yes-or-no reader
+ *   START  plan_run names the start's own run; PRIOR: the parked run (a run
+ *          parked on approvals stays `running`: send() returns
+ *          awaiting_approval without closing it); NONE: no run in flight
+ *   action cells hold what the action answered: a harness error code,
+ *   `accepted`, or a runner outcome (`denied`: refused, and nothing written,
+ *   no model request). An empty action cell is not measured in that phase
+ *   (the action would succeed and change what the later phases measure).
+ *
+ * Readers (round 12 added provisional .. policy):
+ *   mode, binding, refs (its tree), depth, ceiling, run (the current run),
+ *   offer (effectiveTools with a host provider that adds `danger` whenever
+ *   mode() is not `work`), provisional (childStartUnconfirmed), plans
+ *   (Plans.enabledFor), plan_run (Plans.runId), paused (the thread tail is
+ *   parked on approvals: the paused row), busy (childTurnLive, the gate's
+ *   child_busy fact), resumed_tree (resumedRunTree), policy (the tool policy
+ *   of the mode the session reads: its requires_approval list).
+ * Actions:
+ *   approval (recordApproval on a fresh Session), resume (send '' on a fresh
+ *   Session), second_start (a second runner start onto the same child),
+ *   decision_same (recordApproval on the start's OWN Session), own_resume /
+ *   own_new (send '' / a new message on the start's own Session).
+ *
+ * Not columns in TS, and why: isLinkedChild has no reader of its own here
+ * (the runtime folds scope, binding, refs and the paused row, each a column);
+ * the delegation id is the count record, whose live hold is `busy`; cancel
+ * reads no child state (RunContext's ledger).
  */
 
-type Phase = 'before_gate' | 'after_b' | 'own_run' | 'after_task' | 'failed_undone' | 'failed_undo_failed';
-type Reader = 'mode' | 'binding' | 'refs' | 'depth' | 'ceiling' | 'run' | 'offer';
+type Phase =
+  | 'before_gate' | 'after_b' | 'run_started' | 'own_run' | 'tool_denied' | 'after_task'
+  | 'failed_undone' | 'failed_undone_during' | 'failed_undo_failed' | 'failed_undo_failed_during';
+type Reader = 'mode' | 'binding' | 'refs' | 'depth' | 'ceiling' | 'run' | 'offer'
+  | 'provisional' | 'plans' | 'plan_run' | 'paused' | 'busy' | 'resumed_tree' | 'policy';
 type Cells = Record<Reader, string>;
+type InsideAction = 'decision_same' | 'own_resume' | 'own_new';
+type OutsideAction = 'approval' | 'resume' | 'second_start';
+interface Side { inside: Cells & Partial<Record<InsideAction, string>>; outside: Cells & Partial<Record<OutsideAction, string>>; own_outside?: Cells & Partial<Record<'decision_same' | 'own_resume', string>> }
 
-const ALL = (token: string, binding = 'BOUND'): Cells => ({ mode: token, binding, refs: token, depth: token, ceiling: token, run: token, offer: token });
-/** A start's records before its task row, read by anyone but the start itself (round 9 + round 10 items 1 and 3). */
-const PROVISIONAL: Cells = { mode: 'PRIOR', binding: 'ABSENT', refs: 'PRIOR', depth: 'ABSENT', ceiling: 'ABSENT', run: 'PRIOR', offer: 'PRIOR' };
 const TOO_DEEP = 'run_not_permitted';
 const NO_BINDING = 'child_binding_missing';
 const ENDED = 'approval_not_pending';
+const DENIED = 'denied';
 
-export const EXPECTED: Record<Phase, { inside: Cells; outside: Cells & { approval: string } }> = {
+/** Before the start, or after a start that was undone: the child as it was. */
+const AS_BEFORE: Cells = {
+  mode: 'PRIOR', binding: 'BOUND', refs: 'PRIOR', depth: 'PRIOR', ceiling: 'PRIOR', run: 'PRIOR', offer: 'PRIOR',
+  provisional: 'no', plans: 'no', plan_run: 'PRIOR', paused: 'yes', busy: 'no', resumed_tree: 'PRIOR', policy: 'PRIOR',
+};
+/**
+ * A start's records before its task row, read by anyone but the start itself
+ * (round 9 + round 10 items 1 and 3): absent, keeping the last confirmed tree
+ * and mode. The start's count hold is a live turn whatever its records say,
+ * so `busy` reads yes (a second start is denied, fail closed).
+ */
+const PROVISIONAL: Cells = {
+  mode: 'PRIOR', binding: 'ABSENT', refs: 'PRIOR', depth: 'ABSENT', ceiling: 'ABSENT', run: 'PRIOR', offer: 'PRIOR',
+  provisional: 'yes', plans: 'no', plan_run: 'PRIOR', paused: 'yes', busy: 'yes', resumed_tree: 'PRIOR', policy: 'PRIOR',
+};
+/** The start's own view of what it committed (round 11 item 5), its run begun; the thread still parked. */
+const OWN_VIEW: Cells = {
+  mode: 'NEW', binding: 'BOUND', refs: 'NEW', depth: 'NEW', ceiling: 'NEW', run: 'NEW', offer: 'NEW',
+  provisional: 'no', plans: 'yes', plan_run: 'START', paused: 'yes', busy: 'yes', resumed_tree: 'PRIOR', policy: 'NEW',
+};
+/** After the task row, for everyone: confirmed, the parked call ended, the start's turn still running. */
+const CONFIRMED: Cells = { ...OWN_VIEW, paused: 'no', resumed_tree: 'ABSENT' };
+/** Actions on the start's own object before its task row: each has a scope of its own, so the provisional rule. */
+const OWN_REFUSED = { decision_same: NO_BINDING, own_resume: NO_BINDING, own_new: NO_BINDING };
+
+export const EXPECTED: Record<Phase, Side> = {
   // Nothing written yet: everyone reads the child as it was.
-  before_gate: { inside: ALL('PRIOR'), outside: { ...ALL('PRIOR'), approval: TOO_DEEP } },
+  before_gate: { inside: AS_BEFORE, outside: { ...AS_BEFORE, approval: TOO_DEEP } },
   // Commit (b) wrote the records provisionally. The start's own Session reads
   // what it committed (round 11 item 5); its run has not begun, so the
-  // current run is still the one before it. Everyone else: provisional.
-  after_b: { inside: { ...ALL('NEW'), run: 'PRIOR' }, outside: { ...PROVISIONAL, approval: NO_BINDING } },
-  // Inside the start's own run, before its task row (tool resolution, the
-  // plan context): its own state, its own run. Outside: still provisional.
-  own_run: { inside: ALL('NEW'), outside: { ...PROVISIONAL, approval: NO_BINDING } },
-  // The task row confirms the start for every reader; it ended the parked call.
-  after_task: { inside: ALL('NEW'), outside: { ...ALL('NEW'), approval: ENDED } },
+  // current run is still the one before it. Everyone else, and the start's
+  // own object used from outside its run: provisional.
+  after_b: {
+    inside: { ...OWN_VIEW, run: 'PRIOR', plan_run: 'PRIOR', ...OWN_REFUSED },
+    outside: { ...PROVISIONAL, approval: NO_BINDING, resume: NO_BINDING, second_start: DENIED },
+    own_outside: { ...PROVISIONAL, decision_same: NO_BINDING, own_resume: NO_BINDING },
+  },
+  // Inside a run.started listener (round 12, Py phase run_started): the run
+  // has begun, the task row is not written.
+  run_started: {
+    inside: { ...OWN_VIEW, ...OWN_REFUSED },
+    outside: { ...PROVISIONAL, approval: NO_BINDING, resume: NO_BINDING, second_start: DENIED },
+  },
+  // Inside the start's own run, before its task row (tool resolution): its
+  // own state, its own run. Outside, and its own object outside its scope:
+  // still provisional.
+  own_run: {
+    inside: { ...OWN_VIEW, ...OWN_REFUSED },
+    outside: { ...PROVISIONAL, approval: NO_BINDING, resume: NO_BINDING, second_start: DENIED },
+    own_outside: { ...PROVISIONAL, decision_same: NO_BINDING, own_resume: NO_BINDING },
+  },
+  // Inside a tool_denied listener for the call the task row ended (PHP
+  // ToolDenied(A0)): announced only once the row is recorded, so confirmed.
+  tool_denied: {
+    inside: { ...CONFIRMED, decision_same: ENDED },
+    outside: { ...CONFIRMED, approval: ENDED },
+  },
+  // The task row confirms the start for every reader; it ended the parked
+  // call. Its turn still holds the count: a second start is denied.
+  after_task: {
+    inside: { ...CONFIRMED, decision_same: ENDED },
+    outside: { ...CONFIRMED, approval: ENDED, second_start: DENIED },
+  },
   // A failed start whose undo ran: every record is back, for every reader
-  // (the start's own Session included: its view ends with its run).
-  failed_undone: { inside: ALL('PRIOR'), outside: { ...ALL('PRIOR'), approval: TOO_DEEP } },
+  // (the start's own Session included: its view ends first on the failure
+  // path), measured after the run and DURING the failure (a run.failed
+  // listener), when every hold is already released (round 12 item 4).
+  failed_undone: { inside: AS_BEFORE, outside: { ...AS_BEFORE, approval: TOO_DEEP } },
+  failed_undone_during: { inside: { ...AS_BEFORE, decision_same: TOO_DEEP }, outside: { ...AS_BEFORE, approval: TOO_DEEP } },
   // A failed start whose undo failed too: the records stay provisional for
   // good, so every reader (the start's own Session too) reads them absent,
-  // keeping the last confirmed tree and mode (round 10 items 1 and 3).
+  // keeping the last confirmed tree and mode (round 10 items 1 and 3). The
+  // count hold the undo would have settled stays until it expires (busy).
   failed_undo_failed: { inside: PROVISIONAL, outside: { ...PROVISIONAL, approval: NO_BINDING } },
+  failed_undo_failed_during: { inside: { ...PROVISIONAL, decision_same: NO_BINDING }, outside: { ...PROVISIONAL, approval: NO_BINDING } },
 };
 
 const network = vi.fn(() => { throw new Error('A test tried to use the network.'); });
 beforeEach(() => { vi.stubGlobal('fetch', network); });
 afterEach(() => { expect(network).not.toHaveBeenCalled(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
+/** A store that mirrors what it holds, so a test can compare every record byte for byte. */
 class Store extends MemorySessionStore {
+  readonly mirror = new Map<string, string>();
+
   constructor(private readonly kind: Durability) {
     super();
   }
@@ -85,30 +180,49 @@ class Store extends MemorySessionStore {
   override durability(): Durability {
     return this.kind;
   }
+
+  override async put(key: string, payload: JsonObject, ttlSeconds: number | null = null): Promise<void> {
+    await super.put(key, payload, ttlSeconds);
+    this.mirror.set(key, JSON.stringify(payload));
+  }
+
+  override async forget(key: string): Promise<void> {
+    await super.forget(key);
+    this.mirror.delete(key);
+  }
 }
+
+/** Set while the test itself measures: its reads never hold the run, and never fire a hook. */
+const measuring = new AsyncLocalStorage<true>();
 
 class Rig {
   readonly queue: LlmResponse[] = [];
+  readonly requests: LlmRequest[] = [];
   readonly durable = new Store('durable');
   readonly ephemeral = new Store('volatile');
+  readonly events = new HarnessEvents();
   readonly registry: ToolRegistry;
+  readonly modes: ModeRegistry;
+  readonly plans: Plans;
   readonly runtime: AgentRuntime;
   readonly harness: PrismHarness;
   /** Run once, before the child's first model request is answered. */
   beforeChildRequest: (() => Promise<void>) | null = null;
   /** Run once, the first time the start's tools are resolved (inside its run, before its task row). */
   onResolve: ((view: Session) => Promise<void>) | null = null;
+  /** A measurement a listener started: the run waits for it at its next tool resolution or model request. */
+  pending: Promise<void> | null = null;
   #call = 0;
-  #resolving = false;
 
   constructor() {
-    const modes = new ModeRegistry({
+    this.modes = new ModeRegistry({
       default: 'lead',
       modes: {
         lead: { system_prompt: 'Lead.', tools: ['echo', 'a'], max_steps: 8, requires_approval: ['echo'], subagents: { a: { mode: 'work', max_steps: 8 } } } as ModeConfig,
         // The same delegation from a parent with fewer steps: a smaller ceiling.
         short: { system_prompt: 'Lead.', tools: ['echo', 'a'], max_steps: 4, requires_approval: ['echo'], subagents: { a: { mode: 'work', max_steps: 8 } } } as ModeConfig,
-        work: { system_prompt: 'Work.', tools: ['*'], max_steps: 8, requires_approval: ['echo'] } as ModeConfig,
+        // The child's own mode: plans on, and a tool policy of its own.
+        work: { system_prompt: 'Work.', tools: ['*'], max_steps: 8, requires_approval: ['echo', 'danger'], plans: true } as ModeConfig,
       },
     });
     this.registry = new ToolRegistry().register({ name: 'echo', handle: () => 'ok' });
@@ -117,30 +231,55 @@ class Rig {
     // reports the wrong mode shows in the offer.
     this.registry.registerProvider(async (session) => {
       if (!session.scope.includes('::sub::')) return [];
-      if (!this.#resolving && this.onResolve !== null) {
-        const hook = this.onResolve;
-        this.onResolve = null;
-        this.#resolving = true;
-        try { await hook(session); } finally { this.#resolving = false; }
+      if (measuring.getStore() !== true) {
+        await this.#wait();
+        if (this.onResolve !== null) {
+          const hook = this.onResolve;
+          this.onResolve = null;
+          await measuring.run(true, () => hook(session));
+        }
       }
       const tools = [{ name: 'probe', handle: () => 'probed' }];
       return (await session.mode()) === 'work' ? tools : [...tools, { name: 'danger', handle: () => 'boom' }];
     }, 'host', 'host_probe');
+    this.plans = new Plans({ modes: this.modes, config: { enabled: true }, events: this.events });
     this.runtime = new AgentRuntime({
-      modes, tools: this.registry, events: new HarnessEvents(),
+      modes: this.modes, tools: this.registry, events: this.events,
       client: async (request: LlmRequest) => {
-        if (request.systemPrompt.startsWith('Work.') && this.beforeChildRequest !== null) {
-          const hook = this.beforeChildRequest;
-          this.beforeChildRequest = null;
-          await hook();
+        if (measuring.getStore() !== true) {
+          await this.#wait();
+          if (request.systemPrompt.startsWith('Work.') && this.beforeChildRequest !== null) {
+            const hook = this.beforeChildRequest;
+            this.beforeChildRequest = null;
+            await measuring.run(true, hook);
+          }
         }
+        this.requests.push(request);
+        // A measurement never takes the scripted answers (if it reaches the
+        // model at all, the request count shows it).
+        if (measuring.getStore() === true) return { text: 'Measured.', finishReason: 'stop' };
         return this.queue.shift() ?? { text: 'Done.', finishReason: 'stop' };
       },
     });
     const durable = this.durable, ephemeral = this.ephemeral;
-    this.harness = new PrismHarness({ drivers: { ephemeral: () => ephemeral, durable: () => durable }, stores: { ephemeral: 'ephemeral', durable: 'durable' }, runtime: this.runtime });
+    this.harness = new PrismHarness({ drivers: { ephemeral: () => ephemeral, durable: () => durable }, stores: { ephemeral: 'ephemeral', durable: 'durable' }, runtime: this.runtime, plans: this.plans });
     this.registry.register(new SubagentRunner(this.harness, this.runtime)
-      .tool(modes.resolve('lead').subagents.a!, this.session(), RunContext.root('host', new RunBudget(100)), 'host_run'));
+      .tool(this.modes.resolve('lead').subagents.a!, this.session(), RunContext.root('host', new RunBudget(100)), 'host_run'));
+  }
+
+  async #wait(): Promise<void> {
+    while (this.pending !== null) {
+      const pending = this.pending;
+      await pending;
+      if (this.pending === pending) this.pending = null;
+    }
+  }
+
+  /** Start a measurement from a listener; the run waits for it. */
+  measureFromListener(body: () => Promise<void>): void {
+    const pending = measuring.run(true, body);
+    this.pending = pending.catch(() => {});
+    void pending.catch(() => {});
   }
 
   session(scope = 'chat'): Session {
@@ -159,10 +298,23 @@ class Rig {
     this.queue.push({ text, finishReason: 'stop' });
   }
 
+  childRequests(): number {
+    return this.requests.filter((request) => request.systemPrompt.startsWith('Work.')).length;
+  }
+
   /** The child's parked approval ids. */
   async approvals(): Promise<string[]> {
     return (await this.child().thread().messages()).flatMap((entry) => Array.isArray(entry.message.tool_approval_requests)
       ? (entry.message.tool_approval_requests as JsonObject[]).map((request) => request.approval_id as string) : []);
+  }
+
+  /** Every stored record of the child (durable, ephemeral, its thread), as bytes. */
+  childRecords(): string {
+    const out: [string, string][] = [];
+    for (const store of [this.durable, this.ephemeral]) {
+      for (const [key, value] of store.mirror) if (key.includes('::sub::')) out.push([key, value]);
+    }
+    return JSON.stringify(out.sort(([a], [b]) => a.localeCompare(b)));
   }
 
   /** A delegation through the subagent tool in a parent turn under `context`. */
@@ -174,9 +326,10 @@ class Rig {
   }
 }
 
-interface Values { mode: unknown; binding: unknown; refs: unknown; depth: unknown; ceiling: unknown; run: unknown; offer: unknown }
+interface Values { mode: unknown; binding: unknown; refs: unknown; depth: unknown; ceiling: unknown; run: unknown; offer: unknown; provisional: boolean; plans: boolean; plan_run: string | null; paused: boolean; busy: boolean; resumed_tree: unknown; policy: unknown }
 
 async function read(r: Rig, session: Session): Promise<Values> {
+  const now = Math.floor(Date.now() / 1000);
   return {
     mode: await session.mode(),
     binding: await session.childBinding(),
@@ -185,27 +338,53 @@ async function read(r: Rig, session: Session): Promise<Values> {
     ceiling: await session.childCeiling(),
     run: (await session.run())?.id ?? null,
     offer: (await r.runtime.effectiveTools(session)).map((tool) => tool.name).sort(),
+    provisional: await session.childStartUnconfirmed(),
+    plans: await r.plans.enabledFor(session),
+    plan_run: await r.plans.runId(session),
+    // The thread is the child's, whichever object reads it (a provider's
+    // read-only view refuses thread(): it is a write accessor).
+    paused: pausedApprovalIds((await r.child().thread().messages()).map((entry) => entry.message)).length > 0,
+    busy: await session.childTurnLive(now, r.runtime.holdTtl(session)),
+    resumed_tree: await session.resumedRunTree(),
+    policy: [...(await r.runtime.modeOf(session)).requiresApproval],
   };
 }
 
-async function approval(r: Rig, id: string): Promise<string> {
-  return recordApproval(r.child(), id, true).then(() => 'accepted', (error: { code?: string; message?: string }) => error.code ?? String(error.message));
+const code = (error: { code?: string; message?: string }): string => error.code ?? `?${String(error.message)}`;
+
+async function approve(session: Session, id: string): Promise<string> {
+  return recordApproval(session, id, true).then(() => 'accepted', code);
 }
 
-const ABSENT: Record<Reader, unknown> = { mode: null, binding: null, refs: null, depth: 0, ceiling: null, run: null, offer: [] };
+async function turn(r: Rig, session: Session, prompt: string): Promise<string> {
+  return r.runtime.send(session, prompt).then(() => 'ran', code);
+}
 
-function token(reader: Reader, value: unknown, prior: Values, next: Values | null): string {
+/** A second runner start onto the same child: its outcome, `+wrote` if it wrote any child record or asked the model. */
+async function secondStart(r: Rig): Promise<string> {
+  const before = r.childRecords(), requests = r.childRequests();
+  const result = await new SubagentRunner(r.harness, r.runtime)
+    .run(r.modes.resolve('lead').subagents.a!, r.session(), RunContext.root('root2', new RunBudget(8)), 'root2', 'Second start');
+  return before === r.childRecords() && requests === r.childRequests() ? result.outcome : `${result.outcome}+wrote`;
+}
+
+const ABSENT: Record<Reader, unknown> = { mode: null, binding: null, refs: null, depth: 0, ceiling: null, run: null, offer: [], provisional: false, plans: false, plan_run: null, paused: false, busy: false, resumed_tree: null, policy: [] };
+
+function token(reader: Reader, value: unknown, prior: Values, next: Values | null, start: string | null): string {
   const same = (a: unknown, b: unknown): boolean => JSON.stringify(a) === JSON.stringify(b);
   if (reader === 'binding') return value === null ? 'ABSENT' : 'BOUND';
+  if (reader === 'provisional' || reader === 'plans' || reader === 'paused' || reader === 'busy') return value === true ? 'yes' : value === false ? 'no' : `?${String(value)}`;
+  if (reader === 'plan_run') return value === null ? 'NONE' : value === start ? 'START' : value === prior.run ? 'PRIOR' : `?${String(value)}`;
+  if (reader === 'resumed_tree') return value === null ? 'ABSENT' : same(value, prior.resumed_tree) ? 'PRIOR' : `?${JSON.stringify(value)}`;
   if (next !== null && same(value, next[reader]) && !same(value, prior[reader])) return 'NEW';
   if (same(value, prior[reader])) return 'PRIOR';
   if (same(value, ABSENT[reader])) return 'ABSENT';
   return `?${JSON.stringify(value)}`;
 }
 
-function cells(values: Values, prior: Values, next: Values | null): Cells {
+function cells(values: Values, prior: Values, next: Values | null, start: string | null): Cells {
   const out = {} as Cells;
-  for (const reader of Object.keys(ABSENT) as Reader[]) out[reader] = token(reader, values[reader], prior, next);
+  for (const reader of Object.keys(ABSENT) as Reader[]) out[reader] = token(reader, values[reader], prior, next, start);
   return out;
 }
 
@@ -227,7 +406,9 @@ async function prepared(): Promise<{ r: Rig; parked: string; prior: Values }> {
   expect(prior.depth).toBe(1_000);
   expect(prior.binding).not.toBeNull();
   expect(prior.run).not.toBeNull();
-  expect(await approval(r, parked)).toBe(TOO_DEEP);
+  expect(prior.resumed_tree).not.toBeNull();
+  expect(prior.paused).toBe(true);
+  expect(await approve(r.child(), parked)).toBe(TOO_DEEP);
 
   return { r, parked, prior };
 }
@@ -238,38 +419,84 @@ async function second(r: Rig, child: () => void): Promise<void> {
   await r.delegate('Second task', child);
 }
 
-/** Spy on `method` of the child's Session; `hook` runs on the start's own Session (`this`) once. */
-function onChild<K extends 'childTurnLive' | 'rememberChildStart' | 'beginRun'>(method: K, after: boolean, hook: (own: Session) => Promise<void>): void {
+/** Spy on `method` of the child's Session; `hook` runs on the start's own Session (`this`) once, inside its run's async context. */
+function onChild<K extends 'childTurnLive' | 'rememberChildStart' | 'beginRun'>(method: K, after: boolean, hook: (own: Session, args: unknown[]) => Promise<void>): void {
   const original = Session.prototype[method] as (...args: unknown[]) => Promise<unknown>;
   let fired = false;
   vi.spyOn(Session.prototype, method).mockImplementation(async function (this: Session, ...args: unknown[]) {
-    const mine = !fired && this.scope.includes('::sub::');
+    const mine = !fired && measuring.getStore() !== true && this.scope.includes('::sub::');
     if (mine) fired = true;
-    if (mine && !after) await hook(this);
+    if (mine && !after) await measuring.run(true, () => hook(this, args));
     const result = await original.apply(this, args);
-    if (mine && after) await hook(this);
+    if (mine && after) await measuring.run(true, () => hook(this, args));
     return result;
   } as never);
 }
 
-interface Measured { inside: Cells; outside: Cells & { approval: string } }
+/**
+ * A deferred registered in the TEST's async context, outside any run: the
+ * body runs there whenever the start triggers it, so the start's own object
+ * is used from outside its run (TS review S4).
+ */
+function outsideDeferred(): { run: (body: () => Promise<void>) => Promise<void> } {
+  let trigger!: (body: () => Promise<void>) => void;
+  let ready = new Promise<() => Promise<void>>((resolve) => { trigger = resolve; });
+  const loop = async (): Promise<void> => {
+    for (;;) {
+      const body = await ready;
+      ready = new Promise((resolve) => { trigger = resolve; });
+      await body();
+    }
+  };
+  void loop();
+  return {
+    run: (body) => new Promise<void>((resolve, reject) => { trigger(() => body().then(resolve, reject)); }),
+  };
+}
 
-describe('G-387 round 11 item 7: the child-state invariant matrix', () => {
-  it('a start that completes: before the gate, after (b), during its own run, after its task row', async () => {
+type Measured = Partial<Record<Phase, Side>>;
+
+describe('G-387 rounds 11-12: the child-state invariant matrix', () => {
+  it('a start that completes: before the gate, after (b), at run.started, during its own run, at tool_denied, after its task row', async () => {
     const { r, parked, prior } = await prepared();
-    const raw: Partial<Record<Phase, { inside: Values; outside: Values; approval: string }>> = {};
-    const measure = async (phase: Phase, own: Session): Promise<void> => {
-      raw[phase] = { inside: await read(r, own), outside: await read(r, r.child()), approval: await approval(r, parked) };
-    };
+    const outside = outsideDeferred();
+    let start: string | null = null;
     let own: Session | null = null;
-    onChild('childTurnLive', false, (session) => measure('before_gate', session));
-    onChild('rememberChildStart', true, async (session) => {
-      await measure('after_b', session);
+    const raw: Partial<Record<Phase, { inside: Values; outside: Values; own_outside?: Values; actions: Record<string, string> }>> = {};
+    const measure = async (phase: Phase, reader: Session, actions: { inside?: InsideAction[]; outside?: OutsideAction[]; ownOutside?: boolean } = {}): Promise<void> => {
+      const done: Record<string, string> = {};
+      const entry: { inside: Values; outside: Values; own_outside?: Values; actions: Record<string, string> } = { inside: await read(r, reader), outside: await read(r, r.child()), actions: done };
+      if (actions.ownOutside === true) {
+        const self = own!;
+        await outside.run(async () => {
+          entry.own_outside = await read(r, self);
+          done['own_outside.decision_same'] = await approve(self, parked);
+          done['own_outside.own_resume'] = await turn(r, self, '');
+        });
+      }
+      for (const action of actions.outside ?? []) {
+        done[`outside.${action}`] = action === 'approval' ? await approve(r.child(), parked)
+          : action === 'resume' ? await turn(r, r.child(), '') : await secondStart(r);
+      }
+      for (const action of actions.inside ?? []) {
+        done[`inside.${action}`] = action === 'decision_same' ? await approve(own!, parked)
+          : await turn(r, own!, action === 'own_resume' ? '' : 'Injected');
+      }
+      raw[phase] = entry;
+    };
+    onChild('childTurnLive', false, (session) => measure('before_gate', session, { outside: ['approval'] }));
+    onChild('rememberChildStart', true, async (session, args) => {
+      own = session;
+      start = (args[3] as { runId: string }).runId;
+      await measure('after_b', session, { inside: ['decision_same', 'own_resume', 'own_new'], outside: ['approval', 'resume', 'second_start'], ownOutside: true });
       // Armed only now: the readers above resolve tools too.
-      r.onResolve = (view) => measure('own_run', view);
+      r.onResolve = (view) => measure('own_run', view, { inside: ['decision_same', 'own_resume', 'own_new'], outside: ['approval', 'resume', 'second_start'], ownOutside: true });
     });
-    onChild('beginRun', false, async (session) => { own = session; });
-    r.beforeChildRequest = () => measure('after_task', own!);
+    r.events.listen((event: HarnessEvent) => {
+      if (event.type === 'run.started' && event.runId === start) r.measureFromListener(() => measure('run_started', own!, { inside: ['decision_same', 'own_resume', 'own_new'], outside: ['approval', 'resume', 'second_start'] }));
+      if (event.type === 'tool_denied' && event.runId === start) r.measureFromListener(() => measure('tool_denied', own!, { inside: ['decision_same'], outside: ['approval'] }));
+    });
+    r.beforeChildRequest = () => measure('after_task', own!, { inside: ['decision_same'], outside: ['approval', 'second_start'] });
 
     await second(r, () => r.text('Child done.'));
     vi.restoreAllMocks();
@@ -278,24 +505,44 @@ describe('G-387 round 11 item 7: the child-state invariant matrix', () => {
     expect(next.depth).toBe(1);
     expect(next.ceiling).toBe(3);
     expect(next.refs).not.toEqual(prior.refs);
+    // No action in any phase let the child take a model step beyond the start's own one.
+    expect(r.childRequests()).toBe(2);
 
-    const measured: Partial<Record<Phase, Measured>> = {};
-    for (const phase of ['before_gate', 'after_b', 'own_run', 'after_task'] as const) {
+    const measured: Measured = {};
+    for (const phase of ['before_gate', 'after_b', 'run_started', 'own_run', 'tool_denied', 'after_task'] as const) {
       const got = raw[phase];
       expect(got, `${phase} was reached`).toBeDefined();
-      measured[phase] = { inside: cells(got!.inside, prior, next), outside: { ...cells(got!.outside, prior, next), approval: got!.approval } };
+      const side: Side = { inside: cells(got!.inside, prior, next, start), outside: cells(got!.outside, prior, next, start) };
+      if (got!.own_outside !== undefined) side.own_outside = cells(got!.own_outside, prior, next, start);
+      for (const [key, value] of Object.entries(got!.actions)) {
+        const [where, action] = key.split('.') as ['inside' | 'outside' | 'own_outside', string];
+        (side[where] as Record<string, string>)[action] = value;
+      }
+      measured[phase] = side;
     }
-    expect(measured).toEqual({ before_gate: EXPECTED.before_gate, after_b: EXPECTED.after_b, own_run: EXPECTED.own_run, after_task: EXPECTED.after_task });
+    const expected: Measured = {};
+    for (const phase of ['before_gate', 'after_b', 'run_started', 'own_run', 'tool_denied', 'after_task'] as const) expected[phase] = EXPECTED[phase];
+    expect(measured).toEqual(expected);
   });
 
   for (const phase of ['failed_undone', 'failed_undo_failed'] as const) {
-    it(`a start that fails after (b), before its task row, ${phase === 'failed_undone' ? 'its undo done' : 'its undo failing too'}`, async () => {
+    it(`a start that fails after (b), before its task row, ${phase === 'failed_undone' ? 'its undo done' : 'its undo failing too'}: measured during the failure (run.failed) and after`, async () => {
       const { r, parked, prior } = await prepared();
       let own: Session | null = null;
-      onChild('beginRun', false, async (session) => { own = session; });
+      let start: string | null = null;
+      let during: Side | null = null;
+      onChild('beginRun', false, async (session, args) => { own = session; start = args[0] as string; });
+      r.events.listen((event: HarnessEvent) => {
+        if (event.type !== 'run.failed' || event.runId !== start) return;
+        r.measureFromListener(async () => {
+          const inside = { ...cells(await read(r, own!), prior, null, start), decision_same: await approve(own!, parked) };
+          const outside = { ...cells(await read(r, r.child()), prior, null, start), approval: await approve(r.child(), parked) };
+          during = { inside, outside };
+        });
+      });
       const resolve = ToolRegistry.prototype.resolveDetailed;
       vi.spyOn(ToolRegistry.prototype, 'resolveDetailed').mockImplementation(function (this: ToolRegistry, ...args: Parameters<ToolRegistry['resolveDetailed']>) {
-        if (args[1]?.scope.includes('::sub::') === true) throw new Error('REGISTRY-SECRET');
+        if (args[1]?.scope.includes('::sub::') === true && measuring.getStore() !== true) throw new Error('REGISTRY-SECRET');
         return resolve.apply(this, args);
       });
       if (phase === 'failed_undo_failed') vi.spyOn(Session.prototype, 'undoChildStart').mockRejectedValue(new Error('STORE-SECRET'));
@@ -304,11 +551,11 @@ describe('G-387 round 11 item 7: the child-state invariant matrix', () => {
       vi.restoreAllMocks();
       expect(own).not.toBeNull();
 
-      const measured: Measured = {
-        inside: cells(await read(r, own!), prior, null),
-        outside: { ...cells(await read(r, r.child()), prior, null), approval: await approval(r, parked) },
+      const after: Side = {
+        inside: cells(await read(r, own!), prior, null, start),
+        outside: { ...cells(await read(r, r.child()), prior, null, start), approval: await approve(r.child(), parked) },
       };
-      expect(measured).toEqual(EXPECTED[phase]);
+      expect({ during, after }).toEqual({ during: EXPECTED[`${phase}_during`], after: EXPECTED[phase] });
     });
   }
 });

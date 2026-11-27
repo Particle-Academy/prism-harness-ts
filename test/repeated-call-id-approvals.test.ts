@@ -309,9 +309,10 @@ describe('G-392: ended entries carry their own approval id', () => {
     await r.endByStart();
 
     expect(r.ran).toEqual([]);
-    const ended = (await r.rows()).filter((row) => row.type === 'tool_result')
-      .flatMap((row) => row.tool_results as JsonObject[]).filter((entry) => entry.not_run === 'delegation_ended');
-    expect(ended.map((entry) => entry.approval_id)).toEqual(ids);
+    // The row-level mark (G-387 round 12, the reference's shape): each call's own approval, in call order.
+    const ended = (await r.rows()).filter((row) => row.type === 'tool_result' && Object.hasOwn(row, 'harness_ended_by_start'))
+      .flatMap((row) => (row.harness_ended_by_start as { approval_ids: string[] }).approval_ids);
+    expect(ended).toEqual(ids);
     const step = await r.step();
     for (const id of ids) {
       expect(step.approvedIds).not.toContain(id);
@@ -325,9 +326,10 @@ describe('G-392: ended entries carry their own approval id', () => {
     await r.endByStart();
 
     expect(r.ran).toEqual([]);
-    const ended = (await r.rows()).filter((row) => row.type === 'tool_result')
-      .flatMap((row) => row.tool_results as JsonObject[]).filter((entry) => entry.not_run === 'delegation_ended');
-    expect(ended.map((entry) => entry.approval_id)).toEqual(ids);
+    // The row-level mark (G-387 round 12, the reference's shape): each call's own approval, in call order.
+    const ended = (await r.rows()).filter((row) => row.type === 'tool_result' && Object.hasOwn(row, 'harness_ended_by_start'))
+      .flatMap((row) => (row.harness_ended_by_start as { approval_ids: string[] }).approval_ids);
+    expect(ended).toEqual(ids);
   });
 
   it('a plan step held on two calls sharing an id, both approved and resumed: nothing runs, and the plan never reads them as approved work', async () => {

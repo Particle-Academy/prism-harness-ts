@@ -281,61 +281,88 @@ export function unresolvedApprovalIds(rows: readonly JsonObject[]): string[] {
 }
 
 /**
- * The result a runner start's task row records for a call its child was
+ * The result a runner start's task row records for each call its child was
  * parked on (G-387 round 9): not run, whatever decision is recorded on it.
- * The text is for the model; the harness recognises such a row only by its
- * mark (ENDED_BY_START_KEY, round 11), never by these words.
+ * One fixed text in all three languages (round 12: the reference's), so a
+ * thread reads the same whichever language wrote it. The text is for the
+ * model; the harness recognises such a row only by its mark
+ * (ENDED_BY_START_KEY), never by these words.
  *
  * @internal
  */
-export function endedByStartResult(tool: string): string {
-  return `Not run: ${tool} was waiting on an approval when its delegation ended and a new task was given.`;
+export function endedByStartResult(): string {
+  return 'Not run: the delegation this call was proposed under ended.';
 }
 
 /**
- * The key and value of the mark a runner start's task row puts on each
- * entry it ends (G-387 round 11), beside `approval_id`, the approval it
- * ended. Only the harness writes them: a tool returns a `result` string and
- * nothing else of the entry, and the replay view rebuilds entries from
- * their known keys, so the model never sees them either.
+ * The key of the mark a runner start puts on the result row it ends its
+ * child's parked calls with (G-387 rounds 11-12): `{approval_ids: [...]}`,
+ * the approvals those calls were asked under, in call order. The PHP
+ * reference's shape and placement: a top-level key of the row, AFTER
+ * `tool_approval_responses`, beside (never inside) the results. Only the
+ * harness writes it: a tool returns a `result` string and nothing else of
+ * the row, and the replay view rebuilds rows from their known keys, so the
+ * model never sees it either. Pinned by harness-thread-rows thr-0014.
  *
  * @internal
  */
-export const ENDED_BY_START_KEY = 'not_run';
-/** @internal */
-export const ENDED_BY_START = 'delegation_ended';
+export const ENDED_BY_START_KEY = 'harness_ended_by_start';
+
+export type EndedByStartRow = ToolResultRow & { harness_ended_by_start: { approval_ids: string[] } };
+
+/**
+ * The row a runner start records with its task row when it ends `calls`,
+ * the calls of its child's parked step that have no result (G-387): each
+ * with the one fixed result, never run, and the row marked with the
+ * approvals they were asked under (`approvalIds`, one per call, undefined
+ * for a call asked under none), in call order, each once.
+ *
+ * @internal Written by the runtime; the harness-thread-rows corpus drives it.
+ */
+export function endedByStartRow(calls: readonly ToolCallInput[], approvalIds: readonly (string | undefined)[]): EndedByStartRow {
+  const approvals: string[] = [];
+  for (const id of approvalIds) if (typeof id === 'string' && !approvals.includes(id)) approvals.push(id);
+
+  return {
+    ...toolResultRow(calls.map((call) => toolResultEntry(call, endedByStartResult()))),
+    [ENDED_BY_START_KEY]: { approval_ids: approvals },
+  };
+}
 
 /**
  * The approval ids whose call a runner start's task row ended as not run
  * (G-387 round 10): their decision, if any, was never acted on, so it reads
  * as ended, never as approved.
  *
- * Recognised ONLY by the harness's mark (round 11), never by the result
- * text: a tool that returns the very words of a "Not run" result is an
- * ordinary result. And only for the approval the mark names, asked for by a
- * request row BEFORE the marked row, for the same call: never by tool_call
- * id across the thread, since providers reuse call ids (one per function
- * name, or numbered per response), and a later approval with a reused id
- * is its own. The marked row is the one written directly before the start's
- * task row (one write).
+ * The reference's rule (round 12), read the same in every language: for
+ * each approval, its request row; then the FIRST result of its call after
+ * that row, before any later assistant row (a later step means the call had
+ * no result in its own turn). The approval is ended only when that result's
+ * row carries the mark and the mark names this approval. Never by the
+ * result text (a tool can return any text), and never by tool_call id
+ * across the thread (providers reuse call ids: one per function name, or
+ * numbered per response).
  *
  * @internal
  */
 export function endedByStart(rows: readonly JsonObject[]): Set<string> {
-  const asked = new Map<string, string>();
-  const ended = new Set<string>();
+  const requests = new Map<string, { index: number; call: string }>();
   for (const [index, row] of rows.entries()) {
-    if (row.type === 'assistant') {
-      for (const request of list(row.tool_approval_requests)) {
-        if (typeof request.approval_id === 'string' && typeof request.tool_call_id === 'string' && !asked.has(request.approval_id)) asked.set(request.approval_id, request.tool_call_id);
+    if (row.type !== 'assistant') continue;
+    for (const request of list(row.tool_approval_requests)) {
+      if (typeof request.approval_id === 'string' && typeof request.tool_call_id === 'string') {
+        requests.set(request.approval_id, { index, call: request.tool_call_id });
       }
-      continue;
     }
-    if (row.type !== 'tool_result' || rows[index + 1]?.type !== 'user') continue;
-    for (const result of list(row.tool_results)) {
-      const approval = result.approval_id;
-      if (result[ENDED_BY_START_KEY] === ENDED_BY_START && typeof approval === 'string'
-        && asked.has(approval) && asked.get(approval) === result.tool_call_id) ended.add(approval);
+  }
+  const ended = new Set<string>();
+  for (const [approval, request] of requests) {
+    for (const row of rows.slice(request.index + 1)) {
+      if (row.type === 'assistant') break;
+      if (row.type !== 'tool_result' || !list(row.tool_results).some((result) => result.tool_call_id === request.call)) continue;
+      const mark = row[ENDED_BY_START_KEY];
+      if (isObject(mark) && Array.isArray(mark.approval_ids) && mark.approval_ids.includes(approval)) ended.add(approval);
+      break;
     }
   }
 
@@ -507,13 +534,21 @@ export function ambiguousCalls(assistant: AssistantRow): Set<string> {
 /**
  * The result a call gets when its step repeats a tool call id (G-392): not
  * run, whatever was decided. The harness recognises such an entry only by
- * its mark (REPEATED_CALL_ID under ENDED_BY_START_KEY), never by this text.
+ * its mark (REPEATED_CALL_ID under NOT_RUN_KEY), never by this text.
  *
  * @internal
  */
 export const REPEATED_CALL_ID_RESULT = 'Tool call was not run because another call in this step has the same id';
 /** @internal */
 export const REPEATED_CALL_ID = 'repeated_call_id';
+/**
+ * The key of the per-entry mark on a call denied because its step repeats
+ * a call id (G-392), beside `approval_id`. Not the ended-by-start mark,
+ * which is the row-level ENDED_BY_START_KEY (G-387 round 12).
+ *
+ * @internal
+ */
+export const NOT_RUN_KEY = 'not_run';
 
 /**
  * Each call of one assistant step paired with its OWN approval request, by
@@ -573,7 +608,7 @@ export function repeatedStepSettled(rows: readonly JsonObject[], index: number):
   for (const row of rows.slice(index + 1)) {
     if (row.type !== 'tool_result') continue;
     const entries = list(row.tool_results);
-    if (entries.some((entry) => entry[ENDED_BY_START_KEY] === REPEATED_CALL_ID || entry[ENDED_BY_START_KEY] === ENDED_BY_START)) return true;
+    if (isObject(row[ENDED_BY_START_KEY]) || entries.some((entry) => entry[NOT_RUN_KEY] === REPEATED_CALL_ID)) return true;
     const here = new Map<string, number>();
     for (const entry of entries) here.set(text(entry.tool_call_id), (here.get(text(entry.tool_call_id)) ?? 0) + 1);
     for (const [id, count] of here) counts.set(id, Math.max(counts.get(id) ?? 0, count));
@@ -605,7 +640,7 @@ export function repeatedIdDenials(rows: readonly JsonObject[]): Set<string> {
     if (row.type !== 'tool_result') continue;
     for (const result of list(row.tool_results)) {
       const approval = result.approval_id;
-      if (result[ENDED_BY_START_KEY] === REPEATED_CALL_ID && typeof approval === 'string'
+      if (result[NOT_RUN_KEY] === REPEATED_CALL_ID && typeof approval === 'string'
         && asked.has(approval) && asked.get(approval) === result.tool_call_id) denied.add(approval);
     }
   }

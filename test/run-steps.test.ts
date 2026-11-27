@@ -358,8 +358,10 @@ describe('refused versus failed', () => {
     } finally {
       process.emitWarning = quiet;
     }
-    // Isolated, not swallowed: the failure is still reported.
-    expect(warnings.some((warning) => warning.includes('a broken renderer'))).toBe(true);
+    // Isolated, not swallowed: the failure is still reported, by its class
+    // name only, never the listener's own text (G-387 round 12).
+    expect(warnings.some((warning) => warning.includes('A prism-harness event listener threw') && warning.includes('Error'))).toBe(true);
+    expect(warnings.some((warning) => warning.includes('a broken renderer'))).toBe(false);
   });
 
   it('emits no run.stepped by default, so content never reaches apps that record every event', async () => {

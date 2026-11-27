@@ -17,12 +17,11 @@ import {
   ambiguousCalls,
   pendingApprovalIds,
   unresolvedApprovalIds,
-  ENDED_BY_START,
-  ENDED_BY_START_KEY,
-  endedByStartResult,
+  endedByStartRow,
   pairStepApprovals,
   repeatedStepSettled,
   REPEATED_CALL_ID,
+  NOT_RUN_KEY,
   REPEATED_CALL_ID_RESULT,
   ARGUMENTS_AS_SENT,
 } from './thread-rows.js';
@@ -1010,27 +1009,40 @@ export class AgentRuntime {
       await started?.undo();
       throw error;
     }
-    this.#events?.emit({
-      // A parked run continued under its own id has already STARTED once; a
-      // second run.started for it would read as a new run.
-      type: stepping?.resuming === true ? 'run.resumed' : 'run.started',
-      runId,
-      sessionKey: session.key(),
-      mode: mode.name,
-      provider,
-      model,
-      rootRunId: run.rootRunId,
-      depth: run.depth,
-      at: new Date().toISOString(),
-      ...tag,
-    });
-
     // A turn that holds part of its delegation's step budget (G-387): the
     // hold is replaced by what the run took when it ends, parks or fails.
     let delegation: { session: Session; startSteps: number } | null = null;
     // A runner start is undone by any failure before its task row is recorded.
     let taskRecorded = false;
+    // The run's holds (its tree's and its delegation's), released ONCE: on
+    // the failure path BEFORE run.failed is emitted (G-387 round 12), so a
+    // listener never observes, or races, a hold about to be released.
+    let holdsReleased = false;
+    const releaseHolds = async (): Promise<void> => {
+      if (holdsReleased) return;
+      holdsReleased = true;
+      // A root run that holds part of a run tree's budget settles it.
+      await RunTrees.finished(session, runId);
+      if (delegation !== null) await settleDelegation(delegation.session, runId, run.ledger.steps - delegation.startSteps, this.#setting(session, 'lock_ttl') ?? RESOLUTION_LOCK_SECONDS);
+    };
     try {
+      // Inside the run's try (G-387 round 12): whatever this emit throws (a
+      // host's own HarnessEvents may throw anything) fails the run, releases
+      // its holds and emits the terminal event, like any other failure.
+      this.#events?.emit({
+        // A parked run continued under its own id has already STARTED once; a
+        // second run.started for it would read as a new run.
+        type: stepping?.resuming === true ? 'run.resumed' : 'run.started',
+        runId,
+        sessionKey: session.key(),
+        mode: mode.name,
+        provider,
+        model,
+        rootRunId: run.rootRunId,
+        depth: run.depth,
+        at: new Date().toISOString(),
+        ...tag,
+      });
       // Recorded before any tool can run, so a child this run starts finds it.
       RunTrees.enter(session, runId, membership, run);
       // G-360: the plan, in the system prompt of this turn and never in the
@@ -1232,6 +1244,13 @@ export class AgentRuntime {
       } catch {
         // The event is still emitted and the error still reaches the caller.
       }
+      // Released BEFORE the event (round 12): settling never throws (it
+      // reports by class name), and the finally does not settle again.
+      try {
+        await releaseHolds();
+      } catch {
+        // Each settle reports its own failure; the event is still emitted.
+      }
       this.#events?.emit({
         type: 'run.failed',
         runId,
@@ -1247,9 +1266,7 @@ export class AgentRuntime {
       session.endChildStartView(runId);
       unwatchPlan();
       this.#childRefs.delete(runId);
-      // A root run that holds part of a run tree's budget settles it.
-      await RunTrees.finished(session, runId);
-      if (delegation !== null) await settleDelegation(delegation.session, runId, run.ledger.steps - delegation.startSteps, this.#setting(session, 'lock_ttl') ?? RESOLUTION_LOCK_SECONDS);
+      await releaseHolds();
       if (steps !== undefined) await rememberSeq(session, runId, steps);
     }
   }
@@ -1520,25 +1537,22 @@ export class AgentRuntime {
     const work = await this.#unresolved(session, mode);
     if (work === null) return { rows: [], announce: () => {} };
     const inputs = work.calls.map((call) => ({ id: call.id, name: call.name, arguments: work.ambiguous.has(call.id) ? {} : call.arguments, resultId: call.result_id }));
-    // Each entry ends its OWN call's approval, paired by position (G-392).
-    // Each entry carries the harness-only mark (round 11) and the approval
-    // it ended: a tool controls only its `result` string, and the replay
-    // view and every builder rebuild entries from their known keys, so no
-    // tool result, argument or model output can produce either.
-    const ended: ToolResultEntry[] = inputs.map((input, index) => {
-      const approvalId = work.approvalIds[index];
-
-      return { ...toolResultEntry(input, endedByStartResult(input.name)), [ENDED_BY_START_KEY]: ENDED_BY_START, ...(approvalId === undefined ? {} : { approval_id: approvalId }) };
-    });
+    // ONE row, in the reference's shape (round 12): the ended calls, each
+    // with the one fixed result, and the row marked with the approvals they
+    // were asked under, each call's OWN approval, paired by position (G-392).
+    // A tool controls only its `result` string, and the replay view and
+    // every builder rebuild rows from their known keys, so no tool result,
+    // argument or model output can produce the mark.
+    const row = endedByStartRow(inputs, inputs.map((_input, index) => work.approvalIds[index]));
 
     return {
-      rows: [toolResultRow([...work.results.values(), ...ended]) as unknown as JsonObject],
+      rows: [row as unknown as JsonObject],
       // The events and run steps for them, emitted by the caller only once
       // the rows are recorded with the task row (G-387 round 10).
       announce: () => {
         inputs.forEach((input, index) => {
           this.#toolDecision('tool_denied', session, runId, input, undefined, 'policy');
-          steps?.toolResult(input.id, ended[index]!.result, { ok: false, code: 'approval_denied', refused: true });
+          steps?.toolResult(input.id, row.tool_results[index]!.result, { ok: false, code: 'approval_denied', refused: true });
         });
       },
     };
@@ -1589,7 +1603,7 @@ export class AgentRuntime {
           // decided. Marked, so the step reads settled and no later decision
           // or resume revives it, and the plan never reads it as approved.
           this.#toolDecision('tool_denied', live, runId, input, declared, 'policy');
-          const entry = { ...toolResultEntry(input, REPEATED_CALL_ID_RESULT), [ENDED_BY_START_KEY]: REPEATED_CALL_ID, ...(approvalId === undefined ? {} : { approval_id: approvalId }) };
+          const entry = { ...toolResultEntry(input, REPEATED_CALL_ID_RESULT), [NOT_RUN_KEY]: REPEATED_CALL_ID, ...(approvalId === undefined ? {} : { approval_id: approvalId }) };
           steps?.toolResult(call.id, entry.result, { ok: false, code: 'approval_denied', refused: true });
           resolved.push(entry);
         } else if (decision?.approved === true && work.unusable.has(call.id)) {
@@ -1747,7 +1761,7 @@ export class AgentRuntime {
     if (error instanceof HarnessError && error.code === 'call_not_authorized') throw error;
 
     return {
-      entry: toolResultEntry(call, `The tool failed: ${error instanceof Error ? error.message : String(error)}`),
+      entry: toolResultEntry(call, `The tool failed: ${toolFailureText(error)}`),
       outcome: settled.refused ? REFUSED_CALL : { ok: false, code: 'tool_failed', refused: false },
     };
   }
@@ -2030,6 +2044,22 @@ const STOPS = new WeakMap<AgentResponse, RunStop>();
  */
 export function stopCodeOf(response: AgentResponse): RunStop | null {
   return STOPS.get(response) ?? null;
+}
+
+/**
+ * What the model is told a tool's failure was: its message, as before (a
+ * tool result goes to the model by design, so it can recover), by a
+ * conversion that cannot throw (G-387 round 12). A value String() cannot
+ * convert, or a throwing message getter, reads as its class by the
+ * named-class rule; it never turns a tool's failure into a broken run.
+ */
+function toolFailureText(error: unknown): string {
+  try {
+    const text: unknown = error instanceof Error ? error.message : String(error);
+    return typeof text === 'string' ? text : failureName(error);
+  } catch {
+    return failureName(error);
+  }
 }
 
 /** A structured run's failure records its CODE (it holds the model's document), guarded; else null. */

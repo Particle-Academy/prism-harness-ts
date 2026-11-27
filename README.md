@@ -332,7 +332,8 @@ holds; a count hold it could not release expires after `lock_ttl`. A runner
 start acts on no recorded decision: its task row ends every call the child
 was still waiting on, recorded as not run, and such a call never reads as
 approved in the child's plan. The harness recognises such a call only by a
-mark it writes itself on that entry, naming the approval it ended; never by
+mark it writes itself on that result row (`harness_ended_by_start`, the same
+shape in every language), naming the approvals it ended; never by
 the result's words or by a tool call id, so a tool whose output happens to
 read "Not run", or a provider that reuses call ids, cannot make an approved
 call that ran read as ended, nor end a later approval. A decision a person recorded that a resume

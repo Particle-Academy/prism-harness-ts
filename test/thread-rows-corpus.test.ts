@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { assistantRow, threadView, toolResultRow, type JsonObject } from '../src/index.js';
+import { endedByStartRow, pairStepApprovals } from '../src/thread-rows.js';
 
 /**
  * The cross-language thread-rows corpus from `prism-parity`.
@@ -12,7 +13,7 @@ import { assistantRow, threadView, toolResultRow, type JsonObject } from '../src
  */
 interface RowsCase {
   id: string;
-  input?: JsonObject & { write: 'assistant' | 'tool_result' };
+  input?: JsonObject & { write: 'assistant' | 'tool_result' | 'ended_by_start' };
   fold?: JsonObject[];
   rows: { php: string; ts: string; py: string };
   agrees: boolean;
@@ -27,6 +28,20 @@ function rowsFor(testCase: RowsCase): JsonObject[] {
   if (testCase.fold !== undefined) return threadView(testCase.fold);
 
   const input = testCase.input as unknown as Record<string, never>;
+
+  if (testCase.input?.write === 'ended_by_start') {
+    // The row a runner start writes when it ends the calls its child was
+    // parked on (G-387): the harness's own builder, each call paired with
+    // its OWN approval request by position (G-392), as the runtime pairs them.
+    const calls = input.tool_calls as JsonObject[];
+    const requests = input.approval_requests as JsonObject[];
+    return [
+      endedByStartRow(
+        calls.map((call) => ({ id: call.id as string, name: call.name as string, arguments: call.arguments as JsonObject, resultId: (call.result_id as string | undefined) ?? null })),
+        pairStepApprovals(calls, requests).approvalIds,
+      ) as unknown as JsonObject,
+    ];
+  }
 
   if (testCase.input?.write === 'assistant') {
     return [
@@ -61,9 +76,19 @@ function rowsFor(testCase: RowsCase): JsonObject[] {
   ];
 }
 
+/** Set to an absolute path to write what this port produces for every row (for the parity recorder). */
+const RECORD = process.env.HARNESS_THREAD_ROWS_RECORD;
+
 describe('harness-thread-rows corpus', () => {
+  if (RECORD !== undefined && RECORD !== '') {
+    it("records this port's rows", async () => {
+      const { writeFileSync } = await import('node:fs');
+      writeFileSync(RECORD, JSON.stringify(Object.fromEntries(corpus.cases.map((testCase) => [testCase.id, JSON.stringify(rowsFor(testCase))])), null, 2));
+    });
+  }
+
   it('is the whole suite, not a subset someone trimmed to green', () => {
-    expect(corpus.cases).toHaveLength(13);
+    expect(corpus.cases).toHaveLength(14);
   });
 
   it.each(corpus.cases.map((testCase) => [testCase.id, testCase] as const))('%s stores and replays the rows the corpus records for this port', (_id, testCase) => {

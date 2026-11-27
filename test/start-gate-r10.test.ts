@@ -871,14 +871,14 @@ describe('round 10: new channels considered', () => {
     const reply: JsonObject = { type: 'assistant', content: 'Done.' };
 
     // The call ran and its tool answered with the same words: not ended.
-    expect([...endedByStart([asked, result(endedByStartResult('echo')), reply])]).toEqual([]);
+    expect([...endedByStart([asked, result(endedByStartResult()), reply])]).toEqual([]);
     // Another tool's text, or a near copy: not ended.
-    expect([...endedByStart([asked, result(endedByStartResult('other')), user])]).toEqual([]);
-    expect([...endedByStart([asked, result(`${endedByStartResult('echo')} `), user])]).toEqual([]);
+    expect([...endedByStart([asked, result(endedByStartResult()), user])]).toEqual([]);
+    expect([...endedByStart([asked, result(`${endedByStartResult()} `), user])]).toEqual([]);
     // The same text right before a task row is NOT ended either (round 11):
     // only the harness's own mark makes a row the start's.
-    expect([...endedByStart([asked, result(endedByStartResult('echo')), user])]).toEqual([]);
-    const marked: JsonObject = { type: 'tool_result', tool_results: [{ tool_call_id: 'c1', tool_name: 'echo', result: endedByStartResult('echo'), not_run: 'delegation_ended', approval_id: 'apr_1' }], tool_approval_responses: [] };
+    expect([...endedByStart([asked, result(endedByStartResult()), user])]).toEqual([]);
+    const marked: JsonObject = { type: 'tool_result', tool_results: [{ tool_call_id: 'c1', tool_name: 'echo', result: endedByStartResult() }], tool_approval_responses: [], harness_ended_by_start: { approval_ids: ['apr_1'] } };
     expect([...endedByStart([asked, marked, user])]).toEqual(['apr_1']);
   });
 });
