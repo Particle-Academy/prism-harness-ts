@@ -18,9 +18,12 @@
   have run", never "not run", and is never denied by a later message. The
   replay gives any call of an earlier step with no stored result that
   interrupted result, so a provider request always answers every call.
-- A resume during which a tool's own `send()` parked a newer step for a
-  person stops with no model step and reports the newer step's approvals; it
-  never replaces that step.
+- A run during which a newer step on its session (a tool's own `send()`,
+  another run, a host) parked for a person takes no further model step: it
+  fails with the new code `parked_elsewhere`, having recorded what it ran,
+  and never replaces that step.
+- A result answers the first call of its step with no outcome, so two
+  identical calls answered by two rows each read answered.
 - The harness's marks, a request's binding included, are honoured only on
   rows the runtime itself wrote; a run id is never a trust signal.
 - A decision a tool records on its own session while its turn holds the

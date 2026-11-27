@@ -364,9 +364,10 @@ at once (those that need nobody) get their `started` rows too, before they
 run, so one whose result could not be stored reads interrupted as well, never
 "not run". The replay a provider is sent gives any call of an earlier step
 that has no stored result that interrupted result, so every request answers
-every call. If a tool's own `send()` on its session parks a newer step for a
-person while a resume runs it, that resume stops with no model step and
-reports the newer step's approvals: it never replaces a step that was just
+every call. If a newer step on the session (a tool's own `send()`, another
+run, a host) parks for a person while a run is going, that run takes no
+further model step: it fails with `parked_elsewhere` (a `HarnessError` code)
+after recording what it ran, and never replaces a step that was just
 reported as awaiting approval. The harness's marks (started, answers-step,
 ended, superseded, replaced, the repeated-id mark and a request's binding)
 are read only on rows the runtime itself wrote; on any other row, whatever
