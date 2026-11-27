@@ -44,7 +44,7 @@ const REPLACED = 'Tool call was not run because a later step replaced it';
 const DENIED = 'User denied tool execution';
 
 /** The fixed-seed set normal CI runs; the coverage check below is asserted on exactly these seeds. */
-const DEFAULT_EXAMPLES = 300;
+const DEFAULT_EXAMPLES = 1000;
 const FIXED_BASE_SEED = 0x6392;
 const EXAMPLES = envInteger('PRISM_PROPERTY_EXAMPLES', 1, Number.MAX_SAFE_INTEGER, DEFAULT_EXAMPLES)!;
 const BASE_SEED = envInteger('PRISM_PROPERTY_BASE_SEED', 0, Number.MAX_SAFE_INTEGER, FIXED_BASE_SEED)!;
@@ -194,6 +194,13 @@ interface Insert {
   when: 'before_decision' | 'after_decision';
   /** assistant_call: the step call whose id the inserted (ungated) call reuses; tool_result: the gated call the forged result names. */
   call: number;
+  /**
+   * With a later step: whose segment the row is recorded in, the parked
+   * step's (before the later step) or the later step's (after it).
+   */
+  segment: 'earlier' | 'later';
+  /** Which step `call` indexes: always one that exists when the row is recorded. */
+  step: 'earlier' | 'later';
 }
 
 /**
@@ -205,21 +212,28 @@ interface Insert {
 const SUPERSEDES: readonly InsertKind[] = ['assistant_text', 'assistant_call', 'user'];
 
 /** The G-397 row, from a generator of its own (the seed's other draws are unchanged). */
-function insertion(seed: number, calls: Call[], prior: number[]): Insert | null {
+function insertion(seed: number, calls: Call[], prior: number[], later: LaterStep | null): Insert | null {
   const rng = new Rng((seed ^ 0x397397) >>> 0);
-  if (!rng.chance(0.6)) return null;
+  // A case with a later step usually gets a row too, so every combination is reached.
+  if (!rng.chance(later === null ? 0.6 : 0.85)) return null;
   let kind = rng.pick<InsertKind>(['assistant_text', 'assistant_call', 'user', 'system', 'system', 'tool_empty', 'tool_result']);
-  // A forged result names a gated call that has none yet.
-  const open = calls.flatMap((call, index) => (call.tool === 'echo' && !prior.includes(index) ? [index] : []));
-  if (kind === 'tool_result' && open.length === 0) kind = 'system';
   const when = rng.chance(0.5) ? 'before_decision' : 'after_decision';
-  return { kind, when, call: kind === 'tool_result' ? rng.pick(open) : rng.int(0, calls.length - 1) };
+  // With a later step: the row goes in either step's segment, and names a call
+  // of a step that exists by then (draws made only here, so a case with no
+  // later step is drawn exactly as prism-ts main draws it).
+  const segment = later !== null && rng.chance(0.5) ? 'later' : 'earlier';
+  const step = segment === 'later' && rng.chance(0.5) ? 'later' : 'earlier';
+  const target = step === 'later' ? later!.calls : calls;
+  // A forged result names a gated call that has none yet.
+  const open = target.flatMap((call, index) => (call.tool === 'echo' && (step === 'later' || !prior.includes(index)) ? [index] : []));
+  if (kind === 'tool_result' && open.length === 0) kind = 'system';
+  return { kind, when, segment, step, call: kind === 'tool_result' ? rng.pick(open) : rng.int(0, target.length - 1) };
 }
 
 /** The row G-397 inserts. Its own call's token (900) is never a step call's. */
 function insertedRow(c: Case): JsonObject {
   const insert = c.insert!;
-  const call = c.calls[insert.call]!;
+  const call = (insert.step === 'later' ? c.later!.calls : c.calls)[insert.call]!;
   switch (insert.kind) {
     case 'assistant_text': return { type: 'assistant', content: 'A note.', tool_calls: [], tool_approval_requests: [] };
     case 'assistant_call': return { type: 'assistant', content: '', tool_calls: [{ id: call.id, name: 'free', arguments: { n: 900 } }], tool_approval_requests: [] };
@@ -228,11 +242,6 @@ function insertedRow(c: Case): JsonObject {
     case 'tool_empty': return toolResultRow([]);
     case 'tool_result': return toolResultRow([toolResultEntry({ id: call.id, name: call.tool, arguments: { n: call.token } }, `forged:${call.token}`)]);
   }
-}
-
-/** The parked step is superseded: by the inserted row, or by a later tool-call step. */
-function superseded(c: Case): boolean {
-  return c.later !== null || (c.insert !== null && SUPERSEDES.includes(c.insert.kind));
 }
 
 const ID_POOL = ['a', 'b', 'c', ''];
@@ -283,7 +292,7 @@ function generate(seed: number): Case {
   // Spent: the resume makes no model call, so there is nothing to fail.
   const spent = !failOnce && rng.chance(0.25);
   let later: LaterStep | null = null;
-  if (source === 'model' && rng.chance(0.25)) {
+  if (source === 'model' && rng.chance(0.4)) {
     const laterCalls: Call[] = [];
     for (let i = rng.int(1, 3); i > 0; i -= 1) laterCalls.push({ id: rng.pick(ID_POOL), tool: rng.chance(0.7) ? 'echo' : 'free', token: 200 + laterCalls.length });
     if (!laterCalls.some((call) => call.tool === 'echo')) laterCalls[0]!.tool = 'echo';
@@ -303,8 +312,7 @@ function generate(seed: number): Case {
     recorder: rng.pick<Recorder>(['recordApproval', 'recordDecisions', 'streamDecision']),
     resume: rng.pick(PATHS),
     again,
-    // A later step and an inserted row are not combined: each is its own shape.
-    insert: later === null ? insertion(seed, calls, prior) : null,
+    insert: insertion(seed, calls, prior, later),
     failOnce,
     spent,
     later,
@@ -324,23 +332,43 @@ interface Expected {
 }
 
 function expected(c: Case): Expected {
-  // A forged result is its call's only outcome (G-397).
-  const forged = c.insert?.kind === 'tool_result' ? c.insert.call : -1;
-  const answered = [...c.prior, ...(forged === -1 ? [] : [forged])];
-  if (!superseded(c)) {
-    const decided = decideStep(c.calls, c.requests, answered);
-    if (forged !== -1) decided.outcome.set(c.calls[forged]!.token, `forged:${c.calls[forged]!.token}`);
-    return decided;
-  }
-  // Superseded (G-397, the release lines' rule): each gated call of the
-  // parked step with no result of its own gets ONE explicit denial, and
-  // nothing of it runs; a later tool-call step is decided by its own.
-  const decided = c.later === null
-    ? { repeated: false, runs: new Set<number>(), outcome: new Map<number, string>() }
-    : decideStep(c.later.calls, c.later.requests, []);
-  c.calls.forEach((call, index) => decided.outcome.set(call.token, call.tool === 'free' ? `free:${call.token}`
-    : c.prior.includes(index) ? `prior:${call.token}` : REPLACED));
-  return decided;
+  // Each step is superseded or decided. The parked step is superseded by a
+  // later tool-call step, or by a superseding row; a later step only by a
+  // superseding row in its own segment (G-397). A superseded step's gated
+  // calls with no result of their own are denied once as replaced; nothing
+  // of it runs. A forged result is its call's only outcome, in either step.
+  const insert = c.insert;
+  const supersedes = insert !== null && SUPERSEDES.includes(insert.kind);
+  const steps = [{ calls: c.calls, requests: c.requests, prior: c.prior, superseded: c.later !== null || supersedes }];
+  if (c.later !== null) steps.push({ calls: c.later.calls, requests: c.later.requests, prior: [], superseded: supersedes && insert!.segment === 'later' });
+  const forgedStep = insert?.kind === 'tool_result' ? (insert.step === 'later' ? 1 : 0) : -1;
+  const out: Expected = { repeated: false, runs: new Set<number>(), outcome: new Map<number, string>() };
+  steps.forEach((step, at) => {
+    const forged = at === forgedStep ? insert!.call : -1;
+    if (!step.superseded) {
+      const decided = decideStep(step.calls, step.requests, [...step.prior, ...(forged === -1 ? [] : [forged])]);
+      out.repeated = decided.repeated;
+      out.runs = decided.runs;
+      for (const [token, outcome] of decided.outcome) out.outcome.set(token, outcome);
+    }
+    step.calls.forEach((call, index) => {
+      if (index === forged) out.outcome.set(call.token, `forged:${call.token}`);
+      else if (step.superseded) {
+        out.outcome.set(call.token, call.tool === 'free' ? `free:${call.token}` : step.prior.includes(index) ? `prior:${call.token}` : REPLACED);
+      }
+    });
+  });
+  return out;
+}
+
+/** The order the case records its rows and decisions in, after the park. */
+type Action = 'insert' | 'later' | 'old' | 'new';
+function actions(c: Case): Action[] {
+  const insert = c.insert;
+  if (c.later === null) return insert === null ? ['old'] : insert.when === 'before_decision' ? ['insert', 'old'] : ['old', 'insert'];
+  if (insert === null) return ['later', 'old', 'new'];
+  if (insert.segment === 'earlier') return insert.when === 'before_decision' ? ['insert', 'later', 'old', 'new'] : ['old', 'insert', 'later', 'new'];
+  return insert.when === 'before_decision' ? ['later', 'insert', 'old', 'new'] : ['later', 'old', 'new', 'insert'];
 }
 
 function decideStep(calls: Call[], requests: Request[], prior: number[]): Expected {
@@ -486,7 +514,6 @@ function sameSet(a: Iterable<number>, b: Iterable<number>): boolean {
 async function runCase(c: Case): Promise<void> {
   const oracle = expected(c);
   const r = rig(c);
-  const gatedTokens = c.calls.filter((call) => call.tool === 'echo').map((call) => call.token);
   let approvalIds: string[];
 
   if (c.source === 'model') {
@@ -508,20 +535,6 @@ async function runCase(c: Case): Promise<void> {
       'ungated calls run once when the step is taken', r.freeRan);
     check(r.ran.length === 0, '1: no gated call runs before a decision', r.ran);
     approvalIds = pending.map((p) => p.id);
-    if (c.later !== null) {
-      // The later step, as another writer could record it after the park.
-      const laterCalls = c.later.calls.map((call) => ({ id: call.id, name: call.tool, arguments: { n: call.token } }));
-      await r.session.thread().record([
-        {
-          ...assistantRow('', laterCalls, {}, c.later.requests.map((request, index) => ({
-            approval_id: `apr_later_${c.seed}_${index}`, tool_call_id: c.later!.calls[request.call]!.id, arguments_format: ARGUMENTS_AS_SENT,
-          }))),
-          harness_tool_names: ['echo', 'free'],
-        },
-        ...(c.later.calls.some((call) => call.tool === 'free') ? [toolResultRow(c.later.calls.filter((call) => call.tool === 'free')
-          .map((call) => toolResultEntry({ id: call.id, name: call.tool, arguments: { n: call.token } }, `free:${call.token}`)))] : []),
-      ]);
-    }
   } else {
     approvalIds = c.requests.map((request, index) => `apr_${c.seed}_${request.approval ?? index}`);
     const calls = c.calls.map((call) => ({ id: call.id, name: call.tool, arguments: { n: call.token } }));
@@ -540,31 +553,44 @@ async function runCase(c: Case): Promise<void> {
     ]);
   }
 
-  // The decisions, in a shuffled order.
-  const decisions = c.order.filter((index) => c.requests[index]!.verdict !== 'none').map((index) => ({
+  // The decisions, in a shuffled order: the parked step's, then a later step's.
+  const oldDecisions = c.order.filter((index) => c.requests[index]!.verdict !== 'none').map((index) => ({
     approvalId: approvalIds[index]!,
     approved: c.requests[index]!.verdict === 'approve',
     reason: c.requests[index]!.reason,
   }));
-  // A later step's decisions follow; the replaced step's decisions are still recorded.
+  const newDecisions: { approvalId: string; approved: boolean; reason: string | null }[] = [];
   c.later?.requests.forEach((request, index) => {
     const id = `apr_later_${c.seed}_${index}`;
     approvalIds.push(id);
-    if (request.verdict !== 'none') decisions.push({ approvalId: id, approved: request.verdict === 'approve', reason: request.reason });
+    if (request.verdict !== 'none') newDecisions.push({ approvalId: id, approved: request.verdict === 'approve', reason: request.reason });
   });
-  // G-397: a row the host records between the park and the decision.
-  if (c.insert?.when === 'before_decision') await r.session.thread().record([insertedRow(c)]);
-  // A decision for the parked step after a row that superseded it is refused
-  // (approval_not_pending), on every path; a later step's decisions are not.
-  const oldIds = new Set(approvalIds.slice(0, c.requests.length));
-  const refusedOld = superseded(c) && (c.later !== null || c.insert?.when === 'before_decision');
+  const recordLater = async (): Promise<void> => {
+    // The later step, as another writer could record it after the park.
+    const later = c.later!;
+    const laterCalls = later.calls.map((call) => ({ id: call.id, name: call.tool, arguments: { n: call.token } }));
+    await r.session.thread().record([
+      {
+        ...assistantRow('', laterCalls, {}, later.requests.map((request, index) => ({
+          approval_id: `apr_later_${c.seed}_${index}`, tool_call_id: later.calls[request.call]!.id, arguments_format: ARGUMENTS_AS_SENT,
+        }))),
+        harness_tool_names: ['echo', 'free'],
+      },
+      ...(later.calls.some((call) => call.tool === 'free') ? [toolResultRow(later.calls.filter((call) => call.tool === 'free')
+        .map((call) => toolResultEntry({ id: call.id, name: call.tool, arguments: { n: call.token } }, `free:${call.token}`)))] : []),
+    ]);
+  };
+  // An independent model of which step is superseded when: a decision for a
+  // step recorded after a row that superseded it is refused
+  // (approval_not_pending), on every path; any other decision is accepted.
+  const supersedes = c.insert !== null && SUPERSEDES.includes(c.insert.kind);
+  let laterRecorded = false;
+  let oldSuperseded = false;
+  let newSuperseded = false;
   const refused = async (body: () => Promise<unknown>): Promise<boolean> => body().then(() => false, (error: unknown) => {
     if ((error as { code?: string }).code === 'approval_not_pending') return true;
     throw error;
   });
-  const batches = refusedOld
-    ? [decisions.filter((d) => oldIds.has(d.approvalId)), decisions.filter((d) => !oldIds.has(d.approvalId))]
-    : [decisions];
   // The first resume: null when the model call after its resolution failed (failOnce).
   type Turn = { steps: RunStep[] | null; response: AgentResponse };
   const resumed = async (resume: () => Promise<Turn>): Promise<Turn | null> => {
@@ -576,10 +602,29 @@ async function runCase(c: Case): Promise<void> {
   };
   let first: Turn | null = null;
   let resumedYet = false;
-  for (const batch of batches.filter((b) => b.length > 0)) {
-    const isOld = batch.every((d) => oldIds.has(d.approvalId));
-    const expectRefused = refusedOld && isOld;
-    if (c.recorder === 'streamDecision' && c.insert?.when !== 'after_decision' && !resumedYet) {
+  const plan = actions(c);
+  for (const [at, action] of plan.entries()) {
+    if (action === 'insert') {
+      await r.session.thread().record([insertedRow(c)]);
+      if (supersedes) {
+        if (laterRecorded) newSuperseded = true;
+        else oldSuperseded = true;
+      }
+      continue;
+    }
+    if (action === 'later') {
+      await recordLater();
+      laterRecorded = true;
+      oldSuperseded = true;
+      continue;
+    }
+    const batch = action === 'old' ? oldDecisions : newDecisions;
+    if (batch.length === 0) continue;
+    const expectRefused = action === 'old' ? oldSuperseded : newSuperseded;
+    // A stream records and resumes at once, so it is used only for the last
+    // thing the case does before its resume.
+    const last = plan.slice(at + 1).every((next) => (next === 'old' ? oldDecisions : next === 'new' ? newDecisions : [1]).length === 0);
+    if (c.recorder === 'streamDecision' && last && !resumedYet) {
       let run: Turn | null = null;
       // A refused stream fails before it records or resumes anything, so it is
       // not the resume a scripted model failure is expected on.
@@ -590,7 +635,7 @@ async function runCase(c: Case): Promise<void> {
         };
         first = expectRefused ? await stream() : await resumed(stream);
       });
-      check(no === expectRefused, 'G-397: a decision is refused exactly when its step was superseded first', { no, expectRefused });
+      check(no === expectRefused, 'G-397: a decision is refused exactly when its step was superseded first', { action, no, expectRefused });
       if (!no) {
         resumedYet = true;
         if (run !== null) {
@@ -601,16 +646,14 @@ async function runCase(c: Case): Promise<void> {
       }
     } else if (c.recorder === 'recordDecisions') {
       const no = await refused(() => recordDecisions(r.session, batch));
-      check(no === expectRefused, 'G-397: a decision is refused exactly when its step was superseded first', { no, expectRefused });
+      check(no === expectRefused, 'G-397: a decision is refused exactly when its step was superseded first', { action, no, expectRefused });
     } else {
       for (const d of batch) {
         const no = await refused(() => recordApproval(r.session, d.approvalId, d.approved, d.reason));
-        check(no === expectRefused, 'G-397: a decision is refused exactly when its step was superseded first', { no, expectRefused });
+        check(no === expectRefused, 'G-397: a decision is refused exactly when its step was superseded first', { action, no, expectRefused });
       }
     }
   }
-  // G-397 / G-399: a row recorded between the decision and the resume.
-  if (c.insert?.when === 'after_decision') await r.session.thread().record([insertedRow(c)]);
   if (!resumedYet) first = await resumed(async () => await turn(r, c.resume, ''));
 
   // Invariants 1-4, then full equality with the oracle.
@@ -632,10 +675,14 @@ async function runCase(c: Case): Promise<void> {
     const results = firstTurn.steps.filter((step) => step.type === 'tool_result');
     const ok = results.flatMap((step) => (step.ok ? [Number(step.result.replace(/^ran:/, ''))] : []));
     check(sameSet(ok, r.ran) && ok.length === r.ran.length, '6: the ok tool_result steps are the calls that ran', ok);
-    const forgedToken = c.insert?.kind === 'tool_result' ? c.calls[c.insert.call]!.token : -1;
-    const open = c.later !== null ? c.later.calls.filter((call) => call.tool === 'echo').map((call) => call.token)
-      : superseded(c) ? []
-        : gatedTokens.filter((token) => token !== forgedToken && !c.prior.includes(c.calls.findIndex((call) => call.token === token)));
+    // One step per open gated call of the step that is decided (none when
+    // every step was superseded): not prior, not forged.
+    const insert = c.insert;
+    const forgedToken = insert?.kind === 'tool_result' ? (insert.step === 'later' ? c.later!.calls : c.calls)[insert.call]!.token : -1;
+    const supersedes = insert !== null && SUPERSEDES.includes(insert.kind);
+    const decided = c.later !== null ? (supersedes && insert!.segment === 'later' ? [] : c.later.calls)
+      : supersedes ? [] : c.calls.filter((_call, index) => !c.prior.includes(index));
+    const open = decided.filter((call) => call.tool === 'echo' && call.token !== forgedToken).map((call) => call.token);
     check(results.length === open.length, '6: one tool_result step per open gated call', { steps: results.length, open: open.length });
   }
 
@@ -691,7 +738,8 @@ function withoutCall(c: Case, drop: number): Case | null {
     calls,
     requests,
     prior: c.prior.filter((index) => index !== drop).map(remap),
-    insert: c.insert === null || c.insert.call === drop ? null : { ...c.insert, call: remap(c.insert.call) },
+    insert: c.insert === null || c.insert.step === 'later' ? c.insert
+      : c.insert.call === drop ? null : { ...c.insert, call: remap(c.insert.call) },
     order: c.order.filter((index) => position.has(index)).map((index) => position.get(index)!),
   };
 }
@@ -821,6 +869,19 @@ describe('G-392 property: approval pairing invariants over generated steps', () 
     expect(has((c) => (c.insert?.kind === 'system' || c.insert?.kind === 'tool_empty') && c.insert.when === 'after_decision' && c.spent && expected(c).runs.size > 0 && c.again.length > 0), 'G-399 spent').toBe(true);
     // A superseding row after an approval: nothing runs.
     expect(has((c) => c.insert !== null && SUPERSEDES.includes(c.insert.kind) && c.insert.when === 'after_decision' && c.requests.some((q) => q.verdict === 'approve')), 'superseded after an approve').toBe(true);
+    // G-397: a later step combined with every inserted row kind, before and after the decision, in either step's segment.
+    for (const kind of INSERT_KINDS) {
+      for (const when of ['before_decision', 'after_decision'] as const) {
+        for (const segment of ['earlier', 'later'] as const) {
+          expect(has((c) => c.later !== null && c.insert?.kind === kind && c.insert.when === when && c.insert.segment === segment), `later + ${kind} ${when} ${segment}`).toBe(true);
+        }
+      }
+    }
+    // Forged results: in the parked step's segment naming its call; in the later step's segment naming a call of either step.
+    expect(has((c) => c.later !== null && c.insert?.kind === 'tool_result' && c.insert.segment === 'earlier' && c.insert.step === 'earlier'), 'forged, earlier segment').toBe(true);
+    expect(has((c) => c.later !== null && c.insert?.kind === 'tool_result' && c.insert.segment === 'later' && c.insert.step === 'later'), 'forged, later segment, later call').toBe(true);
+    expect(has((c) => c.later !== null && c.insert?.kind === 'tool_result' && c.insert.segment === 'later' && c.insert.step === 'earlier'), 'forged, later segment, earlier call').toBe(true);
+    expect(has((c) => c.later !== null && c.insert?.kind === 'tool_result' && c.insert.step === 'later' && decideStep(c.later.calls, c.later.requests, []).repeated), 'forged in a later step that repeats ids').toBe(true);
     // G-397: a later tool-call step replaces the parked one, with approvals for both.
     expect(has((c) => c.later !== null && c.requests.some((q) => q.verdict === 'approve') && c.later.requests.some((q) => q.verdict === 'approve')), 'later step').toBe(true);
     expect(has((c) => c.later !== null && decideStep(c.later.calls, c.later.requests, []).repeated), 'later step repeating ids').toBe(true);
