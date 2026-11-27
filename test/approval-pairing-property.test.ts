@@ -213,6 +213,14 @@ interface Case {
    * reader), from the same generator.
    */
   forgedRunId?: boolean;
+  /**
+   * Round 17 (BRIEF-R17 item 1): while the FIRST approved call runs, the host
+   * records a user row or an assistant text row on the session (a person's
+   * message, a progress note), from a generator of its own (seed ^ 0x17017).
+   * It supersedes the step: the running call keeps its real result, and
+   * every other gated call with no outcome gets the replaced denial.
+   */
+  during?: 'user' | 'text';
 }
 
 type JunkKind = 'string' | 'number' | 'null' | 'strings' | 'scalar' | 'mixed' | 'copy' | 'both';
@@ -472,7 +480,35 @@ function generate(seed: number): Case {
   // The G-399 / item-5 shapes (a non-superseding row after the decision,
   // then a resume that runs a call) are kept exactly as drawn.
   if (REGRESSION_SEEDS.has(seed) || ((c.insert?.kind === 'system' || c.insert?.kind === 'tool_empty') && c.insert.when === 'after_decision')) return c;
-  return withJunk(withDuplicate(c));
+  return withDuring(withJunk(withDuplicate(c)));
+}
+
+/** Round 17: a row the host records while the first approved call runs (see Case.during). */
+function withDuring(c: Case): Case {
+  const rng = new Rng((c.seed ^ 0x17017) >>> 0);
+  if (!rng.chance(0.35) || c.source !== 'model' || c.later !== null) return c;
+  // On its own: no inserted row, no junk row, no duplicate (the oracle below
+  // models this one action).
+  const plain = c.dup === null ? c : withoutCall(c, c.dup);
+  if (plain === null) return c;
+  const bare: Case = { ...plain, insert: null, junk: null, dup: null, forgedRunId: undefined };
+  if (decideStep(bare.calls, bare.requests, bare.prior).repeated || !bare.requests.some((q) => q.verdict === 'approve')) return c;
+  return { ...bare, during: rng.chance(0.5) ? 'user' : 'text' };
+}
+
+/**
+ * The oracle with Case.during applied: the first approved call (in call
+ * order) runs and keeps its real result; the row it records supersedes the
+ * step, so every other gated call with no outcome gets the replaced denial
+ * and none of them runs.
+ */
+function withDuringOutcomes(c: Case, oracle: Expected): Expected {
+  if (c.during === undefined || oracle.runs.size === 0) return oracle;
+  const first = c.calls.find((call) => call.tool === 'echo' && oracle.runs.has(call.token))!;
+  const outcome = new Map<number, string[]>();
+  c.calls.forEach((call, index) => put(outcome, call.token, call.tool === 'free' ? `free:${call.token}`
+    : c.prior.includes(index) ? `prior:${call.token}` : call === first ? `ran:${call.token}` : REPLACED));
+  return { repeated: false, runs: new Set([first.token]), outcome };
 }
 
 /**
@@ -638,6 +674,8 @@ interface Rig {
   /** Token of every gated call that ran, in order, across the whole case. */
   ran: number[];
   freeRan: number[];
+  /** Every request the runtime SENT to the model (round 17: the replay is checked as sent). */
+  requests: LlmRequest[];
 }
 
 function rig(c: Case): Rig {
@@ -648,12 +686,24 @@ function rig(c: Case): Rig {
   const session = harness.for({ type: 'User', id: 1 }).session(`property-${c.seed}`);
   const ran: number[] = [];
   const freeRan: number[] = [];
+  const requests: LlmRequest[] = [];
+  let during = c.during;
   const tools = new ToolRegistry()
-    .register({ name: 'echo', handle: (args: JsonObject) => { ran.push(Number(args.n)); return `ran:${String(args.n)}`; } })
+    .register({ name: 'echo', handle: async (args: JsonObject) => {
+      ran.push(Number(args.n));
+      // Round 17: the host writes while this call runs (once).
+      if (during !== undefined) {
+        const row: JsonObject = during === 'user' ? { type: 'user', content: 'While it ran.' } : { type: 'assistant', content: 'A progress note.', tool_calls: [], tool_approval_requests: [] };
+        during = undefined;
+        await session.thread().record([row]);
+      }
+      return `ran:${String(args.n)}`;
+    } })
     .register({ name: 'free', handle: (args: JsonObject) => { freeRan.push(Number(args.n)); return `free:${String(args.n)}`; } });
   let served = c.source === 'stored';
   let failing = c.failOnce;
   const client = async (request: LlmRequest): Promise<LlmResponse> => {
+    requests.push(request);
     if (!served) {
       served = true;
       // G-405: an ANTHROPIC-shaped step keeps the model's text beside its
@@ -674,7 +724,7 @@ function rig(c: Case): Rig {
       : { text: '{"ok":true}', finishReason: 'stop', structured: { ok: true } };
   };
 
-  return { session, agent: new AgentRuntime({ client, modes: c.spent ? spentModes : modes, tools }), ran, freeRan };
+  return { session, agent: new AgentRuntime({ client, modes: c.spent ? spentModes : modes, tools }), ran, freeRan, requests };
 }
 
 async function drain(stream: AsyncGenerator<RunStep, AgentResponse, undefined>): Promise<{ steps: RunStep[]; response: AgentResponse }> {
@@ -775,7 +825,7 @@ function sameSet(a: Iterable<number>, b: Iterable<number>): boolean {
 }
 
 async function runCase(c: Case): Promise<void> {
-  const oracle = expected(c);
+  const oracle = withDuringOutcomes(c, expected(c));
   const r = rig(c);
   const gatedTokens = c.calls.filter((call) => call.tool === 'echo').map((call) => call.token);
   let approvalIds: string[];
@@ -994,6 +1044,7 @@ async function runCase(c: Case): Promise<void> {
   // is pending, by the reader every decision is checked against.
   check(pendingApprovalIds(await r.session.thread().readerRows()).length === 0, 'A: a pending approval names a call with no outcome', pendingApprovalIds(await r.session.thread().readerRows()));
   await replaySentAnswersEveryCall(r.session, c, '7b');
+  everySentRequestAnswersEveryCall(r, c, '7c');
 
   // Repeat resumes, with later decisions in between: nothing runs twice and
   // no outcome changes, and no result entry is written again (round 15).
@@ -1023,6 +1074,38 @@ async function runCase(c: Case): Promise<void> {
   if (c.source === 'stored') check(r.freeRan.length === 0, 'a stored ungated call with a result never runs', r.freeRan);
   await settledOutcomes(r, c, oracle, '5 (after repeat resumes)');
   await replayShowsEachResultOnce(r.session, '7 (after repeat resumes)');
+  everySentRequestAnswersEveryCall(r, c, '7c (after repeat resumes)');
+}
+
+/**
+ * Round 17's invariant on `messages` (BRIEF-R17 item 1): every call of every
+ * step is answered EXACTLY once in that step's OWN result run: the
+ * tool_result rows directly after it, before a row of any other kind.
+ */
+function answersInOwnRun(messages: readonly JsonObject[], c: Case, label: string): void {
+  const forged = c.insert?.kind === 'tool_result';
+  for (const [index, row] of messages.entries()) {
+    if (row.type !== 'assistant') continue;
+    const calls = ((row.tool_calls ?? []) as JsonObject[]);
+    if (calls.length === 0) continue;
+    const answers: string[] = [];
+    for (let at = index + 1; at < messages.length && messages[at]!.type === 'tool_result'; at += 1) {
+      for (const entry of (messages[at]!.tool_results ?? []) as JsonObject[]) answers.push(String(entry.tool_call_id));
+    }
+    const counts = new Map<string, number>();
+    for (const call of calls) counts.set(String(call.id), (counts.get(String(call.id)) ?? 0) + 1);
+    for (const [id, want] of counts) {
+      const got = answers.filter((answer) => answer === id).length;
+      // As 7b: identical calls may share one answer; a forged result answering no call may add one.
+      const ok = forged ? got >= want : want > 1 ? got >= 1 && got <= want : got === want;
+      check(ok, `${label}: every call is answered once, in its own step's result run`, { step: index, id, got, want, rows: messages.map((m) => m.type) });
+    }
+  }
+}
+
+/** Invariant 7c (round 17): every request the runtime actually SENT satisfies answersInOwnRun. */
+function everySentRequestAnswersEveryCall(r: Rig, c: Case, label: string): void {
+  r.requests.forEach((request, at) => answersInOwnRun(request.messages, c, `${label} (request ${at})`));
 }
 
 /**
@@ -1090,7 +1173,9 @@ async function replaySentAnswersEveryCall(session: Session, c: Case, label: stri
     const calls = ((row.tool_calls ?? []) as JsonObject[]);
     if (calls.length === 0) continue;
     const answers: string[] = [];
-    for (let at = index + 1; at < sent.length && sent[at]!.type !== 'assistant' && sent[at]!.type !== 'user'; at += 1) {
+    // Round 17 (BRIEF-R17 item 1): in the step's OWN result run, the
+    // tool_result rows directly after it, past no row of another kind.
+    for (let at = index + 1; at < sent.length && sent[at]!.type === 'tool_result'; at += 1) {
       for (const entry of (sent[at]!.tool_results ?? []) as JsonObject[]) answers.push(String(entry.tool_call_id));
     }
     const counts = new Map<string, number>();
@@ -1327,5 +1412,13 @@ describe('G-392 property: approval pairing invariants over generated steps', () 
     // into storage), and inserted rows carrying the parked step's own run id.
     for (const kind of ['string', 'mixed', 'copy', 'both'] as const) expect(has((c) => c.junk?.kind === kind && c.junk.raw === true && c.junk.requests), `raw junk ${kind} with the old requests`).toBe(true);
     for (const kind of ['user', 'assistant_text', 'assistant_call', 'tool_result', 'system'] as const) expect(has((c) => c.forgedRunId === true && c.insert?.kind === kind), `forged run id on a ${kind} row`).toBe(true);
+    // Round 17 (item 1): a user row and a text row written while an approved
+    // call runs, beside another gated call and beside an ungated one, and on
+    // every resume path.
+    for (const during of ['user', 'text'] as const) {
+      expect(has((c) => c.during === during && c.calls.filter((call) => call.tool === 'echo').length > 1), `${during} row while a call runs, beside another gated call`).toBe(true);
+      expect(has((c) => c.during === during && c.calls.some((call) => call.tool === 'free')), `${during} row while a call runs, beside an ungated call`).toBe(true);
+    }
+    for (const path of PATHS) expect(has((c) => c.during !== undefined && c.resume === path), `a row while a call runs, resumed by ${path}`).toBe(true);
   });
 });
