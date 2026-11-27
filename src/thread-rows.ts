@@ -380,55 +380,112 @@ export function isReplacedStepRow(row: JsonObject): boolean {
   return row.type === 'tool_result' && isObject(mark) && typeof mark.position === 'number';
 }
 
+/** A stored thread row and the run that recorded it. @internal */
+export type StoredRow = { position: number; message: JsonObject; runId: string | null };
+
 /**
- * The gated calls of every parked step a later tool-call step replaced that
- * have no result of their own (G-397), by the replaced step's thread
- * position. A call's own results are the ones recorded after its step and
- * before the next tool-call step; a step already answered as replaced is
- * left alone. A result names its call only by id, so for an id the step
- * repeats, only as many of its calls are open as results are missing: gated
- * calls first, the last ones first.
+ * The index of the row that SUPERSEDES the tool-call step at `index` of the
+ * stored rows (G-397), or -1 while it is not superseded:
  *
- * `gated` says which calls needed approval; a call with a request counts too.
+ * - any later assistant row WITH tool calls, always;
+ * - a later assistant row without tool calls, or a user row, recorded
+ *   OUTSIDE the runs that own the step: the run that recorded it and the
+ *   runs that recorded its results. Rows the runtime writes inside those
+ *   runs (a resume's answer, a structured turn's document) never supersede;
+ *   a row recorded with no run id, or under another run, does.
+ *
+ * Rows of any other kind (a system row, a tool result row) never supersede.
+ * This only decides how a step's open calls are labelled and whether a late
+ * decision is accepted: what can run is decided by the one step selector.
+ *
+ * @internal
+ */
+export function supersededAt(rows: readonly StoredRow[], index: number): number {
+  const owners = new Set<string>();
+  const own = rows[index]?.runId;
+  if (typeof own === 'string') owners.add(own);
+  for (let at = index + 1; at < rows.length; at += 1) {
+    const { message, runId } = rows[at]!;
+    if (message.type === 'assistant' && list(message.tool_calls).length > 0) return at;
+    if (message.type === 'tool_result' && typeof runId === 'string' && list(message.tool_results).length > 0) owners.add(runId);
+    if ((message.type === 'user' || message.type === 'assistant') && (typeof runId !== 'string' || !owners.has(runId))) return at;
+  }
+  return -1;
+}
+
+/**
+ * The positions, in `calls`, of the calls `entries` answer. An entry belongs
+ * to the call with its id AND the arguments it records (the harness copies a
+ * call's arguments into its result), so in a step that repeats an id a
+ * result still names one call; an entry whose arguments match no call with
+ * its id falls back to the last such call still unanswered.
+ *
+ * @internal
+ */
+export function answeredCalls(calls: readonly JsonObject[], entries: readonly JsonObject[]): Set<number> {
+  const answered = new Set<number>();
+  const args = (value: JsonValue | undefined): string => JSON.stringify(isObject(value) ? value : {});
+  for (const entry of entries) {
+    const id = text(entry.tool_call_id);
+    const candidates = calls.flatMap((call, index) => (text(call.id) === id && !answered.has(index) ? [index] : []));
+    const exact = candidates.find((index) => args(calls[index]!.arguments) === args(entry.args));
+    const at = exact ?? candidates.at(-1);
+    if (at !== undefined) answered.add(at);
+  }
+  return answered;
+}
+
+/**
+ * Every tool-call step that was SUPERSEDED (G-397) and still has gated calls
+ * with no result of their own, by the step's thread position, with those
+ * calls. A step is superseded as supersededAt() says. Its own results are the
+ * ones recorded after it and before the superseding row. A step already
+ * answered as replaced is left alone.
+ *
+ * `gated` says which calls needed approval; an ungated call counts only when
+ * a request names its id and no gated call shares that id.
  *
  * @internal
  */
 export function replacedStepCalls(
-  messages: readonly { position: number; message: JsonObject }[],
+  messages: readonly StoredRow[],
   gated: (name: string) => boolean,
 ): { position: number; calls: JsonObject[] }[] {
-  const steps: number[] = [];
-  for (const [index, { message }] of messages.entries()) {
-    if (message.type === 'assistant' && list(message.tool_calls).length > 0) steps.push(index);
-  }
-  const answered = new Set(messages.filter(({ message }) => isReplacedStepRow(message))
-    .map(({ message }) => (message[REPLACED_STEP_KEY] as JsonObject).position as number));
+  const rows = messages.map(({ message }) => message);
+  const answered = new Set(rows.filter((row) => isReplacedStepRow(row))
+    .map((row) => (row[REPLACED_STEP_KEY] as JsonObject).position as number));
   const replaced: { position: number; calls: JsonObject[] }[] = [];
-  for (let at = 0; at < steps.length - 1; at += 1) {
-    const { position, message: step } = messages[steps[at]!]!;
-    if (answered.has(position)) continue;
-    const own = messages.slice(steps[at]! + 1, steps[at + 1]!)
-      .filter(({ message }) => message.type === 'tool_result' && !isReplacedStepRow(message))
-      .flatMap(({ message }) => list(message.tool_results));
-    const requested = new Set(list(step.tool_approval_requests).map((request) => text(request.tool_call_id)));
+  for (const [index, step] of rows.entries()) {
+    if (step.type !== 'assistant' || list(step.tool_calls).length === 0) continue;
+    const end = supersededAt(messages, index);
+    const position = messages[index]!.position;
+    if (end === -1 || answered.has(position)) continue;
+    // Each row read on its own: folding the rows would merge results that
+    // share an id, and a step that repeats an id has one result per call.
+    const own = rows.slice(index + 1, end).flatMap((row) => threadView([row]))
+      .filter((row) => row.type === 'tool_result').flatMap((row) => list(row.tool_results));
     const calls = list(step.tool_calls);
-    const open = new Set<number>();
-    for (const id of new Set(calls.map((call) => text(call.id)))) {
-      const positions = calls.flatMap((call, index) => (text(call.id) === id ? [index] : []));
-      let missing = positions.length - own.filter((entry) => text(entry.tool_call_id) === id).length;
-      // Gated calls first, so an ungated call that shares the id (and ran
-      // when the step was taken) is never taken for the gated one.
-      for (const pass of [(name: string) => gated(name), () => requested.has(id)]) {
-        for (const index of [...positions].reverse()) {
-          if (missing <= 0) break;
-          if (!open.has(index) && pass(text(calls[index]!.name))) { open.add(index); missing -= 1; }
-        }
-      }
-    }
-    if (open.size > 0) replaced.push({ position, calls: calls.filter((_call, index) => open.has(index)) });
+    const done = answeredCalls(calls, own);
+    const requested = new Set(list(step.tool_approval_requests).map((request) => text(request.tool_call_id)));
+    const open = calls.filter((call, at) => !done.has(at) && (gated(text(call.name))
+      || (requested.has(text(call.id)) && !calls.some((other) => other.id === call.id && gated(text(other.name))))));
+    if (open.length > 0) replaced.push({ position, calls: open });
   }
 
   return replaced;
+}
+
+/**
+ * Whether a decision for `approvalId` can no longer be acted on because the
+ * step that asked for it was superseded (G-397): a decision recorded after
+ * the superseding row never runs anything, so it is refused.
+ *
+ * @internal
+ */
+export function approvalSuperseded(messages: readonly StoredRow[], approvalId: string): boolean {
+  return messages.some(({ message }, index) => message.type === 'assistant'
+    && list(message.tool_approval_requests).some((request) => request.approval_id === approvalId)
+    && supersededAt(messages, index) !== -1);
 }
 
 function list(value: JsonValue | undefined): JsonObject[] {

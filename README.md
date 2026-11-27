@@ -308,6 +308,13 @@ A call that has a result never runs again. Who may approve is your application's
 decision: authorize before calling `recordApproval()`. `recordDecisions(session,
 [{ approvalId, approved, reason }])` records several decisions as one row.
 
+A paused step is replaced when a later step with tool calls is recorded after
+it, or when your application records a user or assistant message on the thread
+outside the run that paused. Each of its calls that has no result is then
+answered with "Tool call was not run because a later step replaced it", and
+none of them runs. A decision recorded for a replaced step is refused with
+`approval_not_pending`, and nothing is recorded.
+
 ## Run steps for a UI
 
 `streamSteps()` takes the same arguments as `send()` and yields run steps as the

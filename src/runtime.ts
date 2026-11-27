@@ -18,6 +18,9 @@ import {
   REPEATED_CALL_ID_RESULT,
   replacedStepCalls,
   isReplacedStepRow,
+  supersededAt,
+  answeredCalls,
+  approvalSuperseded,
   REPLACED_STEP_KEY,
   REPLACED_STEP_RESULT,
   ARGUMENTS_AS_SENT,
@@ -970,13 +973,18 @@ export class AgentRuntime {
     while (stored >= 0 && !(rows[stored]!.type === 'assistant' && Array.isArray(rows[stored]!.tool_calls) && (rows[stored]!.tool_calls as JsonValue[]).length > 0)) stored -= 1;
     const storedResults = rows.slice(stored + 1).filter((row) => row.type === 'tool_result' && !isReplacedStepRow(row))
       .flatMap((row) => (Array.isArray(row.tool_results) ? row.tool_results : []) as JsonObject[]);
-    const settled = (id: string): boolean => storedResults.filter((entry) => entry.tool_call_id === id).length
-      >= assistant.tool_calls.filter((call) => call.id === id).length;
-    const calls = repeated
-      ? assistant.tool_calls.filter((call) => mode.needsApproval(call.name) && !settled(call.id))
-      : assistant.tool_calls.filter(
-        (call) => !results.has(call.id) && (approvalIds.has(call.id) || mode.needsApproval(call.name)),
-      );
+    // In a step that repeats an id, a result is matched to its call by id and
+    // the arguments it records, never by id alone (G-392, G-397).
+    const done = answeredCalls(assistant.tool_calls as unknown as JsonObject[], storedResults);
+    // A superseded step is never resolved here: it is answered as replaced
+    // (G-397), and nothing of it runs.
+    const calls = stored >= 0 && supersededAt(messages, stored) !== -1
+      ? []
+      : repeated
+        ? assistant.tool_calls.filter((call, at) => mode.needsApproval(call.name) && !done.has(at))
+        : assistant.tool_calls.filter(
+          (call) => !results.has(call.id) && (approvalIds.has(call.id) || mode.needsApproval(call.name)),
+        );
 
     return calls.length === 0 && replaced.length === 0 ? null : { calls, results, decisions, approvalIds, repeated, replaced, scope: approvalToolScope(rows), unusable: unusableStoredCalls(rows), ambiguous: ambiguousCalls(assistant) };
   }
@@ -1158,6 +1166,12 @@ export async function recordDecisions(session: Session, decisions: readonly Appr
 
 /** Where decisions are made durable, for every path that takes them. */
 async function writeDecisions(session: Session, decisions: readonly ApprovalDecision[]): Promise<void> {
+  // A decision for a step that was superseded is refused before anything is
+  // written: it could never run anything (G-397).
+  const messages = await session.thread().messages();
+  for (const decision of decisions) {
+    if (approvalSuperseded(messages, decision.approvalId)) throw HarnessError.approvalNotPending(decision.approvalId);
+  }
   const run = await session.run();
 
   await session.thread().record([toolResultRow([], decisions.map((decision) => ({
