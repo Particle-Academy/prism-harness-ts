@@ -28,6 +28,8 @@ interface PairingCase {
   title: string;
   calls: { id: string; name: string; args: JsonObject }[];
   rounds: [number, boolean][][];
+  /** DECISION B (0.2.0): what supersedes the parked step, after the park and before the rounds. */
+  supersede?: 'assistant_tool_step' | 'assistant_text' | 'user' | 'new_message';
   expected: unknown;
 }
 
@@ -71,6 +73,12 @@ async function record(row: PairingCase): Promise<unknown> {
   const runtime = new AgentRuntime({ client, modes, tools });
 
   const pending = (await runtime.send(session, 'go')).pendingApprovals;
+  // DECISION B (0.2.0): a row that supersedes the parked step, recorded by a
+  // host (outside the run that owns the step), or a new message.
+  if (row.supersede === 'assistant_tool_step') await session.thread().record([{ type: 'assistant', content: '', tool_calls: [{ id: 'later', name: 'free', arguments: {} }], tool_approval_requests: [] }]);
+  if (row.supersede === 'assistant_text') await session.thread().record([{ type: 'assistant', content: 'A later answer.', tool_calls: [], tool_approval_requests: [] }]);
+  if (row.supersede === 'user') await session.thread().record([{ type: 'user', content: 'A later message.' }]);
+  if (row.supersede === 'new_message') await runtime.send(session, 'Something else.');
   for (const round of row.rounds) {
     try {
       await recordDecisions(session, round.map(([index, approved]) => ({ approvalId: pending[index]!.id, approved })));
@@ -91,7 +99,26 @@ async function record(row: PairingCase): Promise<unknown> {
     }
   }
 
-  return { approvals: pending.length, free, ran: [...ran].sort((a, b) => a - b), decided: pending.map((approval) => recorded.get(approval.id) ?? null) };
+  const outcome: Record<string, unknown> = { approvals: pending.length, free, ran: [...ran].sort((a, b) => a - b), decided: pending.map((approval) => recorded.get(approval.id) ?? null) };
+  if (row.supersede !== undefined) {
+    // The FIRST result each call of the first step ended with, in call
+    // order, or null (rows with `supersede` only).
+    const first = new Map<string, string>();
+    let after = false;
+    for (const { message } of await session.thread().messages()) {
+      if (!after) {
+        after = message.type === 'assistant' && Array.isArray(message.tool_calls) && message.tool_calls.length > 0;
+        continue;
+      }
+      if (message.type !== 'tool_result') continue;
+      for (const entry of (message.tool_results ?? []) as JsonObject[]) {
+        if (!first.has(entry.tool_call_id as string)) first.set(entry.tool_call_id as string, entry.result as string);
+      }
+    }
+    outcome.outcomes = row.calls.map((call) => first.get(call.id) ?? null);
+  }
+
+  return outcome;
 }
 
 /** Set to an absolute path to write what this port measures for every row (for the parity recorder). */

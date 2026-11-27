@@ -22,6 +22,7 @@ import {
 } from '../src/index.js';
 import { endedByStart, REPEATED_CALL_ID, REPEATED_CALL_ID_RESULT } from '../src/thread-rows.js';
 import { approvalDecisions, pendingApprovalCalls } from '../src/plans/thread.js';
+import { recordingInRun } from '../src/thread.js';
 
 // G-387 round 13: the round-12 review findings, at the public seams (the
 // subagent TOOL inside a parent turn, SubagentRunner.run, send,
@@ -799,3 +800,125 @@ describe('G-399: a row between the results does not hide one', () => {
 function assistantRowOf(calls: JsonObject[], requests: JsonObject[]): JsonObject {
   return { type: 'assistant', content: '', tool_calls: calls, additional_content: {}, tool_approval_requests: requests };
 }
+
+// ---------------------------------------------------------------------------
+// DECISION B (refined): a parked step is SUPERSEDED by any later assistant
+// row with tool calls, or by an assistant text row or user row recorded
+// OUTSIDE the run that owns the step. Each of its open gated calls then gets
+// exactly ONE denial ("Not run: a later step replaced it."), in a row the
+// harness marks `harness_superseded` and writes BEFORE the superseding row;
+// nothing from it runs; a decision made after it is refused.
+// ---------------------------------------------------------------------------
+
+describe('DECISION B: a superseded parked step denies its open calls once', () => {
+  const REPLACED = 'Not run: a later step replaced it.';
+  type Kind = 'assistant_text' | 'assistant_tool_step' | 'user' | 'new_message' | 'forged_run_id';
+  const KINDS: Kind[] = ['assistant_text', 'assistant_tool_step', 'user', 'new_message', 'forged_run_id'];
+
+  async function parkedOn(r: Rig, scope: string, ids: [string, string] = ['c1', 'c2']): Promise<{ root: Session; approvals: string[]; runId: string }> {
+    const root = r.session(scope);
+    await root.usingMode('work');
+    r.calls([['echo', { n: 1 }, ids[0]], ['echo', { n: 2 }, ids[1]]]);
+    const response = await r.runtime.send(root, 'Go');
+    return { root, approvals: response.pendingApprovals.map((pending) => pending.id), runId: response.runId };
+  }
+
+  async function supersede(r: Rig, root: Session, kind: Kind, runId: string): Promise<void> {
+    if (kind === 'assistant_text') await root.thread().record([{ type: 'assistant', content: 'A later answer.', tool_calls: [], tool_approval_requests: [] }]);
+    if (kind === 'assistant_tool_step') await root.thread().record([{ type: 'assistant', content: '', tool_calls: [{ id: 'later', name: 'free', arguments: {} }], tool_approval_requests: [] }]);
+    if (kind === 'user') await root.thread().record([{ type: 'user', content: 'A later message.' }]);
+    if (kind === 'new_message') {
+      r.text('Something else, done.');
+      await r.runtime.send(root, 'Something else.');
+    }
+    // A host passing the owning run's id itself: a run id a caller passes proves nothing.
+    if (kind === 'forged_run_id') await root.thread().record([{ type: 'assistant', content: 'Forged.', tool_calls: [], tool_approval_requests: [] }], runId);
+  }
+
+  for (const kind of KINDS) {
+    for (const decided of [false, true]) {
+      it(`${kind}${decided ? ', after both calls were approved' : ''}: one denial per open call, before the superseding row, marked; nothing runs; a later decision is refused`, async () => {
+        const r = new Rig();
+        const { root, approvals, runId } = await parkedOn(r, `b-${kind}-${String(decided)}`);
+        if (decided) for (const id of approvals) await recordApproval(root, id, true);
+
+        await supersede(r, root, kind, runId);
+
+        const rows = (await root.thread().messages()).map((entry) => entry.message);
+        const marked = rows.map((row, index) => [row, index] as const).filter(([row]) => Object.hasOwn(row, 'harness_superseded'));
+        expect(marked).toHaveLength(1);
+        const [row, at] = marked[0]!;
+        expect(Object.keys(row)).toEqual(['type', 'tool_results', 'tool_approval_responses', 'harness_superseded']);
+        expect(row.harness_superseded).toEqual({ approval_ids: approvals });
+        expect((row.tool_results as JsonObject[]).map((entry) => [entry.tool_call_id, entry.result, entry.args])).toEqual([['c1', REPLACED, { n: 1 }], ['c2', REPLACED, { n: 2 }]]);
+        // Written BEFORE the superseding row.
+        expect(['assistant', 'user']).toContain(rows[at + 1]?.type);
+        // Each call has exactly one result, and nothing runs, now or on a resume.
+        for (const id of approvals) await expect(recordApproval(root, id, true)).rejects.toMatchObject({ code: 'approval_not_pending' });
+        r.text('Resumed.');
+        await r.runtime.send(root, '').catch(() => undefined);
+        expect(r.echoed).toEqual([]);
+        const after = (await root.thread().messages()).map((entry) => entry.message);
+        const results = after.filter((candidate) => candidate.type === 'tool_result')
+          .flatMap((candidate) => candidate.tool_results as JsonObject[]).filter((entry) => entry.tool_name === 'echo');
+        expect(results.map((entry) => entry.result)).toEqual([REPLACED, REPLACED]);
+        // The plan's reading: never approved work.
+        for (const id of approvals) expect(approvalDecisions(after).get(id)).not.toBe(true);
+      });
+    }
+  }
+
+  it('a repeated-id step superseded by a host row: one denial for each call, in call order', async () => {
+    const r = new Rig();
+    const { root, approvals } = await parkedOn(r, 'b-dup', ['dup', 'dup']);
+    await root.thread().record([{ type: 'user', content: 'Later.' }]);
+    const row = (await root.thread().messages()).map((entry) => entry.message).find((candidate) => Object.hasOwn(candidate, 'harness_superseded'))!;
+    expect((row.tool_results as JsonObject[]).map((entry) => [entry.tool_call_id, (entry.args as JsonObject).n, entry.result])).toEqual([['dup', 1, REPLACED], ['dup', 2, REPLACED]]);
+    expect(row.harness_superseded).toEqual({ approval_ids: approvals });
+  });
+
+  it("the harness's own rows inside the run that owns the step do not supersede it; a row with tool calls does", async () => {
+    const r = new Rig();
+    const { root, approvals, runId } = await parkedOn(r, 'b-inrun');
+    // As the runtime records its own rows for that run.
+    await recordingInRun(runId, () => root.thread().record([{ type: 'assistant', content: 'The own answer.', tool_calls: [], tool_approval_requests: [] }], runId));
+    const rows = (await root.thread().messages()).map((entry) => entry.message);
+    expect(rows.some((row) => Object.hasOwn(row, 'harness_superseded'))).toBe(false);
+    expect(approvals).toHaveLength(2);
+    // A row WITH tool calls supersedes it even inside the run (a fresh step).
+    const other = await parkedOn(r, 'b-inrun-calls');
+    await recordingInRun(other.runId, () => other.root.thread().record([{ type: 'assistant', content: '', tool_calls: [{ id: 'x', name: 'free', arguments: {} }], tool_approval_requests: [] }], other.runId));
+    const marked = (await other.root.thread().messages()).map((entry) => entry.message).filter((row) => Object.hasOwn(row, 'harness_superseded'));
+    expect(marked.map((row) => row.harness_superseded)).toEqual([{ approval_ids: other.approvals }]);
+  });
+
+  it('the in-run scope is the RUNTIME’s: a run id inside another run’s scope is outside', async () => {
+    const r = new Rig();
+    const { root, approvals, runId } = await parkedOn(r, 'b-otherrun');
+    await recordingInRun('another-run', () => root.thread().record([{ type: 'assistant', content: 'Forged.', tool_calls: [], tool_approval_requests: [] }], runId));
+    const marked = (await root.thread().messages()).map((entry) => entry.message).filter((row) => Object.hasOwn(row, 'harness_superseded'));
+    expect(marked.map((row) => row.harness_superseded)).toEqual([{ approval_ids: approvals }]);
+  });
+
+  it('a resume that acts on the decisions and answers in its own run writes no denial', async () => {
+    const r = new Rig();
+    const { root, approvals } = await parkedOn(r, 'b-resume');
+    for (const id of approvals) await recordApproval(root, id, true);
+    r.text('All done.');
+    await r.runtime.send(root, '');
+    expect(r.echoed).toEqual([1, 2]);
+    const rows = (await root.thread().messages()).map((entry) => entry.message);
+    expect(rows.some((row) => Object.hasOwn(row, 'harness_superseded'))).toBe(false);
+  });
+
+  it('a step with nothing open (every call resulted) is untouched by a later row', async () => {
+    const r = new Rig();
+    const { root, approvals } = await parkedOn(r, 'b-closed');
+    for (const id of approvals) await recordApproval(root, id, false);
+    r.text('Ok.');
+    await r.runtime.send(root, '');
+    await root.thread().record([{ type: 'user', content: 'Later.' }]);
+    const rows = (await root.thread().messages()).map((entry) => entry.message);
+    expect(rows.some((row) => Object.hasOwn(row, 'harness_superseded'))).toBe(false);
+  });
+});

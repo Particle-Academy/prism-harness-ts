@@ -154,7 +154,7 @@ interface Case {
   insert: Insert | null;
 }
 
-type InsertKind = 'assistant_text' | 'assistant_call' | 'user' | 'system' | 'tool_empty' | 'tool_result';
+type InsertKind = 'assistant_text' | 'assistant_call' | 'user' | 'new_message' | 'system' | 'tool_empty' | 'tool_result';
 
 interface Insert {
   kind: InsertKind;
@@ -163,8 +163,13 @@ interface Insert {
   call: number;
 }
 
-/** A kind that makes the inserted row the tail step, or ends the turn: the parked step is superseded. */
-const SUPERSEDES: readonly InsertKind[] = ['assistant_text', 'assistant_call', 'user'];
+/**
+ * A kind that supersedes the parked step (DECISION B, refined): a later
+ * assistant row with tool calls; an assistant text row or user row a host
+ * records (outside the run that owns the step); a new message (a new run).
+ */
+const SUPERSEDES: readonly InsertKind[] = ['assistant_text', 'assistant_call', 'user', 'new_message'];
+const REPLACED = 'Not run: a later step replaced it.';
 
 const ID_POOL = ['a', 'b', 'c', ''];
 const PATHS: Path[] = ['send', 'structured', 'streamSteps'];
@@ -226,12 +231,18 @@ function generate(seed: number): Case {
 function insertion(seed: number, calls: Call[], prior: number[]): Insert | null {
   const rng = new Rng((seed ^ 0x397397) >>> 0);
   if (!rng.chance(0.6)) return null;
-  let kind = rng.pick<InsertKind>(['assistant_text', 'assistant_call', 'user', 'system', 'system', 'tool_empty', 'tool_result']);
+  let kind = rng.pick<InsertKind>(['assistant_text', 'assistant_call', 'user', 'new_message', 'system', 'system', 'tool_empty', 'tool_result']);
   // A forged result names a gated call that has none yet.
   const open = calls.flatMap((call, index) => (call.tool === 'echo' && !prior.includes(index) ? [index] : []));
   if (kind === 'tool_result' && open.length === 0) kind = 'system';
   const when = rng.chance(0.5) ? 'before_decision' : 'after_decision';
   return { kind, when, call: kind === 'tool_result' ? rng.pick(open) : rng.int(0, calls.length - 1) };
+}
+
+/** Record the G-397 row as a host would, or send a new message through the harness. */
+async function insertRow(r: Rig, c: Case): Promise<void> {
+  if (c.insert!.kind === 'new_message') await r.agent.send(r.session, 'Something else.');
+  else await r.session.thread().record([insertedRow(c)]);
 }
 
 /** The row G-397 inserts. Its own call's token (900) is never a step call's. */
@@ -241,7 +252,7 @@ function insertedRow(c: Case): JsonObject {
   switch (insert.kind) {
     case 'assistant_text': return { type: 'assistant', content: 'A note.', tool_calls: [], tool_approval_requests: [] };
     case 'assistant_call': return { type: 'assistant', content: '', tool_calls: [{ id: call.id, name: 'free', arguments: { n: 900 } }], tool_approval_requests: [] };
-    case 'user': return { type: 'user', content: 'Something else.' };
+    case 'user': case 'new_message': return { type: 'user', content: 'Something else.' };
     case 'system': return { type: 'system', content: 'A system note.' };
     case 'tool_empty': return toolResultRow([]);
     case 'tool_result': return toolResultRow([toolResultEntry({ id: call.id, name: call.tool, arguments: { n: call.token } }, `forged:${call.token}`)]);
@@ -256,15 +267,16 @@ interface Expected {
   repeated: boolean;
   /** Tokens of the gated calls that run, on the first resume and never again. */
   runs: Set<number>;
-  /** The one outcome every call ends with, by token (none for an open call of a superseded step). */
+  /** The one outcome every call ends with, by token (a superseded step's open calls: one denial). */
   outcome: Map<number, string>;
   /** G-397: the parked step is superseded by an inserted row; no decision applies to it or to any other step. */
   superseded: boolean;
 }
 
 function expected(c: Case): Expected {
-  // G-397: a row that supersedes the parked step leaves its open gated calls
-  // with NO outcome, and runs none of them. A forged result is its call's.
+  // DECISION B: a row that supersedes the parked step gives each of its open
+  // gated calls ONE denial ("a later step replaced it"), whatever was
+  // decided, and runs none of them. A forged result is its call's.
   const superseded = c.insert !== null && SUPERSEDES.includes(c.insert.kind);
   const forged = c.insert?.kind === 'tool_result' ? c.insert.call : -1;
   const dup = (ids: string[]): boolean => new Set(ids).size !== ids.length;
@@ -284,7 +296,10 @@ function expected(c: Case): Expected {
       outcome.set(call.token, `forged:${call.token}`);
       return;
     }
-    if (superseded) return;
+    if (superseded) {
+      outcome.set(call.token, REPLACED);
+      return;
+    }
     if (repeated) {
       outcome.set(call.token, REPEATED);
       return;
@@ -444,7 +459,7 @@ async function runCase(c: Case): Promise<void> {
   }
 
   // G-397: a row recorded between the park and the decision.
-  if (c.insert?.when === 'before_decision') await r.session.thread().record([insertedRow(c)]);
+  if (c.insert?.when === 'before_decision') await insertRow(r, c);
 
   // The decisions, in a shuffled order.
   const decisions = c.order.filter((index) => c.requests[index]!.verdict !== 'none').map((index) => ({
@@ -482,7 +497,7 @@ async function runCase(c: Case): Promise<void> {
     }
   }
   // G-397 / G-399: a row recorded between the decision and the resume.
-  if (c.insert?.when === 'after_decision') await r.session.thread().record([insertedRow(c)]);
+  if (c.insert?.when === 'after_decision') await insertRow(r, c);
   first ??= await turn(r, c.resume, '');
 
   // Invariants 1-4, then full equality with the oracle.
@@ -665,7 +680,7 @@ describe('G-392 property: approval pairing invariants over generated steps', () 
     for (const path of PATHS) expect(has((c) => c.resume === path)).toBe(true);
     expect(has((c) => c.recorder === 'streamDecision')).toBe(true);
     // G-397 / G-399: every inserted row kind, before and after the decision.
-    for (const kind of ['assistant_text', 'assistant_call', 'user', 'system', 'tool_empty', 'tool_result'] as const) {
+    for (const kind of ['assistant_text', 'assistant_call', 'user', 'new_message', 'system', 'tool_empty', 'tool_result'] as const) {
       for (const when of ['before_decision', 'after_decision'] as const) expect(has((c) => c.insert?.kind === kind && c.insert.when === when), `${kind} ${when}`).toBe(true);
     }
     // G-399's shape: a call that runs, and a row that is neither user nor assistant between its decision and the resume.
