@@ -635,7 +635,9 @@ export function replayRows(messages: readonly StoredRow[]): JsonObject[] {
  * So an assistant row a host recorded (not the harness) keeps its provider
  * content ONLY when it is that row's own: its tool items are the row's tool
  * calls exactly (id and name, as a multiset), its text is the row's content,
- * read as prism-ts reads it, and it carries no reasoning (OpenAI reasoning
+ * read as prism-ts reads it, its content_blocks hold no 'fallback' block
+ * (prism-ts sends a different set of blocks from one on), and it carries no
+ * reasoning (OpenAI reasoning
  * items; Anthropic thinking, thinking_signature, thinking_blocks, or
  * thinking and redacted_thinking blocks), which cannot be checked. Otherwise
  * all of those keys are dropped and the client maps the row from `content`
@@ -654,8 +656,12 @@ function withoutHostToolItems(row: JsonObject, harness: true | undefined): JsonO
     !outputItems.some((item) => isObject(item) && item.type === 'function_call_output')
     && callPrints(outputItems.filter(isObject).filter((item) => item.type === 'function_call').map((item) => [text(item.id), text(item.name)])) === own
     && openaiText(outputItems) === content);
+  // A fallback block changes which blocks prism-ts sends (from the last one
+  // on, every block; before it, no tool_use), so blocks that hold one are not
+  // judged: they are never the host's own content to send.
   const anthropicOwn = !Array.isArray(contentBlocks) || (
-    callPrints(contentBlocks.filter(isObject).filter((block) => block.type === 'tool_use').map((block) => [text(block.id), text(block.name)])) === own
+    !contentBlocks.some((block) => isObject(block) && block.type === 'fallback')
+    && callPrints(contentBlocks.filter(isObject).filter((block) => block.type === 'tool_use').map((block) => [text(block.id), text(block.name)])) === own
     && contentBlocks.filter(isObject).filter((block) => block.type === 'text').map((block) => (typeof block.text === 'string' ? block.text : '')).join('') === content);
   // Reasoning cannot be checked against the row, so a host row carrying any
   // is never the host's own content to send.
