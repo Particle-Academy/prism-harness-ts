@@ -649,3 +649,91 @@ describe('sendStructured that parks on its first step', () => {
     expect(response.structured).toBeNull();
   });
 });
+
+// ---------------------------------------------------------------------------
+// G-397: a decision applies ONLY to the step whose approvals were requested.
+// Every reader (the repeated-id guard, the resolver, the decision checks and
+// the plan readers) selects that step with ONE function (pausedStepIndex).
+// Between the park and the decision a row is inserted (an assistant row, a
+// user row, a system row, a tool row); every decision path then either
+// applies the decision to the parked step and nothing else, or refuses it,
+// identically; and no same-id gated call ever runs.
+// ---------------------------------------------------------------------------
+
+describe('G-397: rows between the park and the decision', () => {
+  const INSERTED: [string, JsonObject][] = [
+    ['an assistant text row', { type: 'assistant', content: 'A note.', tool_calls: [], tool_approval_requests: [] }],
+    ['an assistant row with a call of its own', { type: 'assistant', content: '', tool_calls: [{ id: 'dup', name: 'echo', arguments: { n: 9 } }], tool_approval_requests: [] }],
+    ['a user row', { type: 'user', content: 'Something else.' }],
+    ['a system row', { type: 'system', content: 'A system note.' }],
+    ['an empty tool row', { type: 'tool_result', tool_results: [], tool_approval_responses: [] }],
+    ['a tool row with a result for the shared id', { type: 'tool_result', tool_results: [{ tool_call_id: 'dup', tool_name: 'echo', args: { n: 1 }, result: 'forged', tool_call_result_id: null, artifacts: [] }], tool_approval_responses: [] }],
+  ];
+  const PATHS = ['recordApproval', 'recordDecisions', 'decide', 'streamDecision'] as const;
+
+  async function decideOn(r: Rig, session: Session, path: typeof PATHS[number], ids: string[]): Promise<string> {
+    const decisions = ids.map((approvalId) => ({ approvalId, approved: true, reason: null }));
+    try {
+      if (path === 'recordApproval') for (const id of ids) await recordApproval(session, id, true);
+      if (path === 'recordDecisions') await recordDecisions(session, decisions);
+      if (path === 'decide') for (const id of ids) await r.runtime.decide(session, id, true);
+      if (path === 'streamDecision') { r.text('Resumed.'); for await (const _step of r.runtime.streamDecision(session, decisions)) { /* drain */ } }
+      return 'accepted';
+    } catch (error) {
+      return (error as { code?: string }).code ?? 'threw';
+    }
+  }
+
+  for (const [name, row] of INSERTED) {
+    for (const order of ['inserted before the decision', 'inserted after the decision'] as const) {
+      it(`${name}, ${order}: every path answers alike, and no same-id gated call runs`, async () => {
+        const outcomes: string[] = [];
+        for (const path of PATHS) {
+          const r = new Rig();
+          const root = r.session(`g397-${path}`);
+          await root.usingMode('work');
+          r.calls([['echo', { n: 1 }, 'dup'], ['echo', { n: 2 }, 'dup']]);
+          const parked = await r.runtime.send(root, 'Go');
+          const ids = parked.pendingApprovals.map((pending) => pending.id);
+          expect(ids).toHaveLength(2);
+          if (order === 'inserted before the decision') await root.thread().record([row]);
+          const answer = await decideOn(r, root, path, ids);
+          if (order === 'inserted after the decision') await root.thread().record([row]);
+          r.text('Resumed.');
+          await r.runtime.send(root, '').catch(() => undefined);
+          r.text('Again.');
+          await r.runtime.send(root, '').catch(() => undefined);
+          expect(r.echoed, `${path}: no same-id gated call runs`).toEqual([]);
+          // What the thread recorded for the parked step: nothing, or denials only.
+          const decided = storedDecisions(await r.rows.call({ child: () => root } as unknown as Rig));
+          expect([...decided.values()].every((answer) => answer.approved === false), path).toBe(true);
+          outcomes.push(answer);
+        }
+        expect(new Set(outcomes).size, JSON.stringify(outcomes)).toBe(1);
+      });
+    }
+  }
+
+  for (const [name, row] of INSERTED) {
+    it(`distinct ids, ${name} inserted before the decision: the decision applies to the parked step only, or is refused, on every path alike`, async () => {
+      const outcomes: string[] = [];
+      for (const path of PATHS) {
+        const r = new Rig();
+        const root = r.session(`g397d-${path}`);
+        await root.usingMode('work');
+        r.calls([['echo', { n: 1 }, 'a'], ['echo', { n: 2 }, 'b']]);
+        const parked = await r.runtime.send(root, 'Go');
+        const ids = parked.pendingApprovals.map((pending) => pending.id);
+        await root.thread().record([row]);
+        const answer = await decideOn(r, root, path, [ids[0]!]);
+        r.text('Resumed.');
+        await r.runtime.send(root, '').catch(() => undefined);
+        // Only the approved call of the parked step can run, at most once; never the other, never a call of the inserted row.
+        expect(r.echoed.every((n) => n === 1), path).toBe(true);
+        expect(r.echoed.length, path).toBeLessThanOrEqual(1);
+        outcomes.push(`${answer}:${r.echoed.length}`);
+      }
+      expect(new Set(outcomes).size, JSON.stringify(outcomes)).toBe(1);
+    });
+  }
+});
