@@ -45,7 +45,10 @@
   run: a later step replaced it.`, in a row the harness writes before the
   superseding row and marks `harness_superseded: {approval_ids}`. Nothing
   from the step runs, whatever was decided on it, and a later decision is
-  refused. **Behaviour change:** a new message no longer acts on approvals
+  refused, all-or-nothing per batch (`approval_not_pending`). The runs that
+  own a step are the run that recorded it and every run that recorded one of
+  its results; a step whose requests repeat an APPROVAL id fails closed like
+  one that repeats a call id. **Behaviour change:** a new message no longer acts on approvals
   recorded for the paused step first; resume with an empty prompt to act on
   them. The same in every language (harness-approval-pairing apr-0016..0019).
 - A step's results are read from every result row after it, up to the next

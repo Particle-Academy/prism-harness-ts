@@ -89,9 +89,18 @@ export class Thread {
     if (supportsAppendLog(store)) {
       return store.withLock(this.key, async () => {
         const length = (await store.logLength(this.key)) ?? (await this.#migrate(store));
-        const existing = ((await store.readLog(this.key)) ?? []).map((entry) => this.#toMessage(entry));
-        const appended = this.#entries(planned(existing, messages, inRun, denialsOnly), length, runId);
+        // Only the paused step and the rows after it decide a supersede, and
+        // only while it has an open call: kept beside the log (written only
+        // when it changes), so an append never reads the whole log.
+        const payload = (await store.get(this.key)) ?? {};
+        const kept = keptTail(payload[OPEN_STEP_KEY]);
+        const tail = kept ?? openTail(((await store.readLog(this.key)) ?? []));
+        const appended = this.#entries(planned(tail.map((entry) => this.#toMessage(entry)), messages, inRun, denialsOnly), length, runId);
         if (appended.length > 0) await store.appendLog(this.key, appended);
+        const next = openTail([...tail, ...appended]);
+        if (kept === null || JSON.stringify(next) !== JSON.stringify(kept)) {
+          await store.put(this.key, { ...((await store.get(this.key)) ?? {}), [OPEN_STEP_KEY]: { v: 1, rows: next as unknown as JsonValue[] } });
+        }
 
         return appended.map((entry) => this.#toMessage(entry));
       });
@@ -138,7 +147,10 @@ export class Thread {
     await store.withLock(this.key, async () => {
       if (supportsAppendLog(store)) await store.clearLog(this.key);
       const stored = await store.get(this.key);
-      if (stored !== null) await store.put(this.key, { ...stored, messages: [] });
+      if (stored !== null) {
+        const { [OPEN_STEP_KEY]: _open, ...rest } = stored;
+        await store.put(this.key, { ...rest, messages: [] });
+      }
     });
   }
 
@@ -208,15 +220,25 @@ export function recordingInRun<T>(runId: string, record: () => T): T {
  * first row that supersedes it (DECISION B), or only those denials
  * (`denialsOnly`, a new message superseding the step before its turn).
  * Superseded by any later assistant row with tool calls; or a later
- * assistant text row or user row recorded outside the run that owns the
- * step (its run id null, another run, or a run id the caller merely passed).
+ * assistant text row or user row recorded outside the runs that own the
+ * step (the run that recorded it and every run that recorded one of its
+ * results): its run id null, another run, or a run id the caller merely
+ * passed (only the runtime's recordingInRun() makes a row the run's own).
  */
 function planned(existing: readonly ThreadMessage[], messages: readonly JsonObject[], inRun: string | null, denialsOnly: boolean): JsonObject[] {
   const rows = existing.map((entry) => entry.message);
-  // The paused step, by the one selector (G-397), and the run that owns it.
+  // The paused step, by the one selector (G-397), and the runs that own it:
+  // the run that recorded it and every run that recorded one of its results.
   const step = pausedStepIndex(rows);
-  const owner = step === null ? null : existing[step]!.runId;
-  const outside = denialsOnly || inRun === null || owner === null || inRun !== owner;
+  const owners = new Set<string>();
+  if (step !== null) {
+    const own = existing[step]!.runId;
+    if (own !== null) owners.add(own);
+    for (const entry of existing.slice(step + 1)) {
+      if (entry.message.type === 'tool_result' && entry.runId !== null && Array.isArray(entry.message.tool_results) && entry.message.tool_results.length > 0) owners.add(entry.runId);
+    }
+  }
+  const outside = denialsOnly || inRun === null || !owners.has(inRun);
   const at = messages.findIndex((message) => supersedes(message, outside));
   if (at === -1) return denialsOnly ? [] : [...messages];
   const before = messages.slice(0, at).filter((message) => message.type === 'tool_result');
@@ -225,4 +247,24 @@ function planned(existing: readonly ThreadMessage[], messages: readonly JsonObje
   if (denial === null) return [...messages];
 
   return [...messages.slice(0, at), denial as unknown as JsonObject, ...messages.slice(at)];
+}
+
+/** Where an append-log thread keeps its open paused step (DECISION B): the step and every row after it. */
+const OPEN_STEP_KEY = 'harness_open_step';
+
+function keptTail(value: JsonValue | undefined): JsonObject[] | null {
+  return isJsonObject(value) && value.v === 1 && Array.isArray(value.rows) ? value.rows.filter(isJsonObject) : null;
+}
+
+/**
+ * The stored entries from the paused step on (pausedStepIndex), while that
+ * step has a call with no result; otherwise none. All a supersede reads.
+ */
+function openTail(entries: readonly JsonObject[]): JsonObject[] {
+  const rows = entries.map((entry) => (isJsonObject(entry.message) ? entry.message : {}));
+  const step = pausedStepIndex(rows);
+  if (step === null) return [];
+  const tail = rows.slice(step);
+
+  return supersededRow(tail) === null ? [] : entries.slice(step);
 }

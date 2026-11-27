@@ -658,7 +658,8 @@ const EVERY_CALL = (): boolean => true;
  * with such a call first.
  *
  * `repeated` is true when a call id repeats among the step's calls (an empty
- * id is an id like any other) or among its requests. Such a step cannot be
+ * id is an id like any other) or among its requests, or an approval id
+ * repeats among its requests. Such a step cannot be
  * paired safely, and none of its gated calls may run.
  *
  * @internal
@@ -688,7 +689,11 @@ export function pairStepApprovals(
     cursor = at + 1;
   }
 
-  return { approvalIds, repeated: new Set(ids).size !== ids.length || new Set(asked).size !== asked.length };
+  // A repeated APPROVAL id across requests (two calls' requests carrying
+  // one approval id) cannot say which call a decision belongs to either: the
+  // step fails closed like one that repeats a call id (G-397, round 13).
+  const approvals = requests.map((request) => text(request.approval_id));
+  return { approvalIds, repeated: new Set(ids).size !== ids.length || new Set(asked).size !== asked.length || new Set(approvals).size !== approvals.length };
 }
 
 /**
