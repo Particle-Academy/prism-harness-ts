@@ -154,6 +154,21 @@ describe('G-415: a host row\'s provider content is sent only when it is that row
     }
   });
 
+  it('a host row with a fallback block in content_blocks is not sent with its provider content, even when its blocks would match (prism-ts sends a different set of blocks from a fallback block on)', async () => {
+    for (const [content, blocks] of [
+      // The row's own call ahead of the fallback block: prism-ts would leave it out.
+      ['Looking.', [toolUse('toolu_own'), { type: 'fallback' }, { type: 'text', text: 'Looking.' }]],
+      // The row's own text ahead of the fallback block, and the call after it.
+      ['Looking.', [{ type: 'text', text: 'Looking.' }, { type: 'fallback' }, toolUse('toolu_own')]],
+      // Everything after the fallback block.
+      ['Looking.', [{ type: 'fallback' }, { type: 'text', text: 'Looking.' }, toolUse('toolu_own')]],
+    ] as const) {
+      const { sent } = await sendWith(hostRow(content, { content_blocks: [...blocks] as JsonObject[], keep: 'me' }, [call('toolu_own')]));
+      expect(additional(sent)).toEqual({ keep: 'me' });
+      expect((sent.tool_calls as JsonObject[]).map((entry) => entry.id)).toEqual(['toolu_own']);
+    }
+  });
+
   it('a host row whose tool_calls hold no objects counts as one with none', async () => {
     const { sent } = await sendWith(hostRow(NOTE, { output_items: [openaiCall('fc_1'), message(NOTE)], content_blocks: [{ type: 'text', text: NOTE }, toolUse('t1')] }, ['{"id":"fc_1"}']));
     expect(additional(sent)).toEqual({});
