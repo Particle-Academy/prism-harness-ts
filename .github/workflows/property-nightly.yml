@@ -55,7 +55,7 @@ jobs:
           EVENT: ${{ github.event_name }}
           INPUT: ${{ inputs.examples }}
         run: |
-          node --test tools/property/examples.test.mjs
+          node --test tools/property/examples-check.mjs
           count="$(node tools/property/examples.mjs "$EVENT" "$INPUT")"
           echo "count=$count" >> "$GITHUB_OUTPUT"
       - name: Property tests
