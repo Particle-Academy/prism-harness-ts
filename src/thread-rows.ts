@@ -135,12 +135,15 @@ export function toolResultRow(
  * approval id; a later one replaces an earlier one in the earlier one's
  * position.
  *
- * EACH RESULT ONCE, IN ITS OWN SEGMENT (BRIEF-R14 item 5): the fold spans the
- * step's whole segment (its assistant row up to the next assistant row with
- * tool calls), not only consecutive rows. A result row stored after a row of
- * another kind (a resolution row carrying a copy after a host's system row, or
- * after a new message) replaces the same result where it was first shown, and
- * a row left with nothing of its own is not shown at all.
+ * EACH RESULT ONCE, IN ITS OWN SEGMENT (BRIEF-R14 item 5, the reference's
+ * rule, pinned by thr-0017): a step's segment is every row after it up to
+ * the next assistant row with tool calls, and its result rows need not be
+ * consecutive. A resolution recorded after a row of another kind (a host's
+ * system row) carries the step's earlier results again. A later run of the
+ * segment therefore leaves out every result (same key, same occurrence) and
+ * decision an earlier run of it already replayed; the first one stands where
+ * it was. A run left with nothing is not replayed at all (a run that was
+ * empty to begin with is replayed as before).
  *
  * This is the REPLAY view, pinned by the harness-thread-rows corpus. What a
  * decision means for running a call is read from the stored rows instead, by
@@ -148,70 +151,91 @@ export function toolResultRow(
  */
 export function threadView(rows: readonly JsonObject[]): JsonObject[] {
   const view: JsonObject[] = [];
-  // The current segment's shown results and decisions: where each one is
-  // (view row, entry index), in the order shown.
-  let shown: { row: number; at: number; key: string }[] = [];
-  let answers = new Map<string, { row: number; at: number }>();
+  // The consecutive tool result rows not yet replayed, and what the current
+  // segment has replayed: by result key, how many; by approval id.
+  let run: ToolResultRow[] = [];
+  let replayed = new Map<string, number>();
+  let decided = new Set<string>();
+  const flush = (): void => {
+    if (run.length === 0) return;
+    const merged = unreplayed(run.reduce((earlier, later) => fold(earlier, later)), replayed, decided);
+    if (merged !== null) view.push(merged);
+    run = [];
+  };
 
   for (const row of rows) {
     const normalised = normalise(row, view);
 
     if (normalised === null) continue;
 
+    if (normalised.type === 'tool_result') {
+      run.push(normalised as ToolResultRow);
+      continue;
+    }
+
+    flush();
     if (normalised.type === 'assistant' && list(normalised.tool_calls).length > 0) {
-      shown = [];
-      answers = new Map();
+      // A new step: a new segment.
+      replayed = new Map();
+      decided = new Set();
     }
-    if (normalised.type !== 'tool_result') {
-      view.push(normalised);
-      continue;
-    }
-
-    const later = normalised as ToolResultRow;
-    const fresh: ToolResultEntry[] = [];
-    const freshDecisions: ApprovalDecisionEntry[] = [];
-    // A later result replaces only the SAME result, occurrence by occurrence:
-    // the k-th with a key in this row replaces the k-th with that key shown so
-    // far in the segment, in its position; any other is new.
-    const occurrences = new Map<string, number>();
-    for (const entry of later.tool_results) {
-      const key = resultKey(entry);
-      const occurrence = occurrences.get(key) ?? 0;
-      occurrences.set(key, occurrence + 1);
-      const hit = shown.filter((candidate) => candidate.key === key)[occurrence];
-      if (hit === undefined) fresh.push(entry);
-      else (view[hit.row] as ToolResultRow).tool_results[hit.at] = entry;
-    }
-    for (const entry of later.tool_approval_responses) {
-      const hit = answers.get(entry.approval_id);
-      if (hit === undefined) freshDecisions.push(entry);
-      else (view[hit.row] as ToolResultRow).tool_approval_responses[hit.at] = entry;
-    }
-
-    const previous = view.at(-1);
-    if (previous?.type === 'tool_result') {
-      // Consecutive: one row, the new entries after the earlier ones.
-      const target = previous as ToolResultRow;
-      for (const entry of fresh) {
-        shown.push({ row: view.length - 1, at: target.tool_results.length, key: resultKey(entry) });
-        target.tool_results.push(entry);
-      }
-      for (const entry of freshDecisions) {
-        answers.set(entry.approval_id, { row: view.length - 1, at: target.tool_approval_responses.length });
-        target.tool_approval_responses.push(entry);
-      }
-      continue;
-    }
-    // A row whose every entry this segment already shows is not shown again.
-    const had = later.tool_results.length + later.tool_approval_responses.length;
-    if (had > 0 && fresh.length === 0 && freshDecisions.length === 0) continue;
-    const at = view.length;
-    fresh.forEach((entry, index) => shown.push({ row: at, at: index, key: resultKey(entry) }));
-    freshDecisions.forEach((entry, index) => answers.set(entry.approval_id, { row: at, at: index }));
-    view.push(toolResultRow(fresh, freshDecisions));
+    view.push(normalised);
   }
+  flush();
 
   return view;
+}
+
+/**
+ * A later row's result replaces only the SAME result (resultKey), occurrence
+ * by occurrence: the k-th with a key in the later row replaces the k-th with
+ * that key so far, in its position; any other is added after (TS 0.11.x #83).
+ */
+function fold(earlier: ToolResultRow, later: ToolResultRow): ToolResultRow {
+  const results = [...earlier.tool_results];
+  const keys = results.map(resultKey);
+  const seen = new Map<string, number>();
+  for (const entry of later.tool_results) {
+    const key = resultKey(entry);
+    const occurrence = seen.get(key) ?? 0;
+    seen.set(key, occurrence + 1);
+    let at = -1;
+    for (let index = 0, found = 0; index < keys.length; index += 1) {
+      if (keys[index] !== key) continue;
+      if (found === occurrence) { at = index; break; }
+      found += 1;
+    }
+    if (at === -1) { results.push(entry); keys.push(key); } else results[at] = entry;
+  }
+  const decisions = new Map<string, ApprovalDecisionEntry>();
+  for (const entry of [...earlier.tool_approval_responses, ...later.tool_approval_responses]) decisions.set(entry.approval_id, entry);
+
+  return toolResultRow(results, [...decisions.values()]);
+}
+
+/**
+ * `row` without what its segment already replayed, or null when that leaves
+ * nothing of a row that held something. Records what it replays now.
+ */
+function unreplayed(row: ToolResultRow, replayed: Map<string, number>, decided: Set<string>): ToolResultRow | null {
+  if (row.tool_results.length === 0 && row.tool_approval_responses.length === 0) return row;
+  const seen = new Map<string, number>();
+  const results: ToolResultEntry[] = [];
+  for (const entry of row.tool_results) {
+    const key = resultKey(entry);
+    seen.set(key, (seen.get(key) ?? 0) + 1);
+    if (seen.get(key)! > (replayed.get(key) ?? 0)) results.push(entry);
+  }
+  for (const [key, count] of seen) replayed.set(key, Math.max(replayed.get(key) ?? 0, count));
+  const decisions: ApprovalDecisionEntry[] = [];
+  for (const entry of row.tool_approval_responses) {
+    if (decided.has(entry.approval_id)) continue;
+    decided.add(entry.approval_id);
+    decisions.push(entry);
+  }
+  if (results.length === row.tool_results.length && decisions.length === row.tool_approval_responses.length) return row;
+
+  return results.length === 0 && decisions.length === 0 ? null : toolResultRow(results, decisions);
 }
 
 /**
