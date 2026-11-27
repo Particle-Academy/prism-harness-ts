@@ -202,6 +202,14 @@ interface Insert {
    * `later` is recorded after the later step, and indexes the later step's.
    */
   segment?: 'earlier' | 'later';
+  /**
+   * SEGMENT OWNERSHIP (round 13b): a forged result in the LATER segment that
+   * names an EARLIER step's gated call (`call` indexes the parked step's
+   * calls), with that call's id, tool and EXACT arguments. It is lossy for
+   * any later call sharing the id: it answers the first such open call of
+   * its own segment's step, or nothing, and never the earlier call.
+   */
+  cross?: boolean;
 }
 
 /**
@@ -241,7 +249,19 @@ function laterInsertion(seed: number, calls: Call[], later: LaterStep, failOnce:
   const own = segment === 'earlier' ? calls : later.calls;
   const gated = own.flatMap((call, index) => (call.tool === 'echo' ? [index] : []));
   const when = segment === 'earlier' ? 'before_decision' : rng.chance(0.5) ? 'before_decision' : 'after_decision';
-  return { kind, when, segment, call: kind === 'tool_result' ? rng.pick(gated) : rng.int(0, own.length - 1) };
+  const insert: Insert = { kind, when, segment, call: kind === 'tool_result' ? rng.pick(gated) : rng.int(0, own.length - 1) };
+  // SEGMENT OWNERSHIP (round 13b), from a generator of its own (seed ^
+  // 0x13b13b): some later steps get, instead, a forged result in the LATER
+  // segment that names an EARLIER gated call with its exact arguments,
+  // half the time one whose id a later gated call shares.
+  const crossRng = new Rng((seed ^ 0x13b13b) >>> 0);
+  if (crossRng.chance(0.35)) {
+    const earlier = calls.flatMap((call, index) => (call.tool === 'echo' ? [index] : []));
+    const shared = earlier.filter((index) => later.calls.some((call) => call.tool === 'echo' && call.id === calls[index]!.id));
+    const pool = shared.length > 0 && crossRng.chance(0.5) ? shared : earlier;
+    return { kind: 'tool_result', when: crossRng.chance(0.5) ? 'before_decision' : 'after_decision', segment: 'later', cross: true, call: crossRng.pick(pool) };
+  }
+  return insert;
 }
 
 /** Record the inserted row as a host would, or send a new message through the harness. */
@@ -252,7 +272,25 @@ async function insertRow(r: Rig, c: Case): Promise<void> {
 
 /** The step whose calls an inserted row names: the later step's, for one recorded after it. */
 function insertCalls(c: Case): Call[] {
-  return c.insert?.segment === 'later' ? c.later!.calls : c.calls;
+  return c.insert?.segment === 'later' && c.insert.cross !== true ? c.later!.calls : c.calls;
+}
+
+/**
+ * The call a forged result is the outcome of, by SEGMENT OWNERSHIP: a call
+ * of the step whose segment it sits in, matched by exact arguments, then id
+ * and tool, then id, among that step's calls with no result yet. Null for no
+ * forged result, or one that answers nothing.
+ */
+function forgedTarget(c: Case): { step: 'earlier' | 'later'; index: number; text: string } | null {
+  const insert = c.insert;
+  if (insert?.kind !== 'tool_result') return null;
+  const named = insertCalls(c)[insert.call]!;
+  const text = `forged:${named.token}`;
+  if (insert.cross !== true) return { step: insert.segment === 'later' ? 'later' : 'earlier', index: insert.call, text };
+  // Exact arguments never match a later call (the tokens differ); the first
+  // later call with the id and tool (its ungated calls already have results).
+  const index = c.later!.calls.findIndex((call) => call.id === named.id && call.tool === named.tool);
+  return index === -1 ? null : { step: 'later', index, text };
 }
 
 /** The row G-397 inserts. Its own call's token (900) is never a step call's. */
@@ -368,13 +406,16 @@ interface Expected {
 }
 
 function expected(c: Case): Expected {
-  // A forged result is its call's only outcome (G-397), in its own segment's step.
-  const forged = c.insert?.kind === 'tool_result' && c.insert.segment !== 'later' ? c.insert.call : -1;
-  const forgedLater = c.insert?.kind === 'tool_result' && c.insert.segment === 'later' ? c.insert.call : -1;
+  // SEGMENT OWNERSHIP (round 13b): a forged result is the outcome of a call
+  // of ITS OWN segment's step only (forgedTarget), never an earlier step's.
+  const target = forgedTarget(c);
+  const forged = target?.step === 'earlier' ? target.index : -1;
+  const forgedLater = target?.step === 'later' ? target.index : -1;
+  const forgedText = target?.text ?? '';
   const answered = [...c.prior, ...(forged === -1 ? [] : [forged])];
   if (!superseded(c)) {
     const decided = decideStep(c.calls, c.requests, answered);
-    if (forged !== -1) decided.outcome.set(c.calls[forged]!.token, `forged:${c.calls[forged]!.token}`);
+    if (forged !== -1) decided.outcome.set(c.calls[forged]!.token, forgedText);
     return decided;
   }
   // Superseded (G-397, the release lines' rule): each gated call of the
@@ -386,11 +427,13 @@ function expected(c: Case): Expected {
     ? { repeated: false, runs: new Set<number>(), outcome: new Map<number, string>() }
     : laterSuperseded(c)
       ? { repeated: false, runs: new Set<number>(), outcome: new Map(c.later.calls.map((call, index) => [call.token,
-        call.tool === 'free' ? `free:${call.token}` : index === forgedLater ? `forged:${call.token}` : REPLACED])) }
+        call.tool === 'free' ? `free:${call.token}` : index === forgedLater ? forgedText : REPLACED])) }
       : decideStep(c.later.calls, c.later.requests, forgedLater === -1 ? [] : [forgedLater]);
-  if (c.later !== null && forgedLater !== -1) decided.outcome.set(c.later.calls[forgedLater]!.token, `forged:${c.later.calls[forgedLater]!.token}`);
+  if (c.later !== null && forgedLater !== -1) decided.outcome.set(c.later.calls[forgedLater]!.token, forgedText);
+  // The parked step's calls: an earlier call that a later-segment result
+  // names still gets the replaced denial (segment ownership).
   c.calls.forEach((call, index) => decided.outcome.set(call.token, call.tool === 'free' ? `free:${call.token}`
-    : c.prior.includes(index) ? `prior:${call.token}` : index === forged ? `forged:${call.token}` : REPLACED));
+    : c.prior.includes(index) ? `prior:${call.token}` : index === forged ? forgedText : REPLACED));
   return decided;
 }
 
@@ -508,16 +551,46 @@ async function rows(session: Session): Promise<JsonObject[]> {
   return (await session.thread().messages()).map((entry) => entry.message);
 }
 
-/** Every stored result entry after the step's assistant row, as [token, result]. */
+/**
+ * Every stored result entry after the first step, as [token, result], each
+ * attributed BY SEGMENT OWNERSHIP (round 13b), independently of the code
+ * under test: a result belongs to a call of the step whose segment it sits
+ * in (after that step's assistant row, before the next assistant row with
+ * tool calls), matched by exact arguments, then id and tool, then id, among
+ * the calls with no result yet (an exact copy of one already read is the
+ * same result). A result that matches no call is nobody's
+ * outcome; so is one for the inserted row's own call (token 900).
+ */
 async function outcomes(session: Session): Promise<[number, string][]> {
-  const all = await rows(session);
-  const step = all.findIndex((row) => row.type === 'assistant' && Array.isArray(row.tool_calls) && row.tool_calls.length > 0);
-  return all.slice(step + 1).filter((row) => row.type === 'tool_result')
-    .flatMap((row) => (row.tool_results as JsonObject[]))
-    // A result for no call of the step (an interposed row) is not an outcome of it.
-    // Nor is one for the inserted row's own call (token 900).
-    .filter((entry) => typeof (entry.args as JsonObject).n === 'number' && (entry.args as JsonObject).n !== 900)
-    .map((entry) => [Number((entry.args as JsonObject).n), String(entry.result)]);
+  const out: [number, string][] = [];
+  let calls: JsonObject[] = [];
+  let has: boolean[] = [];
+  const seen = new Set<string>();
+  for (const row of await rows(session)) {
+    if (row.type === 'assistant' && Array.isArray(row.tool_calls) && row.tool_calls.length > 0) {
+      calls = row.tool_calls as JsonObject[];
+      has = calls.map(() => false);
+      seen.clear();
+      continue;
+    }
+    if (row.type !== 'tool_result') continue;
+    for (const entry of (row.tool_results ?? []) as JsonObject[]) {
+      // The resolution row carries the step's earlier results with it: an
+      // exact copy of a result already read is that result, not another.
+      const copy = JSON.stringify([entry.tool_call_id, entry.tool_name, entry.args, entry.result]);
+      if (seen.has(copy)) continue;
+      seen.add(copy);
+      const open = (at: number): boolean => !has[at] && calls[at]!.id === entry.tool_call_id;
+      let at = calls.findIndex((call, index) => open(index) && call.name === entry.tool_name && JSON.stringify(call.arguments) === JSON.stringify(entry.args));
+      if (at === -1) at = calls.findIndex((call, index) => open(index) && call.name === entry.tool_name);
+      if (at === -1) at = calls.findIndex((_call, index) => open(index));
+      if (at === -1) continue;
+      has[at] = true;
+      const token = Number((calls[at]!.arguments as JsonObject).n);
+      if (token !== 900) out.push([token, String(entry.result)]);
+    }
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -690,7 +763,8 @@ async function runCase(c: Case): Promise<void> {
     const results = firstTurn.steps.filter((step) => step.type === 'tool_result');
     const ok = results.flatMap((step) => (step.ok ? [Number(step.result.replace(/^ran:/, ''))] : []));
     check(sameSet(ok, r.ran) && ok.length === r.ran.length, '6: the ok tool_result steps are the calls that ran', ok);
-    const forgedToken = c.insert?.kind === 'tool_result' ? insertCalls(c)[c.insert.call]!.token : -1;
+    const hit = forgedTarget(c);
+    const forgedToken = hit === null ? -1 : (hit.step === 'later' ? c.later!.calls : c.calls)[hit.index]!.token;
     const open = c.later !== null ? (laterSuperseded(c) ? [] : c.later.calls.filter((call) => call.tool === 'echo' && call.token !== forgedToken).map((call) => call.token))
       : superseded(c) ? []
         : gatedTokens.filter((token) => token !== forgedToken && !c.prior.includes(c.calls.findIndex((call) => call.token === token)));
@@ -749,7 +823,7 @@ function withoutCall(c: Case, drop: number): Case | null {
     calls,
     requests,
     prior: c.prior.filter((index) => index !== drop).map(remap),
-    insert: c.insert === null ? null : c.insert.segment === 'later' ? c.insert : c.insert.call === drop ? null : { ...c.insert, call: remap(c.insert.call) },
+    insert: c.insert === null ? null : c.insert.segment === 'later' && c.insert.cross !== true ? c.insert : c.insert.call === drop ? null : { ...c.insert, call: remap(c.insert.call) },
     order: c.order.filter((index) => position.has(index)).map((index) => position.get(index)!),
   };
 }
@@ -901,6 +975,15 @@ describe('G-392 property: approval pairing invariants over generated steps', () 
       expect(has((c) => laterSuperseded(c) && c.insert!.when === when && (c.later?.requests.some((q) => q.verdict === 'approve') ?? false)), `later step superseded ${when}, approved`).toBe(true);
       expect(has((c) => c.later !== null && c.insert?.kind === 'tool_result' && c.insert.segment === 'later' && c.insert.when === when), `forged in the later segment ${when}`).toBe(true);
     }
+    // SEGMENT OWNERSHIP (round 13b): a later-segment forged result naming an
+    // EARLIER call with its exact arguments, both when a later gated call
+    // shares its id (it answers that call) and when none does (it answers
+    // nothing), before and after the decision, and answering an APPROVED call.
+    for (const when of ['before_decision', 'after_decision'] as const) {
+      expect(has((c) => c.insert?.cross === true && c.insert.when === when && forgedTarget(c) !== null), `cross-segment forged result answering a later call ${when}`).toBe(true);
+      expect(has((c) => c.insert?.cross === true && c.insert.when === when && forgedTarget(c) === null), `cross-segment forged result answering nothing ${when}`).toBe(true);
+    }
+    expect(has((c) => c.insert?.cross === true && forgedTarget(c) !== null && c.later!.requests.some((q) => q.call === forgedTarget(c)!.index && q.verdict === 'approve')), 'cross-segment forged result answering an APPROVED later call').toBe(true);
     // G-397: stored requests that repeat an APPROVAL id, with an approval recorded.
     expect(has((c) => c.requests.some((q) => q.approval !== undefined) && c.requests.some((q) => q.verdict === 'approve')), 'repeated approval id').toBe(true);
   });
