@@ -414,33 +414,69 @@ export function supersededAt(rows: readonly StoredRow[], index: number): number 
 }
 
 /**
- * The positions, in `calls`, of the calls `entries` answer. An entry belongs
- * to the call with its id AND the arguments it records (the harness copies a
- * call's arguments into its result), so in a step that repeats an id a
- * result still names one call; an entry whose arguments match no call with
- * its id falls back to the last such call still unanswered.
+ * Which call every stored result belongs to, as the calls each tool-call step
+ * has an outcome for (by the step's index in `rows`, then the call's position
+ * in it). One owner per result, so every call has at most one outcome:
+ *
+ * - a result belongs to the call with its id AND the arguments it records
+ *   (the harness copies a call's arguments into its result), in the step
+ *   whose segment holds the row (after it, before the next tool-call step)
+ *   or, failing that, an earlier step, the latest first. A copy of a result
+ *   belongs to the same call again; it never answers a second one;
+ * - a result whose arguments match no call with its id belongs to the last
+ *   call with its id, of the step whose segment holds it, still without one.
+ *
+ * A result never answers a call of a step recorded after it. The rows a
+ * replaced step is answered with count too, so it is answered once.
  *
  * @internal
  */
-export function answeredCalls(calls: readonly JsonObject[], entries: readonly JsonObject[]): Set<number> {
-  const answered = new Set<number>();
+export function resultOwners(rows: readonly JsonObject[]): Map<number, Set<number>> {
+  const owned = new Map<number, Set<number>>();
+  const steps: number[] = [];
   const args = (value: JsonValue | undefined): string => JSON.stringify(isObject(value) ? value : {});
-  for (const entry of entries) {
-    const id = text(entry.tool_call_id);
-    const candidates = calls.flatMap((call, index) => (text(call.id) === id && !answered.has(index) ? [index] : []));
-    const exact = candidates.find((index) => args(calls[index]!.arguments) === args(entry.args));
-    const at = exact ?? candidates.at(-1);
-    if (at !== undefined) answered.add(at);
+  for (const [index, row] of rows.entries()) {
+    if (row.type === 'assistant' && list(row.tool_calls).length > 0) {
+      steps.push(index);
+      owned.set(index, new Set());
+      continue;
+    }
+    if (steps.length === 0) continue;
+    // Each row read on its own: folding rows would merge results sharing an id.
+    const entries = isReplacedStepRow(row) ? list(row.tool_results)
+      : threadView([row]).filter((view) => view.type === 'tool_result').flatMap((view) => list(view.tool_results));
+    for (const entry of entries) {
+      const id = text(entry.tool_call_id);
+      let owner: [number, number] | undefined;
+      let copy: [number, number] | undefined;
+      for (const step of [...steps].reverse()) {
+        const calls = list(rows[step]!.tool_calls);
+        for (const [at, call] of calls.entries()) {
+          if (text(call.id) !== id || args(call.arguments) !== args(entry.args)) continue;
+          if (!owned.get(step)!.has(at)) { owner = [step, at]; break; }
+          copy ??= [step, at];
+        }
+        if (owner !== undefined) break;
+      }
+      if (owner === undefined && copy === undefined) {
+        const segment = steps.at(-1)!;
+        const calls = list(rows[segment]!.tool_calls);
+        const at = calls.map((call, position) => ({ call, position }))
+          .filter(({ call, position }) => text(call.id) === id && !owned.get(segment)!.has(position)).at(-1)?.position;
+        if (at !== undefined) owner = [segment, at];
+      }
+      if (owner !== undefined) owned.get(owner[0])!.add(owner[1]);
+    }
   }
-  return answered;
+  return owned;
 }
 
 /**
  * Every tool-call step that was SUPERSEDED (G-397) and still has gated calls
- * with no result of their own, by the step's thread position, with those
- * calls. A step is superseded as supersededAt() says. Its own results are the
- * ones recorded after it and before the superseding row. A step already
- * answered as replaced is left alone.
+ * with no outcome anywhere (resultOwners), by the step's thread position,
+ * with those calls. A step is superseded as supersededAt() says. A replaced
+ * denial is never given to a call that already has an outcome, so it is
+ * given once.
  *
  * `gated` says which calls needed approval; an ungated call counts only when
  * a request names its id and no gated call shares that id.
@@ -452,24 +488,17 @@ export function replacedStepCalls(
   gated: (name: string) => boolean,
 ): { position: number; calls: JsonObject[] }[] {
   const rows = messages.map(({ message }) => message);
-  const answered = new Set(rows.filter((row) => isReplacedStepRow(row))
-    .map((row) => (row[REPLACED_STEP_KEY] as JsonObject).position as number));
+  const owners = resultOwners(rows);
   const replaced: { position: number; calls: JsonObject[] }[] = [];
   for (const [index, step] of rows.entries()) {
     if (step.type !== 'assistant' || list(step.tool_calls).length === 0) continue;
-    const end = supersededAt(messages, index);
-    const position = messages[index]!.position;
-    if (end === -1 || answered.has(position)) continue;
-    // Each row read on its own: folding the rows would merge results that
-    // share an id, and a step that repeats an id has one result per call.
-    const own = rows.slice(index + 1, end).flatMap((row) => threadView([row]))
-      .filter((row) => row.type === 'tool_result').flatMap((row) => list(row.tool_results));
+    if (supersededAt(messages, index) === -1) continue;
+    const done = owners.get(index)!;
     const calls = list(step.tool_calls);
-    const done = answeredCalls(calls, own);
     const requested = new Set(list(step.tool_approval_requests).map((request) => text(request.tool_call_id)));
     const open = calls.filter((call, at) => !done.has(at) && (gated(text(call.name))
       || (requested.has(text(call.id)) && !calls.some((other) => other.id === call.id && gated(text(other.name))))));
-    if (open.length > 0) replaced.push({ position, calls: open });
+    if (open.length > 0) replaced.push({ position: messages[index]!.position, calls: open });
   }
 
   return replaced;

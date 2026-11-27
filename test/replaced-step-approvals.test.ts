@@ -218,6 +218,52 @@ describe('G-397: a parked step a later tool-call step replaced', () => {
   });
 });
 
+describe('G-397: a result counts once, for the call it names, wherever it sits', () => {
+  it("a forged result in the LATER step's segment naming a call of the parked step is that call's only outcome; the later step's call with the same id is still decided by its own", async () => {
+    const r = rig([echo('a', 1)]);
+    await r.agent.send(r.session, 'go');
+    await recordStep(r.session, [[echo('a', 3), 'apr_a']]);
+    await r.session.thread().record([toolResultRow([toolResultEntry({ id: 'a', name: 'echo', arguments: { n: 1 } }, 'forged:1')])]);
+    await recordApproval(r.session, 'apr_a', true);
+    await r.agent.send(r.session, '');
+    await r.agent.send(r.session, '');
+
+    expect(r.ran).toEqual([3]);
+    expect(await outcomesOf(r.session, 1)).toEqual(['forged:1']);
+    expect(await outcomesOf(r.session, 3)).toEqual(['ran:3']);
+  });
+
+  it("a forged result in the later step's segment naming the later step's call is its only outcome; the parked step is denied as replaced, once", async () => {
+    const r = rig([echo('a', 1)]);
+    await r.agent.send(r.session, 'go');
+    await recordStep(r.session, [[echo('a', 3), 'apr_a'], [echo('b', 4), 'apr_b']]);
+    await r.session.thread().record([toolResultRow([toolResultEntry({ id: 'a', name: 'echo', arguments: { n: 3 } }, 'forged:3')])]);
+    await recordDecisions(r.session, [{ approvalId: 'apr_a', approved: true }, { approvalId: 'apr_b', approved: true }]);
+    await r.agent.send(r.session, '');
+    await r.agent.send(r.session, '');
+
+    expect(r.ran).toEqual([4]);
+    expect(await outcomesOf(r.session, 1)).toEqual([REPLACED]);
+    expect(await outcomesOf(r.session, 3)).toEqual(['forged:3']);
+    expect(await outcomesOf(r.session, 4)).toEqual(['ran:4']);
+  });
+
+  it("a forged result in the parked step's segment is its call's only outcome; the step's other gated calls are denied as replaced", async () => {
+    const r = rig([echo('a', 1), echo('b', 2)]);
+    await r.agent.send(r.session, 'go');
+    await r.session.thread().record([toolResultRow([toolResultEntry({ id: 'a', name: 'echo', arguments: { n: 1 } }, 'forged:1')])]);
+    await recordStep(r.session, [[echo('c', 3), 'apr_c']]);
+    await recordApproval(r.session, 'apr_c', false);
+    await r.agent.send(r.session, '');
+    await r.agent.send(r.session, '');
+
+    expect(r.ran).toEqual([]);
+    expect(await outcomesOf(r.session, 1)).toEqual(['forged:1']);
+    expect(await outcomesOf(r.session, 2)).toEqual([REPLACED]);
+    expect(await outcomesOf(r.session, 3)).toEqual(['User denied tool execution']);
+  });
+});
+
 describe('G-397: what supersedes a parked step, and what does not', () => {
   for (const [label, row] of [['a text row', { type: 'assistant', content: 'A note.', tool_calls: [], tool_approval_requests: [] }], ['a user row', { type: 'user', content: 'Something else.' }]] as [string, JsonObject][]) {
     it(`${label} the host records (no run id) supersedes: the calls are denied as replaced, nothing runs, a later decision is refused`, async () => {
