@@ -319,9 +319,13 @@ describe('FileSessionStore', () => {
     const directory=await mkdtemp(join(tmpdir(),'prism-harness-released-'));
     const store=new FileSessionStore(directory);
     await plantOwner(await lockPath(directory,store),process.pid,true);
+    // The claim is "without waiting for the TTL": bounded by a fraction of the
+    // TTL the lock is taken with, never by a fixed wall-clock figure that a
+    // loaded CI runner can miss.
+    const ttlSeconds=10;
     const started=performance.now();
-    expect(await store.withLock('k',()=> 'reclaimed',10,0.5)).toBe('reclaimed');
-    expect(performance.now()-started).toBeLessThan(400);
+    expect(await store.withLock('k',()=> 'reclaimed',ttlSeconds,0.5)).toBe('reclaimed');
+    expect(performance.now()-started).toBeLessThan(ttlSeconds*1000/4);
   });
 
   it('refuses a stored payload that is not valid JSON, by code', async () => {
