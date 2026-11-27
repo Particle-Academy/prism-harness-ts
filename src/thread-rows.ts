@@ -221,18 +221,6 @@ export function toolResultRow(
  * `turnDecisions()`, where the first answer to an approval is the answer.
  */
 export function threadView(rows: readonly JsonObject[]): JsonObject[] {
-  // Round 15: every decision entry is replayed as the one that STANDS for
-  // its approval (a denial if any was recorded, else the first approval).
-  const standing = new Map<string, ApprovalDecisionEntry>();
-  for (const row of rows) {
-    const answers = row.type === 'tool_result' ? list(row.tool_approval_responses) : row.type === 'tool_approval_response' ? [row] : [];
-    for (const answer of answers) {
-      const entry = decision(answer);
-      if (prevails(standing.get(entry.approval_id), entry.approved)) standing.set(entry.approval_id, entry);
-    }
-  }
-  const context: ViewContext = { asked: new Set(), standing };
-  rows = replayOrder(rows);
   const view: JsonObject[] = [];
   // The consecutive tool result rows not yet replayed, and what the current
   // segment has replayed: by result key, how many; by approval id.
@@ -247,7 +235,7 @@ export function threadView(rows: readonly JsonObject[]): JsonObject[] {
   };
 
   for (const row of rows) {
-    const normalised = normalise(row, view, context);
+    const normalised = normalise(row, view);
 
     if (normalised === null) continue;
 
@@ -267,6 +255,55 @@ export function threadView(rows: readonly JsonObject[]): JsonObject[] {
   flush();
 
   return view;
+}
+
+/**
+ * What a provider is sent (round 15): the stored rows PLACED (placedRows),
+ * then folded (threadView). The runtime's replay; the reference's
+ * Thread::placedRows() then its fold, pinned by the corpus `place` rows.
+ *
+ * @internal
+ */
+export function replayView(rows: readonly JsonObject[]): JsonObject[] {
+  return threadView(placedRows(rows));
+}
+
+/**
+ * The stored rows as the replay places them (round 15, the reference's
+ * Thread::placedRows): in the order replayOrder() gives; every decision
+ * entry rewritten to the decision that STANDS for its approval (a denial if
+ * any was recorded, else the first approval: prevails()); and a step's
+ * request that repeats an approval id an EARLIER step asked for dropped (it
+ * asks for nothing, G-408 / #92).
+ *
+ * @internal
+ */
+export function placedRows(rows: readonly JsonObject[]): JsonObject[] {
+  const standing = new Map<string, ApprovalDecisionEntry>();
+  for (const row of rows) {
+    const answers = row.type === 'tool_result' ? list(row.tool_approval_responses) : row.type === 'tool_approval_response' ? [row] : [];
+    for (const answer of answers) {
+      const entry = decision(answer);
+      if (prevails(standing.get(entry.approval_id), entry.approved)) standing.set(entry.approval_id, entry);
+    }
+  }
+  const asked = new Set<string>();
+  return replayOrder(rows).map((row) => {
+    if (isToolStep(row) && Array.isArray(row.tool_approval_requests)) {
+      const own = row.tool_approval_requests.filter((request) => !isObject(request) || !asked.has(text(request.approval_id)));
+      for (const request of stepRequests(row)) asked.add(text(request.approval_id));
+      return own.length === row.tool_approval_requests.length ? row : { ...row, tool_approval_requests: own };
+    }
+    if (row.type === 'tool_result' && Array.isArray(row.tool_approval_responses)) {
+      const answers = row.tool_approval_responses.map((answer) => (isObject(answer) ? standing.get(text(answer.approval_id)) ?? answer : answer));
+      return { ...row, tool_approval_responses: answers as JsonValue[] };
+    }
+    if (row.type === 'tool_approval_response') {
+      const stands = standing.get(text(row.approval_id));
+      return stands === undefined ? row : { ...row, approved: stands.approved, reason: stands.reason };
+    }
+    return row;
+  });
 }
 
 /**
@@ -1412,16 +1449,10 @@ export function repeatedIdDenials(rows: readonly JsonObject[]): Set<string> {
   return denied;
 }
 
-/** What the replay carries from row to row (round 15): the approval ids steps asked so far, and each approval's standing decision. */
-type ViewContext = { asked: Set<string>; standing: Map<string, ApprovalDecisionEntry> };
-
-function normalise(row: JsonObject, view: JsonObject[], context: ViewContext = { asked: new Set(), standing: new Map() }): JsonObject | null {
+function normalise(row: JsonObject, view: JsonObject[]): JsonObject | null {
   switch (row.type) {
     case 'assistant': {
-      // A request repeating an approval id an EARLIER step asked for asks for
-      // nothing (G-408, #92): it is not replayed.
-      const requests = stepRequests(row).filter((request) => !context.asked.has(text(request.approval_id)));
-      for (const request of requests) context.asked.add(text(request.approval_id));
+      const requests = stepRequests(row);
       return assistantRow(
         typeof row.content === 'string' ? row.content : '',
         stepCalls(row).map((call) => ({
@@ -1455,7 +1486,7 @@ function normalise(row: JsonObject, view: JsonObject[], context: ViewContext = {
             tool_call_result_id: nullableText(entry.tool_call_result_id),
             artifacts: Array.isArray(entry.artifacts) ? entry.artifacts : [],
           })),
-          list(row.tool_approval_responses).map((answer) => standingOf(decision(answer), context)),
+          list(row.tool_approval_responses).map(decision),
         );
       }
 
@@ -1484,7 +1515,7 @@ function normalise(row: JsonObject, view: JsonObject[], context: ViewContext = {
     }
 
     case 'tool_approval_response':
-      return toolResultRow([], [standingOf(decision(row), context)]);
+      return toolResultRow([], [decision(row)]);
 
     default: {
       // The reader view's trust flag (readerRows) is never sent anywhere.
@@ -1493,12 +1524,6 @@ function normalise(row: JsonObject, view: JsonObject[], context: ViewContext = {
       return rest;
     }
   }
-}
-
-/** The decision that stands for `entry`'s approval (prevails), as the replay shows every entry of it. */
-function standingOf(entry: ApprovalDecisionEntry, context: ViewContext): ApprovalDecisionEntry {
-  const stands = context.standing.get(entry.approval_id);
-  return stands === undefined ? entry : { ...stands };
 }
 
 function decision(value: JsonObject): ApprovalDecisionEntry {

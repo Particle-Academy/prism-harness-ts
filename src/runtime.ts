@@ -8,6 +8,7 @@ import {
   assistantRow,
   approvalToolScope, approvalRunSteps, pausedRunState, turnDecisions,
   threadView,
+  replayView,
   toolResultEntry,
   toolResultRow,
   type ApprovalDecisionEntry,
@@ -1366,7 +1367,7 @@ export class AgentRuntime {
       steps?.stepStart();
       const response = await this.#client({
         systemPrompt,
-        messages: threadView((await thread.readerRows())),
+        messages: replayView(await thread.readerRows()),
         tools: offered,
         provider,
         model,
@@ -1830,7 +1831,7 @@ export class AgentRuntime {
     // and a step only by the one rule (G-408).
     const stored = pausedStepIndex(rows);
     if (stored === null || !isToolStep(rows[stored])) return null;
-    const view = threadView(rows);
+    const view = replayView(rows);
     // The same row in the replay view (which folds a 0.3.0 request row into it).
     const ordinal = rows.slice(0, stored + 1).filter((row) => row.type === 'assistant').length;
     const index = view.findIndex((row, at) => row.type === 'assistant' && view.slice(0, at + 1).filter((candidate) => candidate.type === 'assistant').length === ordinal);
