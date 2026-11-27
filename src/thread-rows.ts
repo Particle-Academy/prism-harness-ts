@@ -549,6 +549,40 @@ export function startedCalls(messages: readonly StoredRow[], index: number): Set
   return started;
 }
 
+/**
+ * For each call of the step at `index` that a started row names, the decision
+ * its approval had when the call started (G-411): the last one in the replay
+ * view of the rows between the step and the started row. A decision written
+ * after a call started never becomes the decision recorded beside its outcome.
+ * Read by the same rule as `startedCalls()`.
+ *
+ * @internal
+ */
+export function startedDecisions(messages: readonly StoredRow[], index: number): Map<string, ApprovalDecisionEntry> {
+  const position = messages[index]?.position;
+  const calls = list(messages[index]?.message.tool_calls);
+  const named = new Set<number>();
+  const standing = new Map<string, ApprovalDecisionEntry>();
+  for (let at = index + 1; at < messages.length; at += 1) {
+    const { message, harness } = messages[at]!;
+    if (harness !== true || !isStartedRow(message)) continue;
+    const answers = message[ANSWERS_STEP_KEY];
+    if (!isObject(answers) || answers.position !== position) continue;
+    const mark = message[STARTED_KEY] as JsonObject;
+    const place = calls.findIndex((call, where) => !named.has(where) && text(call.id) === text(mark.tool_call_id) && text(call.name) === text(mark.tool_name));
+    if (place === -1) continue;
+    named.add(place);
+    const approvalId = text(mark.approval_id);
+    let found: ApprovalDecisionEntry | undefined;
+    for (const row of threadView(messages.slice(index + 1, at).map((entry) => entry.message))) {
+      if (row.type !== 'tool_result') continue;
+      for (const entry of list(row.tool_approval_responses)) if (text(entry.approval_id) === approvalId) found = decision(entry);
+    }
+    if (found !== undefined && !standing.has(approvalId)) standing.set(approvalId, found);
+  }
+  return standing;
+}
+
 /** Whether a stored row is the answer to a replaced step (G-397). @internal */
 export function isReplacedStepRow(row: JsonObject): boolean {
   const mark = row[REPLACED_STEP_KEY];
