@@ -40,10 +40,14 @@ import { ARGUMENTS_AS_SENT, assistantRow, toolResultEntry, toolResultRow } from 
 
 const REPEATED = 'Tool call was not run because another call in this step has the same id';
 const NO_RESPONSE = 'No approval response provided';
+const REPLACED = 'Tool call was not run because a later step replaced it';
 const DENIED = 'User denied tool execution';
 
-const EXAMPLES = envInteger('PRISM_PROPERTY_EXAMPLES', 1, Number.MAX_SAFE_INTEGER, 150)!;
-const BASE_SEED = envInteger('PRISM_PROPERTY_BASE_SEED', 0, Number.MAX_SAFE_INTEGER, 0x6392)!;
+/** The fixed-seed set normal CI runs; the coverage check below is asserted on exactly these seeds. */
+const DEFAULT_EXAMPLES = 300;
+const FIXED_BASE_SEED = 0x6392;
+const EXAMPLES = envInteger('PRISM_PROPERTY_EXAMPLES', 1, Number.MAX_SAFE_INTEGER, DEFAULT_EXAMPLES)!;
+const BASE_SEED = envInteger('PRISM_PROPERTY_BASE_SEED', 0, Number.MAX_SAFE_INTEGER, FIXED_BASE_SEED)!;
 const REPLAY = envInteger('PRISM_PROPERTY_SEED', 0, 0xffffffff, undefined);
 
 /**
@@ -131,6 +135,19 @@ interface Request {
   call: number;
   verdict: Verdict;
   reason: string | null;
+  /**
+   * Index of the request whose approval id this one carries (stored only):
+   * its own index, or an earlier request's when requests repeat an approval
+   * id (G-397). A request that repeats another's id records no decision.
+   */
+  approval?: number;
+}
+
+/** A later tool-call step another writer recorded after the park (G-397). */
+interface LaterStep {
+  calls: Call[];
+  /** One per gated call, in call order, each with its own approval id. */
+  requests: Request[];
 }
 
 interface Resume {
@@ -154,6 +171,39 @@ interface Case {
   recorder: Recorder;
   resume: Path;
   again: Resume[];
+  /**
+   * A row another writer recorded between the park and the resume (G-397):
+   * before or after the decisions. The step being decided stays the last
+   * assistant row with tool calls; nothing here is a result for it.
+   */
+  interpose: { kind: Interposed; where: 'beforeDecisions' | 'afterDecisions' } | null;
+  /** The model call after the first resume's resolution fails once, so the resume ends there. */
+  failOnce: boolean;
+  /** The run's steps are spent when it parks, so a resume resolves and stops with no model call (G-399). */
+  spent: boolean;
+  /** A later tool-call step after the park: it is the step decided, and the parked one is replaced. */
+  later: LaterStep | null;
+}
+
+type Interposed = 'assistantText' | 'user' | 'system' | 'unrelatedResult' | 'emptyResult';
+const INTERPOSED: Interposed[] = ['assistantText', 'user', 'system', 'unrelatedResult', 'emptyResult'];
+
+function interposedRow(kind: Interposed): JsonObject {
+  switch (kind) {
+    case 'assistantText': return { type: 'assistant', content: 'Still thinking.', tool_calls: [], tool_approval_requests: [] };
+    case 'user': return { type: 'user', content: 'Any news?' };
+    case 'system': return { type: 'system', content: 'A note from the host.' };
+    case 'unrelatedResult': return toolResultRow([toolResultEntry({ id: 'elsewhere', name: 'free', arguments: {} }, 'unrelated')]);
+    case 'emptyResult': return toolResultRow([]);
+  }
+}
+
+/**
+ * Rows after which the step is no longer the transcript tail a person was
+ * asked about: an approval may then fail closed (not run) rather than run.
+ */
+function movesTheTail(c: Case): boolean {
+  return c.interpose !== null && (c.interpose.kind === 'assistantText' || c.interpose.kind === 'user');
 }
 
 const ID_POOL = ['a', 'b', 'c', ''];
@@ -187,6 +237,10 @@ function generate(seed: number): Case {
       if (rng.chance(0.15)) requests.push({ ...verdict(), call });
     }
     requests = rng.shuffle(requests);
+    // Sometimes a request repeats an earlier request's APPROVAL id.
+    requests = requests.map((request, index) => (index > 0 && rng.chance(0.1)
+      ? { ...request, approval: rng.int(0, index - 1), verdict: 'none' as Verdict, reason: null }
+      : request));
     // An ungated call ran when its step was taken, so it has its result. A
     // gated call may already have one only where a result can say whose it is:
     // a result row is keyed by call id, so not in a step whose call ids repeat.
@@ -196,6 +250,19 @@ function generate(seed: number): Case {
 
   const again: Resume[] = [];
   for (let i = rng.int(0, 2); i > 0; i -= 1) again.push({ approveAll: rng.chance(0.7), path: rng.pick(PATHS) });
+  const interpose = rng.chance(0.35) ? { kind: rng.pick(INTERPOSED), where: rng.pick(['beforeDecisions', 'afterDecisions'] as const) } : null;
+  const failOnce = rng.chance(0.25);
+  // Spent: the resume makes no model call, so there is nothing to fail.
+  const spent = !failOnce && rng.chance(0.25);
+  let later: LaterStep | null = null;
+  if (source === 'model' && rng.chance(0.25)) {
+    const laterCalls: Call[] = [];
+    for (let i = rng.int(1, 3); i > 0; i -= 1) laterCalls.push({ id: rng.pick(ID_POOL), tool: rng.chance(0.7) ? 'echo' : 'free', token: 200 + laterCalls.length });
+    if (!laterCalls.some((call) => call.tool === 'echo')) laterCalls[0]!.tool = 'echo';
+    later = { calls: laterCalls, requests: laterCalls.flatMap((call, index) => (call.tool === 'echo' ? [{ ...verdict(), call: index }] : [])) };
+  }
+  // A resume that failed after its resolution is always followed by another.
+  if (failOnce && again.length === 0) again.push({ approveAll: rng.chance(0.5), path: rng.pick(PATHS) });
 
   return {
     seed,
@@ -208,6 +275,10 @@ function generate(seed: number): Case {
     recorder: rng.pick<Recorder>(['recordApproval', 'recordDecisions', 'streamDecision']),
     resume: rng.pick(PATHS),
     again,
+    interpose,
+    failOnce,
+    spent,
+    later,
   };
 }
 
@@ -224,16 +295,26 @@ interface Expected {
 }
 
 function expected(c: Case): Expected {
-  const dup = (ids: string[]): boolean => new Set(ids).size !== ids.length;
-  const repeated = dup(c.calls.map((call) => call.id)) || dup(c.requests.map((request) => c.calls[request.call]!.id));
+  const decided = decideStep(c.later?.calls ?? c.calls, c.later?.requests ?? c.requests, c.later === null ? c.prior : []);
+  if (c.later === null) return decided;
+  // The parked step was replaced: its gated calls are denied, its ungated
+  // calls keep the results they had when the step was taken.
+  for (const call of c.calls) decided.outcome.set(call.token, call.tool === 'free' ? `free:${call.token}` : REPLACED);
+  return decided;
+}
+
+function decideStep(calls: Call[], requests: Request[], prior: number[]): Expected {
+  const dup = (ids: (string | number)[]): boolean => new Set(ids).size !== ids.length;
+  const repeated = dup(calls.map((call) => call.id)) || dup(requests.map((request) => calls[request.call]!.id))
+    || dup(requests.map((request, index) => request.approval ?? index));
   const runs = new Set<number>();
   const outcome = new Map<number, string>();
-  c.calls.forEach((call, index) => {
+  calls.forEach((call, index) => {
     if (call.tool === 'free') {
       outcome.set(call.token, `free:${call.token}`);
       return;
     }
-    if (c.prior.includes(index)) {
+    if (prior.includes(index)) {
       outcome.set(call.token, `prior:${call.token}`);
       return;
     }
@@ -242,7 +323,7 @@ function expected(c: Case): Expected {
       return;
     }
     // Distinct ids: this call's own request, if it has one.
-    const own = c.requests.find((request) => request.call === index);
+    const own = requests.find((request) => request.call === index);
     if (own?.verdict === 'approve') {
       runs.add(call.token);
       outcome.set(call.token, `ran:${call.token}`);
@@ -273,6 +354,12 @@ const modes = new ModeRegistry({
   modes: { guarded: { system_prompt: 'Careful.', tools: ['echo', 'free'], max_steps: 6, requires_approval: ['echo'] } },
 });
 
+/** One step: the step that parks spends the run, so a resume resolves and stops. */
+const spentModes = new ModeRegistry({
+  default: 'guarded',
+  modes: { guarded: { system_prompt: 'Careful.', tools: ['echo', 'free'], max_steps: 1, requires_approval: ['echo'] } },
+});
+
 interface Rig {
   session: Session;
   agent: AgentRuntime;
@@ -293,17 +380,22 @@ function rig(c: Case): Rig {
     .register({ name: 'echo', handle: (args: JsonObject) => { ran.push(Number(args.n)); return `ran:${String(args.n)}`; } })
     .register({ name: 'free', handle: (args: JsonObject) => { freeRan.push(Number(args.n)); return `free:${String(args.n)}`; } });
   let served = c.source === 'stored';
+  let failing = c.failOnce;
   const client = async (request: LlmRequest): Promise<LlmResponse> => {
     if (!served) {
       served = true;
       return { text: '', finishReason: 'tool_calls', toolCalls: c.calls.map((call) => ({ id: call.id, name: call.tool, arguments: { n: call.token } })) };
+    }
+    if (failing) {
+      failing = false;
+      throw new Error('The model is unavailable (scripted).');
     }
     return request.schema === undefined
       ? { text: 'done', finishReason: 'stop' }
       : { text: '{"ok":true}', finishReason: 'stop', structured: { ok: true } };
   };
 
-  return { session, agent: new AgentRuntime({ client, modes, tools }), ran, freeRan };
+  return { session, agent: new AgentRuntime({ client, modes: c.spent ? spentModes : modes, tools }), ran, freeRan };
 }
 
 async function drain(stream: AsyncGenerator<RunStep, AgentResponse, undefined>): Promise<{ steps: RunStep[]; response: AgentResponse }> {
@@ -331,6 +423,8 @@ async function outcomes(session: Session): Promise<[number, string][]> {
   const step = all.findIndex((row) => row.type === 'assistant' && Array.isArray(row.tool_calls) && row.tool_calls.length > 0);
   return all.slice(step + 1).filter((row) => row.type === 'tool_result')
     .flatMap((row) => (row.tool_results as JsonObject[]))
+    // A result for no call of the step (an interposed row) is not an outcome of it.
+    .filter((entry) => typeof (entry.args as JsonObject).n === 'number')
     .map((entry) => [Number((entry.args as JsonObject).n), String(entry.result)]);
 }
 
@@ -374,8 +468,22 @@ async function runCase(c: Case): Promise<void> {
       'ungated calls run once when the step is taken', r.freeRan);
     check(r.ran.length === 0, '1: no gated call runs before a decision', r.ran);
     approvalIds = pending.map((p) => p.id);
+    if (c.later !== null) {
+      // The later step, as another writer could record it after the park.
+      const laterCalls = c.later.calls.map((call) => ({ id: call.id, name: call.tool, arguments: { n: call.token } }));
+      await r.session.thread().record([
+        {
+          ...assistantRow('', laterCalls, {}, c.later.requests.map((request, index) => ({
+            approval_id: `apr_later_${c.seed}_${index}`, tool_call_id: c.later!.calls[request.call]!.id, arguments_format: ARGUMENTS_AS_SENT,
+          }))),
+          harness_tool_names: ['echo', 'free'],
+        },
+        ...(c.later.calls.some((call) => call.tool === 'free') ? [toolResultRow(c.later.calls.filter((call) => call.tool === 'free')
+          .map((call) => toolResultEntry({ id: call.id, name: call.tool, arguments: { n: call.token } }, `free:${call.token}`)))] : []),
+      ]);
+    }
   } else {
-    approvalIds = c.requests.map((_request, index) => `apr_${c.seed}_${index}`);
+    approvalIds = c.requests.map((request, index) => `apr_${c.seed}_${request.approval ?? index}`);
     const calls = c.calls.map((call) => ({ id: call.id, name: call.tool, arguments: { n: call.token } }));
     await r.session.thread().record([
       { type: 'user', content: 'go' },
@@ -398,39 +506,64 @@ async function runCase(c: Case): Promise<void> {
     approved: c.requests[index]!.verdict === 'approve',
     reason: c.requests[index]!.reason,
   }));
-  let first: { steps: RunStep[] | null; response: AgentResponse };
-  if (c.recorder === 'streamDecision' && decisions.length > 0) {
-    first = await drain(r.agent.streamDecision(r.session, decisions));
-    const recorded = first.steps!.filter((step) => step.type === 'decision_recorded');
-    check(JSON.stringify(recorded.map((step) => [step.approvalId, step.verdict])) === JSON.stringify(decisions.map((d) => [d.approvalId, d.approved ? 'approved' : 'denied'])),
-      '6: one decision_recorded step per decision, as given');
+  // A later step's decisions follow; the replaced step's decisions are still recorded.
+  c.later?.requests.forEach((request, index) => {
+    const id = `apr_later_${c.seed}_${index}`;
+    approvalIds.push(id);
+    if (request.verdict !== 'none') decisions.push({ approvalId: id, approved: request.verdict === 'approve', reason: request.reason });
+  });
+  const streamed = c.recorder === 'streamDecision' && decisions.length > 0;
+  if (c.interpose !== null && (c.interpose.where === 'beforeDecisions' || streamed)) await r.session.thread().record([interposedRow(c.interpose.kind)]);
+  // The first resume: null when the model call after its resolution failed (failOnce).
+  type Turn = { steps: RunStep[] | null; response: AgentResponse };
+  const resumed = async (resume: () => Promise<Turn>): Promise<Turn | null> => {
+    if (!c.failOnce) return await resume();
+    let threw = false;
+    try { await resume(); } catch { threw = true; }
+    check(threw, 'the scripted model failure reaches the caller');
+    return null;
+  };
+  let first: Turn | null;
+  if (streamed) {
+    first = await resumed(async () => {
+      const run = await drain(r.agent.streamDecision(r.session, decisions));
+      const recorded = run.steps.filter((step) => step.type === 'decision_recorded');
+      check(JSON.stringify(recorded.map((step) => [step.approvalId, step.verdict])) === JSON.stringify(decisions.map((d) => [d.approvalId, d.approved ? 'approved' : 'denied'])),
+        '6: one decision_recorded step per decision, as given');
+      return run;
+    });
   } else {
     if (c.recorder === 'recordDecisions' && decisions.length > 0) await recordDecisions(r.session, decisions);
     else for (const d of decisions) await recordApproval(r.session, d.approvalId, d.approved, d.reason);
-    first = await turn(r, c.resume, '');
+    if (c.interpose?.where === 'afterDecisions') await r.session.thread().record([interposedRow(c.interpose.kind)]);
+    first = await resumed(async () => await turn(r, c.resume, ''));
   }
 
   // Invariants 1-4, then full equality with the oracle.
   check(r.ran.length === new Set(r.ran).size, '3: a call runs at most once', r.ran);
-  const denied = new Set(c.requests.filter((q) => q.verdict === 'deny').map((q) => c.calls[q.call]!.token));
+  const all = [...c.requests.map((q) => ({ q, call: c.calls[q.call]! })), ...(c.later?.requests ?? []).map((q) => ({ q, call: c.later!.calls[q.call]! }))];
+  const denied = new Set(all.filter(({ q }) => q.verdict === 'deny').map(({ call }) => call.token));
   check(r.ran.every((token) => !denied.has(token)), '1: a call a person denied never runs', r.ran);
-  const approves = c.requests.filter((q) => q.verdict === 'approve');
-  check(r.ran.every((token) => approves.some((q) => c.calls[q.call]!.token === token)), '2: each run call has its own approve', r.ran);
+  const approves = all.filter(({ q }) => q.verdict === 'approve');
+  check(r.ran.every((token) => approves.some(({ call }) => call.token === token)), '2: each run call has its own approve', r.ran);
   check(r.ran.length <= approves.length, '2: one decision decides at most one call', { ran: r.ran.length, approves: approves.length });
+  if (c.later !== null) check(r.ran.every((token) => token >= 200), 'a replaced step\'s approvals never run anything', r.ran);
   if (oracle.repeated) check(r.ran.length === 0, '4: a step with repeated ids runs none of its gated calls', r.ran);
-  check(sameSet(r.ran, oracle.runs), 'the calls that ran are exactly the oracle\'s', { ran: r.ran, expected: [...oracle.runs] });
+  if (movesTheTail(c)) check(r.ran.every((token) => oracle.runs.has(token)), 'the calls that ran are among the oracle\'s', { ran: r.ran, expected: [...oracle.runs] });
+  else check(sameSet(r.ran, oracle.runs), 'the calls that ran are exactly the oracle\'s', { ran: r.ran, expected: [...oracle.runs] });
 
   // Invariant 6 on the resume itself: what it says it ran is what ran.
-  check(first.response.toolCalls.filter((name) => name === 'echo').length === r.ran.length, '6: the resume reports the calls it ran', first.response.toolCalls);
-  if (first.steps !== null) {
+  if (first !== null) check(first.response.toolCalls.filter((name) => name === 'echo').length === r.ran.length, '6: the resume reports the calls it ran', first.response.toolCalls);
+  if (first !== null && first.steps !== null) {
     const results = first.steps.filter((step) => step.type === 'tool_result');
     const ok = results.flatMap((step) => (step.ok ? [Number(step.result.replace(/^ran:/, ''))] : []));
     check(sameSet(ok, r.ran) && ok.length === r.ran.length, '6: the ok tool_result steps are the calls that ran', ok);
-    const open = gatedTokens.filter((token) => !c.prior.includes(c.calls.findIndex((call) => call.token === token)));
+    const open = c.later !== null ? c.later.calls.filter((call) => call.tool === 'echo').map((call) => call.token)
+      : gatedTokens.filter((token) => !c.prior.includes(c.calls.findIndex((call) => call.token === token)));
     check(results.length === open.length, '6: one tool_result step per open gated call', { steps: results.length, open: open.length });
   }
 
-  await settledOutcomes(r, oracle, '5');
+  await settledOutcomes(r, c, oracle, '5');
 
   // Repeat resumes, with later decisions in between: nothing runs twice and
   // no outcome changes.
@@ -446,11 +579,11 @@ async function runCase(c: Case): Promise<void> {
   check(JSON.stringify(r.ran) === JSON.stringify(ranBefore), '3: a call runs at most once across any resume sequence', { before: ranBefore, after: r.ran });
   check(r.freeRan.length === c.calls.filter((call) => call.tool === 'free').length || c.source === 'stored', '3: an ungated call runs once', r.freeRan);
   if (c.source === 'stored') check(r.freeRan.length === 0, 'a stored ungated call with a result never runs', r.freeRan);
-  await settledOutcomes(r, oracle, '5 (after repeat resumes)');
+  await settledOutcomes(r, c, oracle, '5 (after repeat resumes)');
 }
 
 /** Invariants 5 and 6 on the thread rows: every call has exactly one outcome, the oracle's. */
-async function settledOutcomes(r: Rig, oracle: Expected, label: string): Promise<void> {
+async function settledOutcomes(r: Rig, c: Case, oracle: Expected, label: string): Promise<void> {
   const seen = new Map<number, Set<string>>();
   for (const [token, result] of await outcomes(r.session)) {
     if (!seen.has(token)) seen.set(token, new Set());
@@ -459,7 +592,10 @@ async function settledOutcomes(r: Rig, oracle: Expected, label: string): Promise
   for (const [token, want] of oracle.outcome) {
     const got = [...(seen.get(token) ?? [])];
     check(got.length === 1, `${label}: every call gets exactly one recorded outcome`, { token, got });
-    check(got[0] === want, `6: the recorded outcome matches what ran`, { token, got: got[0], want });
+    // Where the tail moved on, an approved call may fail closed: then its one
+    // outcome says it did not run, and it did not.
+    const closed = movesTheTail(c) && oracle.runs.has(token) && !r.ran.includes(token) && got[0] !== undefined && !got[0].startsWith('ran:');
+    check(got[0] === want || closed, `6: the recorded outcome matches what ran`, { token, got: got[0], want });
   }
   check([...seen.keys()].every((token) => oracle.outcome.has(token)), `${label}: no outcome for a call that is not in the step`, [...seen.keys()]);
 }
@@ -475,7 +611,8 @@ function withoutCall(c: Case, drop: number): Case | null {
   const remap = (index: number): number => (index > drop ? index - 1 : index);
   const keptRequests = c.requests.map((request, index) => ({ request, index })).filter(({ request }) => request.call !== drop);
   const position = new Map(keptRequests.map(({ index }, at) => [index, at]));
-  const requests = keptRequests.map(({ request }) => ({ ...request, call: remap(request.call) }));
+  const requests = keptRequests.map(({ request }) => ({ ...request, call: remap(request.call), approval: request.approval === undefined ? undefined : position.get(request.approval) }))
+    .map((request, at) => (request.approval === undefined || request.approval >= at ? { ...request, approval: undefined } : request));
   return {
     ...c,
     calls,
@@ -489,14 +626,19 @@ function withoutRequest(c: Case, drop: number): Case | null {
   if (c.source === 'model') return null;
   return {
     ...c,
-    requests: c.requests.filter((_request, index) => index !== drop),
+    requests: c.requests.filter((_request, index) => index !== drop).map((request) => (request.approval === undefined ? request
+      : request.approval === drop ? { ...request, approval: undefined } : { ...request, approval: request.approval > drop ? request.approval - 1 : request.approval })),
     order: c.order.filter((index) => index !== drop).map((index) => (index > drop ? index - 1 : index)),
   };
 }
 
 function smaller(c: Case): Case[] {
   const out: Case[] = [];
-  if (c.again.length > 0) out.push({ ...c, again: c.again.slice(0, -1) });
+  if (c.again.length > (c.failOnce ? 1 : 0)) out.push({ ...c, again: c.again.slice(0, -1) });
+  if (c.interpose !== null) out.push({ ...c, interpose: null });
+  if (c.failOnce) out.push({ ...c, failOnce: false });
+  if (c.spent) out.push({ ...c, spent: false });
+  if (c.later !== null) out.push({ ...c, later: null });
   for (let i = 0; i < c.calls.length; i += 1) { const s = withoutCall(c, i); if (s !== null) out.push(s); }
   for (let i = 0; i < c.requests.length; i += 1) { const s = withoutRequest(c, i); if (s !== null) out.push(s); }
   return out;
@@ -585,7 +727,7 @@ describe('G-392 property: approval pairing invariants over generated steps', () 
   });
 
   it('the generator reaches every shape the brief asks for', () => {
-    const cases = Array.from({ length: Math.max(EXAMPLES, 150) }, (_unused, index) => generate(caseSeed(BASE_SEED, index)));
+    const cases = Array.from({ length: DEFAULT_EXAMPLES }, (_unused, index) => generate(caseSeed(FIXED_BASE_SEED, index)));
     const has = (predicate: (c: Case) => boolean): boolean => cases.some(predicate);
     expect(has((c) => expected(c).repeated && c.source === 'model')).toBe(true);
     expect(has((c) => !expected(c).repeated && expected(c).runs.size > 0)).toBe(true);
@@ -595,5 +737,23 @@ describe('G-392 property: approval pairing invariants over generated steps', () 
     expect(has((c) => c.again.length > 0 && c.again.some((a) => a.approveAll))).toBe(true);
     for (const path of PATHS) expect(has((c) => c.resume === path)).toBe(true);
     expect(has((c) => c.recorder === 'streamDecision')).toBe(true);
+    // G-397: rows between the park and the decision, of every kind, both sides of the decisions.
+    for (const kind of INTERPOSED) {
+      for (const where of ['beforeDecisions', 'afterDecisions'] as const) {
+        expect(has((c) => c.interpose?.kind === kind && c.interpose.where === where && c.recorder !== 'streamDecision'), `${kind} ${where}`).toBe(true);
+      }
+      expect(has((c) => c.interpose?.kind === kind && expected(c).repeated && c.requests.some((q) => q.verdict === 'approve')), `${kind} in a repeated-id step`).toBe(true);
+    }
+    expect(has((c) => c.interpose !== null && c.recorder === 'streamDecision')).toBe(true);
+    // A resume that ends after its resolution, with a row between: the next resume must run nothing again.
+    expect(has((c) => c.failOnce && c.interpose?.kind === 'system' && c.interpose.where === 'afterDecisions' && expected(c).runs.size > 0)).toBe(true);
+    // G-399: an inserted row, a resume that stops with no assistant row (steps spent), then repeat resumes.
+    expect(has((c) => c.spent && c.interpose !== null && !movesTheTail(c) && expected(c).runs.size > 0 && c.again.length > 0), 'spent + interposed + again').toBe(true);
+    // G-397: a later tool-call step replaces the parked one, with approvals for both.
+    expect(has((c) => c.later !== null && c.requests.some((q) => q.verdict === 'approve') && c.later.requests.some((q) => q.verdict === 'approve')), 'later step').toBe(true);
+    expect(has((c) => c.later !== null && decideStep(c.later.calls, c.later.requests, []).repeated), 'later step repeating ids').toBe(true);
+    expect(has((c) => c.later !== null && c.later.calls.some((call) => c.calls.some((old) => old.id === call.id))), 'later step reusing an old id').toBe(true);
+    // G-397: stored requests that repeat an APPROVAL id, with an approval recorded.
+    expect(has((c) => c.requests.some((q) => q.approval !== undefined) && c.requests.some((q) => q.verdict === 'approve')), 'repeated approval id').toBe(true);
   });
 });
