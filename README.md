@@ -331,13 +331,21 @@ as they were, provided nobody else has written them since, and releases its
 holds; a count hold it could not release expires after `lock_ttl`. A runner
 start acts on no recorded decision: its task row ends every call the child
 was still waiting on, recorded as not run, and such a call never reads as
-approved in the child's plan. A decision a person recorded that a resume
+approved in the child's plan. The harness recognises such a call only by a
+mark it writes itself on that entry, naming the approval it ended; never by
+the result's words or by a tool call id, so a tool whose output happens to
+read "Not run", or a provider that reuses call ids, cannot make an approved
+call that ran read as ended, nor end a later approval. A decision a person recorded that a resume
 could still act on refuses the start, as an approval waiting on a person
 does, so a re-delegation never ends a call a person decided. While its
 records are provisional the child keeps the run tree and plan budget it was
 last confirmed with, so no later start or turn detaches it from them. A tool
 provider may read the child's session state while a start resolves its
-tools; the resolution view refuses writes only. Whether an approval on the child could be answered is decided by
+tools; the resolution view refuses writes only. Inside the start's own run
+those reads see what the start committed (its mode, binding, run tree, depth,
+ceiling and run), so a provider that offers tools by mode is never shown the
+child's previous mode; every other reader, and any decision or turn, keeps
+the provisional rule until the task row. Whether an approval on the child could be answered is decided by
 the known reasons only (no binding, too deep); a store read that fails
 there fails the start rather than counting the approval unanswerable.
 Any failure while it starts or runs the child comes back as a framed

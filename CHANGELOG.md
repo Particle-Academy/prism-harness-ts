@@ -99,6 +99,26 @@
   limit", in `RunBudget.fromConfig`, the runtime config, modes and plan
   budgets (now pinned by tests).
 
+### Fixed: a runner start's own reads, and how an ended call is recognised (G-387 round 11)
+
+- A call a runner start's task row ended is recognised only by a mark the
+  harness writes on that entry (`not_run: 'delegation_ended'`, with the
+  `approval_id` it ended), never by the "Not run" text: a tool whose result
+  is exactly that text is an ordinary result, and its approval stays
+  approved. The mark applies only to the approval it names, asked for before
+  it, so a provider that reuses tool call ids across turns can no longer make
+  a later approval (a plan draft, a plan step) read as ended.
+- Inside a runner start's own run, the child's Session (and the read-only
+  view a tool provider is given) reads what the start committed: its mode,
+  binding, run tree, depth, ceiling and run. The plan context of the start
+  follows its mode and run. Every other Session object on the child, and any
+  decision or turn, even one entered on the start's own Session, keeps the
+  provisional rule until the task row.
+- A start's task is marked recorded the moment its row is written, before
+  any event for the calls it ended: a failure after that never undoes it.
+- Warnings about a failed budget, plan or step-sequence update name the
+  error's class by the named-class rule only, never a path or its message.
+
 ### Fixed: provisional child records, round 10 (G-387)
 
 - A child whose records a runner start left provisional reads as the run

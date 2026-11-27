@@ -1,3 +1,4 @@
+import { failureName } from './failures.js';
 import type { JsonObject } from './json.js';
 import { PlanBudget, type PlanBudgetGrant, type PlanBudgetState, type RunContextKind } from './plans/budget.js';
 import { RunBudgets, type AllowanceFacts, type StepAllowance } from './run-budgets.js';
@@ -363,7 +364,7 @@ export const RunTrees = {
         await store.put(name, PlanBudget.settle(state, request.spends, 0, 0) as unknown as JsonObject);
       }, 10, 5);
     } catch (error) {
-      process.emitWarning(`A run tree budget update failed: ${error instanceof Error ? error.constructor.name : typeof error}.`);
+      process.emitWarning(`A run tree budget update failed: ${failureName(error)}.`);
     }
   },
 
@@ -380,7 +381,7 @@ export const RunTrees = {
       await write(session.planStore(), entry.tree, (state) => [state === null ? null : PlanBudget.settle(state, runId, steps, cost), null]);
     } catch (error) {
       // The hold stays and is charged in full once it expires.
-      process.emitWarning(`A run tree budget update failed: ${error instanceof Error ? error.constructor.name : typeof error}.`);
+      process.emitWarning(`A run tree budget update failed: ${failureName(error)}.`);
     }
   },
 };
