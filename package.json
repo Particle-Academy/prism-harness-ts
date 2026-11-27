@@ -1,6 +1,6 @@
 {
   "name": "@particle-academy/prism-harness",
-  "version": "0.11.2",
+  "version": "0.11.3",
   "description": "Durable agent sessions for TypeScript — threads, session state and store drivers.",
   "type": "module",
   "sideEffects": false,
