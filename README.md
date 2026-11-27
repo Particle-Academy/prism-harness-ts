@@ -310,10 +310,11 @@ decision: authorize before calling `recordApproval()`. `recordDecisions(session,
 
 A paused step is replaced when a later step with tool calls is recorded after
 it, or when your application records a user or assistant message on the thread
-outside the run that paused. Each of its calls that has no result is then
-answered with "Tool call was not run because a later step replaced it", and
-none of them runs. A decision recorded for a replaced step is refused with
-`approval_not_pending`, and nothing is recorded.
+with `thread().record()`, whatever run id it passes. Each of its calls that
+has no result is then answered with "Tool call was not run because a later
+step replaced it", and none of them runs. A decision recorded for a replaced
+step is refused with `approval_not_pending`, and nothing is recorded. A tool
+result answers only a call of the step it was recorded after.
 
 ## Run steps for a UI
 
