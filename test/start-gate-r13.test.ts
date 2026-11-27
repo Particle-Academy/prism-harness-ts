@@ -370,7 +370,7 @@ describe('item 3: decisions on a repeated-id step are recorded as denials; resul
     }
   }
 
-  it('every decision path records the denial: recordDecisions, decide and streamDecision (a decision step reports what was recorded)', async () => {
+  it('every decision path records the denial: recordDecisions, decide and streamDecision (its decision step reports the decision as given)', async () => {
     for (const path of ['recordDecisions', 'decide', 'streamDecision'] as const) {
       const r = new Rig();
       const ids = await r.parked([['echo', { n: 1 }, 'dup'], ['echo', { n: 2 }, 'dup']]);
@@ -383,7 +383,8 @@ describe('item 3: decisions on a repeated-id step are recorded as denials; resul
         r.text('Resumed.');
         for await (const step of r.runtime.streamDecision(r.child(), decisions)) steps.push(step as unknown as JsonObject);
         const recorded = steps.filter((step) => step.type === 'decision_recorded');
-        expect(recorded.map((step) => [step.verdict, step.reason]), path).toEqual(ids.map(() => ['denied', REPEATED_CALL_ID_RESULT]));
+        // The step reports the decision as given, as the PHP reference streams it; the row holds the denial.
+        expect(recorded.map((step) => [step.verdict, step.reason]), path).toEqual(ids.map(() => ['approved', 'Fine by me.']));
       }
       const stored = storedDecisions(await r.rows());
       for (const approvalId of ids) expect(stored.get(approvalId), path).toEqual({ approval_id: approvalId, approved: false, reason: REPEATED_CALL_ID_RESULT });

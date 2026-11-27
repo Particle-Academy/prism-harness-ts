@@ -12,9 +12,9 @@
   that never ran as approved work. Pinned by the harness-thread-rows corpus.
 - Every decision recorded on a step whose calls repeat a tool call id is
   recorded as a denial with the repeated-id reason, on every decision path
-  (`recordApproval()`, `recordDecisions()`, `decide()`, `streamDecision()`,
-  whose `decision_recorded` step now reports the decision as recorded), as
-  the PHP reference records it. Pinned by the harness-approval-pairing corpus.
+  (`recordApproval()`, `recordDecisions()`, `decide()`, `streamDecision()`),
+  as the PHP reference records it. A `decision_recorded` step still reports
+  the decision as given, as the reference streams it. Pinned by the harness-approval-pairing corpus.
 - A call's result is paired with it by its position in the step, never by
   its tool call id: an ungated call's result no longer makes a gated call
   sharing its id look finished, nor takes its approval in the plan's view of

@@ -553,6 +553,9 @@ export const REPEATED_CALL_ID = 'repeated_call_id';
  */
 export const NOT_RUN_KEY = 'not_run';
 
+/** Every call counts as gated: the pairing when the caller cannot tell (a stored row read alone). */
+const EVERY_CALL = (): boolean => true;
+
 /**
  * Each call of one assistant step paired with its OWN approval request, by
  * position (G-392), and whether the step repeats a tool call id.
@@ -574,7 +577,7 @@ export const NOT_RUN_KEY = 'not_run';
 export function pairStepApprovals(
   calls: readonly JsonObject[],
   requests: readonly JsonObject[],
-  gated: (call: JsonObject, position: number) => boolean = () => true,
+  gated: (call: JsonObject, position: number) => boolean = EVERY_CALL,
 ): { approvalIds: (string | undefined)[]; repeated: boolean } {
   const ids = calls.map((call) => text(call.id));
   const asked = requests.map((request) => text(request.tool_call_id));
@@ -587,8 +590,10 @@ export function pairStepApprovals(
     const free = (position: number, id: string): boolean => approvalIds[position] === undefined && id === want;
     let at = ids.findIndex((id, position) => position >= cursor && free(position, id) && gated(calls[position]!, position));
     if (at === -1) at = ids.findIndex((id, position) => free(position, id) && gated(calls[position]!, position));
-    if (at === -1) at = ids.findIndex((id, position) => position >= cursor && free(position, id));
-    if (at === -1) at = ids.findIndex((id, position) => free(position, id));
+    // A request pairs only with a GATED call (round 13): when the caller says
+    // which calls are gated, an ungated call never takes an approval.
+    if (at === -1 && gated === EVERY_CALL) at = ids.findIndex((id, position) => position >= cursor && free(position, id));
+    if (at === -1 && gated === EVERY_CALL) at = ids.findIndex((id, position) => free(position, id));
     if (at === -1) continue;
     approvalIds[at] = text(request.approval_id);
     cursor = at + 1;

@@ -747,10 +747,9 @@ export class AgentRuntime {
       // (G-360): this stream opens with it even when the decision ended it, or
       // the reader would never learn that a draft was rejected.
       let decidedPlan = false;
-      let recorded: ApprovalDecision[];
       const capture = live.planService()?.watch(live.key(), () => { decidedPlan = true; }) ?? (() => {});
       try {
-        recorded = await writeDecisions(live, decisions, context);
+        await writeDecisions(live, decisions, context);
       } finally {
         capture();
       }
@@ -762,8 +761,9 @@ export class AgentRuntime {
       const unwatch = await this.#watchPlan(live, tagger, decidedPlan);
 
       try {
-        // Each decision as RECORDED (round 13: a repeated-id step's as denials).
-        for (const decision of recorded) {
+        // Each decision AS GIVEN, as the PHP reference streams it; what the
+        // thread recorded (a repeated-id step's as denials) is in its rows.
+        for (const decision of decisions) {
           // From the APP's run context, never from the model or the request.
           tagger.decision(decision.approvalId, decision.approved, decision.reason ?? null, context?.actor ?? null);
         }
@@ -1702,8 +1702,10 @@ export class AgentRuntime {
     // result of a call with unusable arguments) must not make the gated call
     // look finished, nor take its approval.
     const answeredAt = stepResultsByPosition(rows, stored);
-    const pairing = pairStepApprovals(assistant.tool_calls, assistant.tool_approval_requests,
-      (call, position) => typeof call.name === 'string' && mode.needsApproval(call.name) && !answeredAt[position]);
+    // A request pairs only with a call that has no result of its own: the
+    // calls the step ran at once (ungated, or with unusable arguments) never
+    // take an approval. (Not the mode's list: a plan tool gates itself.)
+    const pairing = pairStepApprovals(assistant.tool_calls, assistant.tool_approval_requests, (_call, position) => !answeredAt[position]);
     // A step that repeats a call id: its gated calls are open until the
     // harness settled the step.
     const settled = pairing.repeated && repeatedStepSettled(rows, stored);
