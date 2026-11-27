@@ -299,11 +299,25 @@ export const PlanMachine = {
    * or from model text.
    *
    * @param newTurn a turn with a new user message is starting: every pending approval is about to end
+   * @param ended approvals whose call a runner start's task row ended as not
+   *   run (G-387 round 10): an agent step no longer counts them approved;
+   *   they read as superseded, never as approved work
    */
-  reconcile(original: Plan, pending: readonly PendingCall[], decided: ReadonlyMap<string, boolean>, now: number, runId: string | null, newTurn = false): Plan {
+  reconcile(original: Plan, pending: readonly PendingCall[], decided: ReadonlyMap<string, boolean>, now: number, runId: string | null, newTurn = false, ended: readonly string[] = []): Plan {
     if (!PlanMachine.LIVE.includes(original.status)) return original;
     let plan = copy(original);
     const pendingIds = pending.map((entry) => entry.id);
+
+    if (ended.length > 0) {
+      for (const step of plan.steps) {
+        if (step.owner !== 'agent') continue;
+        const gone = step.approvedIds.filter((id) => ended.includes(id));
+        if (gone.length === 0) continue;
+        step.approvedIds = diff(step.approvedIds, gone);
+        step.approvalIds = diff(step.approvalIds, gone);
+        step.supersededApprovalIds = [...step.supersededApprovalIds, ...gone];
+      }
+    }
 
     const known = boundIds(plan);
     const find = (name: string, digest: string | null): string | null => {

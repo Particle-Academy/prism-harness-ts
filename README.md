@@ -330,7 +330,14 @@ It does clean up, as housekeeping: it puts the child's records and mode back
 as they were, provided nobody else has written them since, and releases its
 holds; a count hold it could not release expires after `lock_ttl`. A runner
 start acts on no recorded decision: its task row ends every call the child
-was still waiting on, recorded as not run. Whether an approval on the child could be answered is decided by
+was still waiting on, recorded as not run, and such a call never reads as
+approved in the child's plan. A decision a person recorded that a resume
+could still act on refuses the start, as an approval waiting on a person
+does, so a re-delegation never ends a call a person decided. While its
+records are provisional the child keeps the run tree and plan budget it was
+last confirmed with, so no later start or turn detaches it from them. A tool
+provider may read the child's session state while a start resolves its
+tools; the resolution view refuses writes only. Whether an approval on the child could be answered is decided by
 the known reasons only (no binding, too deep); a store read that fails
 there fails the start rather than counting the approval unanswerable.
 Any failure while it starts or runs the child comes back as a framed

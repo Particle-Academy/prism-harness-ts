@@ -801,3 +801,78 @@ describe('item 8: a call a runner start ended reads as ended, never approved', (
     expect(after.supersededApprovalIds).toContain(echo);
   });
 });
+
+// ---------------------------------------------------------------------------
+// New channels considered (round 10), each with a test.
+// ---------------------------------------------------------------------------
+
+describe('round 10: new channels considered', () => {
+  it('the refs kept beside a provisional record are never read for a confirmed one: a failed housekeeping clear leaves the new refs in force', async () => {
+    const r = new Rig();
+    await r.session().usingMode('lead');
+    const first = await delegatedChild(r);
+    // A second delegation in a NEW parent turn (a new tree), whose
+    // housekeeping clear fails: the record keeps the first tree beside it.
+    vi.spyOn(Session.prototype as unknown as { confirmChildStart: () => Promise<void> }, 'confirmChildStart').mockRejectedValue(new Error('STORE-SECRET'));
+    r.calls([['a', { task: 'Second task' }]]);
+    r.text('Child done.');
+    r.text('Parent done.');
+    await r.runtime.send(r.session(), 'Delegate again');
+    vi.restoreAllMocks();
+
+    const stored = await childRecord(r);
+    expect(Object.hasOwn(stored, 'child_provisional')).toBe(true);
+    expect(stored.child_confirmed_refs).toMatchObject({ tree: first });
+    const refs = await r.child().childRefs();
+    expect(refs?.tree).not.toEqual(first);
+    expect(refs?.tree?.session).toBe(r.session().key());
+  });
+
+  it('a kept-refs field forged onto a confirmed record changes nothing', async () => {
+    const r = new Rig();
+    await r.session().usingMode('lead');
+    const tree = await delegatedChild(r);
+    await setChildRecord(r, (stored) => ({ ...stored, child_confirmed_refs: { tree: { session: 'elsewhere', run: 'run_x' }, plan_ledger: null } }));
+
+    expect((await r.child().childRefs())?.tree).toEqual(tree);
+  });
+
+  it('a failed start whose undo succeeds leaves the child record exactly as it was (no kept refs left behind)', async () => {
+    const r = new Rig();
+    await r.session().usingMode('lead');
+    await delegatedChild(r);
+    const before = await durableOf(r, r.child());
+    failChildRegistry();
+
+    expect(await directStart(r, 'runner', 'Retry')).toMatch(/failed/);
+    vi.restoreAllMocks();
+    expect(await durableOf(r, r.child())).toBe(before);
+  });
+
+  it("the resolution view's read accessor is only ever used to read messages (source scan)", async () => {
+    const { readFile } = await import('node:fs/promises');
+    const source = await readFile(new URL('../src/session.ts', import.meta.url), 'utf8');
+    const uses = source.split(/\r?\n/).filter((line) => line.includes('#threadOf()') && !line.includes('#threadOf(): Thread'));
+    // thread(), the write-guarded accessor, hands it out after its guard; every other use reads messages.
+    expect(uses.filter((line) => line.trim() === 'return this.#threadOf();')).toHaveLength(1);
+    const reads = uses.filter((line) => line.trim() !== 'return this.#threadOf();');
+    expect(reads.length).toBeGreaterThan(0);
+    for (const line of reads) expect(line).toMatch(/#threadOf\(\)\.messages\(\)/);
+  });
+
+  it("a tool result that only copies a start's ended text is not read as ended unless it is the start's own row", async () => {
+    const { endedByStart, endedByStartResult } = await import('../src/thread-rows.js');
+    const asked: JsonObject = { type: 'assistant', content: '', tool_calls: [{ id: 'c1', name: 'echo', arguments: {} }], tool_approval_requests: [{ approval_id: 'apr_1', tool_call_id: 'c1' }] };
+    const result = (text: string): JsonObject => ({ type: 'tool_result', tool_results: [{ tool_call_id: 'c1', tool_name: 'echo', result: text }], tool_approval_responses: [] });
+    const user: JsonObject = { type: 'user', content: 'Next' };
+    const reply: JsonObject = { type: 'assistant', content: 'Done.' };
+
+    // The call ran and its tool answered with the same words: not ended.
+    expect([...endedByStart([asked, result(endedByStartResult('echo')), reply])]).toEqual([]);
+    // Another tool's text, or a near copy: not ended.
+    expect([...endedByStart([asked, result(endedByStartResult('other')), user])]).toEqual([]);
+    expect([...endedByStart([asked, result(`${endedByStartResult('echo')} `), user])]).toEqual([]);
+    // The start's own row, right before its task row: ended.
+    expect([...endedByStart([asked, result(endedByStartResult('echo')), user])]).toEqual(['apr_1']);
+  });
+});

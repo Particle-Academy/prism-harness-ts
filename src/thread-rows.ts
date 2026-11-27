@@ -241,6 +241,78 @@ export function pendingApprovalIds(rows: readonly JsonObject[]): string[] {
 }
 
 /**
+ * The approval ids the run paused at the transcript tail asked for whose
+ * call has no result yet, pending OR decided (G-387 round 10): a resume would
+ * act on each of them. Read newest first, as pendingApprovalIds() is; a user
+ * turn ends the scope.
+ */
+export function unresolvedApprovalIds(rows: readonly JsonObject[]): string[] {
+  const finished = new Set<string>();
+  for (let index = rows.length - 1; index >= 0; index -= 1) {
+    const row = rows[index]!;
+    if (row.type === 'tool_result') {
+      for (const result of list(row.tool_results)) {
+        if (typeof result.tool_call_id === 'string') finished.add(result.tool_call_id);
+      }
+      continue;
+    }
+    if (row.type === 'user') return [];
+    if (row.type !== 'assistant') continue;
+
+    return [...new Set(list(row.tool_approval_requests)
+      .filter((request) => typeof request.tool_call_id !== 'string' || !finished.has(request.tool_call_id))
+      .map((request) => request.approval_id)
+      .filter((id): id is string => typeof id === 'string' && id !== ''))];
+  }
+
+  return [];
+}
+
+/**
+ * The result a runner start's task row records for a call its child was
+ * parked on (G-387 round 9): not run, whatever decision is recorded on it.
+ * Read back by endedByStart() so a decision on such a call never reads as
+ * approved work (round 10).
+ *
+ * @internal
+ */
+export function endedByStartResult(tool: string): string {
+  return `Not run: ${tool} was waiting on an approval when its delegation ended and a new task was given.`;
+}
+
+/**
+ * The approval ids whose call a runner start's task row ended as not run
+ * (G-387 round 10): their decision, if any, was never acted on, so it reads
+ * as ended, never as approved. Such a result is the start's own row: its
+ * exact text for its tool, in the tool result row written directly before
+ * the start's task row (one write). A tool result that only copies the
+ * text, anywhere else, is not one; one that also sat right before a new
+ * message could only make a decision read as ended, never as approved.
+ *
+ * @internal
+ */
+export function endedByStart(rows: readonly JsonObject[]): Set<string> {
+  const calls = new Set<string>();
+  for (const [index, row] of rows.entries()) {
+    if (row.type !== 'tool_result' || rows[index + 1]?.type !== 'user') continue;
+    for (const result of list(row.tool_results)) {
+      if (typeof result.tool_call_id === 'string' && typeof result.tool_name === 'string'
+        && result.result === endedByStartResult(result.tool_name)) calls.add(result.tool_call_id);
+    }
+  }
+  const ended = new Set<string>();
+  if (calls.size === 0) return ended;
+  for (const row of rows) {
+    if (row.type !== 'assistant') continue;
+    for (const request of list(row.tool_approval_requests)) {
+      if (typeof request.approval_id === 'string' && typeof request.tool_call_id === 'string' && calls.has(request.tool_call_id)) ended.add(request.approval_id);
+    }
+  }
+
+  return ended;
+}
+
+/**
  * Every approval id the run paused at the transcript tail asked for, answered
  * or not; empty when the tail is a user turn or an assistant step that asked
  * nothing. A turn with no new message continues exactly these calls (G-366).

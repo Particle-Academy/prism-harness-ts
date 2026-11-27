@@ -297,6 +297,11 @@ describe('the re-delegation refusal is atomic (item 2)', () => {
     const r = new Rig({ declared: { a: 3 } });
     await r.runner('a');                          // one step, parks
     await recordApproval(r.child(), (await r.pending(r.child()))[0]!, true);
+    // G-387 round 10: a recorded decision no resume has acted on refuses a
+    // runner start at its gate (child_waiting), so the decision is acted on
+    // first; the turn that claims in the race below is a new message.
+    r.text('Child done.');
+    await r.runtime.send(r.child(), '');
     for (let i = 0; i < 4; i += 1) r.calls([['lookup', { q: i }]]);
     let release: () => void = () => {};
     let resume: Promise<unknown> | null = null;
@@ -311,7 +316,7 @@ describe('the re-delegation refusal is atomic (item 2)', () => {
         const started = new Promise<void>((resolve) => {
           r.beforeRequest = async () => { resolve(); await new Promise<void>((done) => { release = done; }); };
         });
-        resume = r.runtime.send(r.child(), '').catch(() => null);
+        resume = r.runtime.send(r.child(), 'Host turn').catch(() => null);
         await started;
       }
       return remember.apply(this, args);

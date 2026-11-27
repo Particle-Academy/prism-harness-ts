@@ -1,5 +1,5 @@
 import type { JsonObject, JsonValue } from '../json.js';
-import { pendingApprovalIds } from '../thread-rows.js';
+import { endedByStart, pendingApprovalIds } from '../thread-rows.js';
 import { argsDigest } from '../tool-policy.js';
 import type { PendingCall } from './machine.js';
 
@@ -43,13 +43,19 @@ export function pendingApprovalCalls(rows: readonly JsonObject[]): PendingCall[]
   return calls;
 }
 
-/** Every recorded decision, by approval id: true when approved. The first decision for an id stands. */
+/**
+ * Every recorded decision, by approval id: true when approved. The first
+ * decision for an id stands. A decision on a call a runner start's task row
+ * ended as not run is left out (G-387 round 10): it was never acted on, so
+ * the plan reads that approval as ended, never as approved work.
+ */
 export function approvalDecisions(rows: readonly JsonObject[]): Map<string, boolean> {
   const decided = new Map<string, boolean>();
+  const ended = endedByStart(rows);
   for (const row of rows) {
     if (row.type !== 'tool_result') continue;
     for (const response of list(row.tool_approval_responses)) {
-      if (typeof response.approval_id === 'string' && !decided.has(response.approval_id)) {
+      if (typeof response.approval_id === 'string' && !decided.has(response.approval_id) && !ended.has(response.approval_id)) {
         decided.set(response.approval_id, response.approved === true);
       }
     }
