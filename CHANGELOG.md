@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+### Fixed: one outcome per call when a new message or a host row lands during a resume, and a replay that shows each result once (G-387 round 14)
+
+- A new message on a session parked on approvals denies each of the paused
+  step's calls that has not run yet, including calls a person approved that
+  no resume has acted on, even if that new turn then fails: the denial is
+  written in the same write as the message, so neither is ever stored
+  without the other.
+- That write is serialised with the resume: while a resume is running an
+  approved call, a new message waits for it (on the session lock, up to
+  `lock_wait`), and a host `thread().record()` of a row that would replace
+  the step is refused with `session_locked` and writes nothing. A call that
+  ran is never also recorded as not run.
+- A decision's pending check is made again inside the thread write, so a
+  decision recorded while a new message or a host row replaces the step is
+  refused `approval_not_pending`, all-or-nothing per batch, in every window;
+  and an approval answered by the harness's own replaced or ended mark is
+  never read as pending.
+- The replay a provider is sent folds results by call id, tool name and
+  arguments, occurrence by occurrence (as the reference does), never by call
+  id alone, so two calls that share an id each keep their result, and each
+  result is shown once, in its own step's segment, even when a copy of it
+  was stored after a row of another kind. The resume carries every earlier
+  result of the step as stored.
+- A copy of an earlier result of the same step answers no other call.
+- Only the runtime's own record call counts as written inside its run: a row
+  a store hook or listener records during that write is outside it.
+- A structured turn parked on approvals returns `structured: null`, never a
+  document it has not validated (pinned with a provider that keeps text on a
+  tool-call step).
+
 ### Fixed: ended approvals in steps that repeat a call id, and cleanup on success (G-387 round 13)
 
 - An approval a runner start ended reads ended when ANY result row of its

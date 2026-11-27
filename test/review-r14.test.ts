@@ -428,6 +428,17 @@ describe('item 3 (I-1): a copy of an earlier result answers nothing new', () => 
     expect(r.echoed).toEqual([]);
   });
 
+  it('channel: two IDENTICAL ungated calls in one step each keep their result (a copy is only one from an EARLIER row): a superseding row denies only the gated call', async () => {
+    const r = new Rig();
+    const [id] = await r.parked('chat', [['free', { n: 1 }, 'c'], ['free', { n: 1 }, 'c'], ['echo', { n: 2 }, 'd']]);
+    expect(r.freed).toEqual([1, 1]);
+    await r.session().thread().record([{ type: 'user', content: 'Host row.' }]);
+    const rows = await r.rows();
+    const denial = rows.find((row) => Object.hasOwn(row, 'harness_superseded'))!;
+    expect(((denial.tool_results ?? []) as JsonObject[]).map((entry) => entry.tool_call_id)).toEqual(['d']);
+    expect(supersededApprovals(rows).has(id!)).toBe(true);
+  });
+
   it('distinct ids: the copy of an ungated result never answers the gated call by the id-only fallback', async () => {
     const r = new Rig();
     // Two calls under distinct ids; a copy of free's result recorded under the gated call's id-free fallback cannot exist, so the copy answers nothing.
@@ -495,8 +506,10 @@ describe('item 5: a result is replayed once', () => {
     ]);
     const counts = emitted({ messages: view } as unknown as LlmRequest);
     expect([...counts.entries()].sort()).toEqual([[JSON.stringify(['e', 'echo', { n: 2 }]), 1], [JSON.stringify(['f', 'free', { n: 1 }]), 1]]);
-    // Each in its own segment: every result row sits after the step and before any later step.
-    expect(view.map((row) => row.type)).toEqual(['user', 'assistant', 'tool_result', 'user']);
+    // Each in its own segment (after the step, no later step), and the copy
+    // replaced in place: the later row shows only what is new in it.
+    expect(view.map((row) => row.type)).toEqual(['user', 'assistant', 'tool_result', 'user', 'tool_result']);
+    expect(((view[4]!.tool_results ?? []) as JsonObject[]).map((entry) => entry.tool_call_id)).toEqual(['e']);
   });
 });
 

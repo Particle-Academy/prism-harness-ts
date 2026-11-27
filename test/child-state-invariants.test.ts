@@ -829,17 +829,20 @@ describe('G-387 round 13: the matrix, extended (item 6) and the mixed repeated r
  * the runner; WHILE the approved call runs, from a fresh Session:
  *   host_record  a host thread().record() of a superseding row (user, text,
  *                or an assistant step with tool calls)
- *   new_message  a new message (send with a prompt): it waits for the
- *                resolution (`waited`), then runs (`ran`)
+ *   new_message  a new message (send with a prompt, no context): refused
+ *                `run_not_permitted` before it writes anything, because the
+ *                resumed turn holds the child's run tree; `waited+` would
+ *                prefix it had it reached its write and waited on the
+ *                resolution (the root case is review-r14's PR2)
  *   approval     a decision on the same approval (it waits on the session
  *                lock; its answer once the call has its result)
  * Measured after: the call's outcomes (exactly one, its real result), how
  * often it ran, and whether any reader takes it for replaced.
  */
 export const EXPECTED_R14: Record<string, Record<string, string>> = {
-  user: { host_record: 'session_locked', new_message: 'waited+ran', approval: ENDED, outcomes: 'ok', echoed: '1', superseded: 'no', decided: 'approved' },
-  assistant_text: { host_record: 'session_locked', new_message: 'waited+ran', approval: ENDED, outcomes: 'ok', echoed: '1', superseded: 'no', decided: 'approved' },
-  assistant_tool_step: { host_record: 'session_locked', new_message: 'waited+ran', approval: ENDED, outcomes: 'ok', echoed: '1', superseded: 'no', decided: 'approved' },
+  user: { host_record: 'session_locked', new_message: 'run_not_permitted', approval: ENDED, outcomes: 'ok', echoed: '1', superseded: 'no', decided: 'approved' },
+  assistant_text: { host_record: 'session_locked', new_message: 'run_not_permitted', approval: ENDED, outcomes: 'ok', echoed: '1', superseded: 'no', decided: 'approved' },
+  assistant_tool_step: { host_record: 'session_locked', new_message: 'run_not_permitted', approval: ENDED, outcomes: 'ok', echoed: '1', superseded: 'no', decided: 'approved' },
 };
 
 describe('G-387 round 14: the matrix, extended with a concurrent supersede (G-404)', () => {
@@ -879,14 +882,14 @@ describe('G-387 round 14: the matrix, extended with a concurrent supersede (G-40
         message = acting.run('message', () => turn(r, r.child(), 'More work.'));
         void message.then(() => { messageDone = true; for (const wake of wakers.splice(0)) wake(); });
         await until(() => queued.has('message') || messageDone);
-        got.new_message = queued.has('message') ? 'waited' : 'did_not_wait';
+        got.new_message = queued.has('message') ? 'waited+' : '';
         decision = acting.run('decision', () => approve(r.child(), parked));
         void decision.then(() => { decisionDone = true; for (const wake of wakers.splice(0)) wake(); });
         await until(() => queued.has('decision') || decisionDone);
       };
       r.text('Resumed.');
       await r.runtime.send(r.child(), '');
-      got.new_message = `${got.new_message}+${await message!}`;
+      got.new_message = `${got.new_message}${await message!}`;
       got.approval = await decision!;
       vi.restoreAllMocks();
 

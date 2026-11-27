@@ -348,7 +348,13 @@ id. A paused step that a later step replaces (any later assistant row with tool
 calls, or an assistant or user row recorded outside its run, a new message
 included) gives each call still waiting ONE result, "Tool call was not run because a
 later step replaced it", and nothing from it runs: to act on recorded decisions, resume
-with an empty prompt before sending a new message. A decision applies only to the step whose approvals were requested, taken
+with an empty prompt before sending a new message. A new message denies even an
+approved call that has not run yet, and does so even if its own turn then fails;
+its denial and its message are one write. While a resume is running an approved
+call, a new message waits for it on the session lock (up to `lock_wait`), and a
+host `thread().record()` of a row that would replace that step is refused with
+`session_locked` and writes nothing: retry it once the resume has recorded its
+results. A decision applies only to the step whose approvals were requested, taken
 by one selector everywhere (the last assistant row, unless a user row follows
 it); and that step's results are read from every result row after it, up to
 the next assistant row, so no other row can hide one. A result counts
@@ -433,7 +439,9 @@ A structured turn that stops before any document, because it parked on an
 approval or a budget stopped it, returns the same shape with `structured:
 null`, its `finishReason` (`awaiting_approval`, `budget_exhausted`) and its
 `pendingApprovals`. Answer them and resume with `sendStructured(session, '',
-schema)` for the document.
+schema)` for the document. A parked structured turn is `null` even when the model
+wrote a document beside its tool calls (some providers keep text on a
+tool-call step): only a document checked against the schema is ever returned.
 
 It is the same run as `send()` — the mode's system prompt, its tools, the step
 budget, the events — asking the provider for structured output. Your client

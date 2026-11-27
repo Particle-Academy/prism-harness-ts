@@ -1,5 +1,6 @@
 import type { JsonObject, JsonValue } from './json.js';
 import { usableArguments } from './tool-arguments.js';
+import { canonicalJson } from './tool-policy.js';
 
 /**
  * The rows a run writes to a thread, in the shape the PHP reference stores.
@@ -129,8 +130,17 @@ export function toolResultRow(
  * calls a stopped step did run, the decisions, and the results written when the
  * run resumes. Rows are never rewritten, so all of them stay stored; shown to a
  * provider separately, a tool output would go twice. Folded, a result is keyed
- * by its tool call id and a decision by its approval id, and a later one
- * replaces an earlier one in the earlier one's position.
+ * by its call id, tool name and canonical arguments, occurrence by occurrence
+ * (G-403, the reference's fold), never by call id alone, and a decision by its
+ * approval id; a later one replaces an earlier one in the earlier one's
+ * position.
+ *
+ * EACH RESULT ONCE, IN ITS OWN SEGMENT (BRIEF-R14 item 5): the fold spans the
+ * step's whole segment (its assistant row up to the next assistant row with
+ * tool calls), not only consecutive rows. A result row stored after a row of
+ * another kind (a resolution row carrying a copy after a host's system row, or
+ * after a new message) replaces the same result where it was first shown, and
+ * a row left with nothing of its own is not shown at all.
  *
  * This is the REPLAY view, pinned by the harness-thread-rows corpus. What a
  * decision means for running a call is read from the stored rows instead, by
@@ -138,22 +148,80 @@ export function toolResultRow(
  */
 export function threadView(rows: readonly JsonObject[]): JsonObject[] {
   const view: JsonObject[] = [];
+  // The current segment's shown results and decisions: where each one is
+  // (view row, entry index), in the order shown.
+  let shown: { row: number; at: number; key: string }[] = [];
+  let answers = new Map<string, { row: number; at: number }>();
 
   for (const row of rows) {
     const normalised = normalise(row, view);
 
     if (normalised === null) continue;
 
-    const previous = view.at(-1);
-
-    if (normalised.type === 'tool_result' && previous?.type === 'tool_result') {
-      view[view.length - 1] = fold(previous as ToolResultRow, normalised as ToolResultRow);
-    } else {
-      view.push(normalised);
+    if (normalised.type === 'assistant' && list(normalised.tool_calls).length > 0) {
+      shown = [];
+      answers = new Map();
     }
+    if (normalised.type !== 'tool_result') {
+      view.push(normalised);
+      continue;
+    }
+
+    const later = normalised as ToolResultRow;
+    const fresh: ToolResultEntry[] = [];
+    const freshDecisions: ApprovalDecisionEntry[] = [];
+    // A later result replaces only the SAME result, occurrence by occurrence:
+    // the k-th with a key in this row replaces the k-th with that key shown so
+    // far in the segment, in its position; any other is new.
+    const occurrences = new Map<string, number>();
+    for (const entry of later.tool_results) {
+      const key = resultKey(entry);
+      const occurrence = occurrences.get(key) ?? 0;
+      occurrences.set(key, occurrence + 1);
+      const hit = shown.filter((candidate) => candidate.key === key)[occurrence];
+      if (hit === undefined) fresh.push(entry);
+      else (view[hit.row] as ToolResultRow).tool_results[hit.at] = entry;
+    }
+    for (const entry of later.tool_approval_responses) {
+      const hit = answers.get(entry.approval_id);
+      if (hit === undefined) freshDecisions.push(entry);
+      else (view[hit.row] as ToolResultRow).tool_approval_responses[hit.at] = entry;
+    }
+
+    const previous = view.at(-1);
+    if (previous?.type === 'tool_result') {
+      // Consecutive: one row, the new entries after the earlier ones.
+      const target = previous as ToolResultRow;
+      for (const entry of fresh) {
+        shown.push({ row: view.length - 1, at: target.tool_results.length, key: resultKey(entry) });
+        target.tool_results.push(entry);
+      }
+      for (const entry of freshDecisions) {
+        answers.set(entry.approval_id, { row: view.length - 1, at: target.tool_approval_responses.length });
+        target.tool_approval_responses.push(entry);
+      }
+      continue;
+    }
+    // A row whose every entry this segment already shows is not shown again.
+    const had = later.tool_results.length + later.tool_approval_responses.length;
+    if (had > 0 && fresh.length === 0 && freshDecisions.length === 0) continue;
+    const at = view.length;
+    fresh.forEach((entry, index) => shown.push({ row: at, at: index, key: resultKey(entry) }));
+    freshDecisions.forEach((entry, index) => answers.set(entry.approval_id, { row: at, at: index }));
+    view.push(toolResultRow(fresh, freshDecisions));
   }
 
   return view;
+}
+
+/**
+ * Which result an entry is, for folding (G-403, as the reference and TS
+ * 0.11.x fold): its call id and tool name, each length-prefixed, and its
+ * arguments as canonical JSON. Two calls that share an id but not their tool
+ * or their arguments are two results.
+ */
+function resultKey(entry: ToolResultEntry): string {
+  return `${entry.tool_call_id.length}:${entry.tool_call_id}${entry.tool_name.length}:${entry.tool_name}${canonicalJson(entry.args)}`;
 }
 
 /**
@@ -237,13 +305,17 @@ export function approvalToolScope(rows: readonly JsonObject[]): { names: string[
  *
  * Read from the stored rows, newest first. A user turn, or an assistant step
  * that asked nothing, ends the scope: nothing before it is pending. An id
- * answered once is no longer pending.
+ * answered once is no longer pending, and neither is one a harness mark
+ * answered (a replaced step's denial, a start's ended row).
  */
 export function pendingApprovalIds(rows: readonly JsonObject[]): string[] {
   // The paused step (G-397); its answers are read from the rows after it.
   const step = pausedStepIndex(rows);
   if (step === null) return [];
-  const answered = new Set<string>();
+  // An approval a harness mark answered is not pending (G-404, BRIEF-R14):
+  // a replaced step's denial or a start's ended row, each read within its
+  // own request's turn, as every other reader reads them.
+  const answered = new Set<string>([...supersededApprovals(rows), ...endedByStart(rows)]);
   for (const later of rows.slice(step + 1)) {
     if (later.type !== 'tool_result') continue;
     for (const response of list(later.tool_approval_responses)) {
@@ -776,7 +848,7 @@ export function pairStepApprovals(
  * within one step, and an ungated call's result (or the immediate result of
  * a call with unusable arguments) must not make a gated call sharing its id
  * look finished. Read from EVERY result row after the step, up to the next
- * assistant row (G-399), as stored (the replay view folds results by id).
+ * assistant row (G-399), as stored (the replay view folds copies away).
  * Each result pairs with the first call without one that has its id, its
  * tool name and its arguments; then its id and name; then its id.
  *
@@ -786,6 +858,11 @@ export function stepResultsByPosition(rows: readonly JsonObject[], index: number
   const calls = list(rows[index]?.tool_calls);
   const has = calls.map(() => false);
   const args = calls.map((call) => JSON.stringify(usableArguments(call.arguments) ?? {}));
+  // A result an EARLIER row of the step already holds (a copy: the same id,
+  // tool, arguments and result) answers nothing new (TS I-1, as 0.11.x reads
+  // it): the resolution row carries the step's earlier results, and a copy
+  // must never claim another open call that shares its id.
+  const prints = new Set<string>();
   // EVERY tool_result row after the step, up to the next assistant row
   // (G-399): a row of another kind between them hides nothing.
   for (const row of rows.slice(index + 1)) {
@@ -795,14 +872,19 @@ export function stepResultsByPosition(rows: readonly JsonObject[], index: number
     if (row.type !== 'tool_result' || isReplacedStepRow(row)) continue;
     const entries = Array.isArray(row.tool_results) ? list(row.tool_results)
       : Object.hasOwn(row, 'tool_call_id') ? [{ tool_call_id: row.tool_call_id ?? null, tool_name: row.name ?? null }] : [];
+    const added: string[] = [];
     for (const entry of entries) {
       const id = text(entry.tool_call_id);
+      const print = canonicalJson([id, text(entry.tool_name), isObject(entry.args) ? entry.args : {}, text(entry.result)]);
+      if (prints.has(print)) continue;
+      added.push(print);
       const open = (position: number): boolean => !has[position] && text(calls[position]!.id) === id;
       let at = calls.findIndex((call, position) => open(position) && call.name === entry.tool_name && args[position] === JSON.stringify(isObject(entry.args) ? entry.args : {}));
       if (at === -1) at = calls.findIndex((call, position) => open(position) && call.name === entry.tool_name);
       if (at === -1) at = calls.findIndex((_call, position) => open(position));
       if (at !== -1) has[at] = true;
     }
+    for (const print of added) prints.add(print);
   }
 
   return has;
@@ -945,16 +1027,6 @@ function normalise(row: JsonObject, view: JsonObject[]): JsonObject | null {
     default:
       return row;
   }
-}
-
-function fold(earlier: ToolResultRow, later: ToolResultRow): ToolResultRow {
-  const results = new Map<string, ToolResultEntry>();
-  const decisions = new Map<string, ApprovalDecisionEntry>();
-
-  for (const entry of [...earlier.tool_results, ...later.tool_results]) results.set(entry.tool_call_id, entry);
-  for (const entry of [...earlier.tool_approval_responses, ...later.tool_approval_responses]) decisions.set(entry.approval_id, entry);
-
-  return toolResultRow([...results.values()], [...decisions.values()]);
 }
 
 function decision(value: JsonObject): ApprovalDecisionEntry {
