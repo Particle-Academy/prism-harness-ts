@@ -199,6 +199,12 @@ interface Case {
    * outcomes of the parked step.
    */
   history: { call: number; same: boolean; string: boolean }[] | null;
+  /**
+   * G-397: indices of prior results (stored cases) recorded with arguments
+   * that differ from their call's own (lossy: none), as a store that redacts
+   * arguments would keep them. They still answer their own call.
+   */
+  lossy: number[];
 }
 
 type InsertKind = 'assistant_text' | 'assistant_call' | 'user' | 'system' | 'tool_empty' | 'tool_result';
@@ -316,7 +322,7 @@ function generate(seed: number): Case {
   // A resume that failed after its resolution is always followed by another.
   if (failOnce && again.length === 0) again.push({ approveAll: rng.chance(0.5), path: rng.pick(PATHS) });
 
-  return {
+  const c: Case = {
     seed,
     source,
     calls,
@@ -332,7 +338,37 @@ function generate(seed: number): Case {
     spent,
     later,
     ...storage(seed, calls.length, later?.calls.length ?? 0),
+    lossy: [],
   };
+  return sharing(c);
+}
+
+/**
+ * G-397: identical arguments across calls, and lossy recorded results, from a
+ * generator of their own: an ungated call may carry the same arguments as a
+ * gated call of its step; a later step's call may reuse a parked call's id
+ * and arguments; a stored prior result may record no arguments.
+ */
+function sharing(c: Case): Case {
+  const rng = new Rng((c.seed ^ 0x5e6) >>> 0);
+  const gated = c.calls.filter((call) => call.tool === 'echo');
+  const calls = c.calls.map((call) => (call.tool === 'free' && gated.length > 0 && rng.chance(0.3) ? { ...call, token: rng.pick(gated).token } : call));
+  const later = c.later === null ? null : {
+    ...c.later,
+    calls: (() => {
+      // Each parked call's arguments reused at most once, so a later call that
+      // ran is still told apart by its arguments.
+      const used = new Set<number>();
+      return c.later!.calls.map((call) => {
+        const from = rng.pick(gated);
+        if (!rng.chance(0.3) || used.has(from.token)) return call;
+        used.add(from.token);
+        return { ...call, id: from.id, token: from.token };
+      });
+    })(),
+  };
+  const lossy = c.prior.filter((index) => c.calls[index]!.tool === 'echo' && rng.chance(0.5));
+  return { ...c, calls, later, lossy };
 }
 
 /** G-397: argument storage forms and an earlier step reusing ids, from a generator of their own. */
@@ -351,36 +387,58 @@ function storage(seed: number, parked: number, later: number): Pick<Case, 'strin
 
 interface Expected {
   repeated: boolean;
-  /** Tokens of the gated calls that run, on the first resume and never again. */
-  runs: Set<number>;
-  /** The one outcome every call ends with, by token. */
-  outcome: Map<number, string>;
+  /** Keys (p<i> parked, l<i> later) of the gated calls that run, on the first resume and never again. */
+  runs: Set<string>;
+  /** The one outcome every call ends with, by key. */
+  outcome: Map<string, string>;
+  /** Keys of the decided step's gated calls a resume answers (no result yet): none when every step was superseded. */
+  open: string[];
 }
 
 function expected(c: Case): Expected {
   // Each step is superseded or decided. The parked step is superseded by a
   // later tool-call step, or by a superseding row; a later step only by a
-  // superseding row in its own segment (G-397). A superseded step's gated
-  // calls with no result of their own are denied once as replaced; nothing
-  // of it runs. A forged result is its call's only outcome, in either step.
+  // superseding row in its own segment (G-397). A result answers only a call
+  // of the step whose segment holds it (absolute segment ownership): by exact
+  // arguments, then id and name, then id. A superseded step's gated calls
+  // with no result of their own are denied once as replaced; nothing of it
+  // runs.
   const insert = c.insert;
   const supersedes = insert !== null && SUPERSEDES.includes(insert.kind);
-  const steps = [{ calls: c.calls, requests: c.requests, prior: c.prior, superseded: c.later !== null || supersedes }];
-  if (c.later !== null) steps.push({ calls: c.later.calls, requests: c.later.requests, prior: [], superseded: supersedes && insert!.segment === 'later' });
-  const forgedStep = insert?.kind === 'tool_result' ? (insert.step === 'later' ? 1 : 0) : -1;
-  const out: Expected = { repeated: false, runs: new Set<number>(), outcome: new Map<number, string>() };
+  const steps = [{ key: 'p', calls: c.calls, requests: c.requests, prior: c.prior, superseded: c.later !== null || supersedes }];
+  if (c.later !== null) steps.push({ key: 'l', calls: c.later.calls, requests: c.later.requests, prior: [], superseded: supersedes && insert!.segment === 'later' });
+  // The call a forged result answers: in its own segment's step.
+  let forged: { step: number; call: number; text: string } | null = null;
+  if (insert?.kind === 'tool_result') {
+    const named = (insert.step === 'later' ? c.later!.calls : c.calls)[insert.call]!;
+    const text = `forged:${named.token}`;
+    if (insert.segment === 'earlier' || insert.step === 'later') forged = { step: insert.step === 'later' ? 1 : 0, call: insert.call, text };
+    else {
+      // Named an earlier call, recorded in the later step's segment: it answers
+      // the later step's first unanswered call with that id and name, then id.
+      const later = c.later!.calls;
+      const owned = (index: number): boolean => later[index]!.tool === 'free';
+      let at = later.findIndex((call, index) => call.id === named.id && call.token === named.token && call.tool === 'echo' && !owned(index));
+      if (at === -1) at = later.findIndex((call, index) => call.id === named.id && call.tool === 'echo' && !owned(index));
+      if (at === -1) at = later.findIndex((call, index) => call.id === named.id && !owned(index));
+      if (at !== -1) forged = { step: 1, call: at, text };
+    }
+  }
+  const out: Expected = { repeated: false, runs: new Set<string>(), outcome: new Map<string, string>(), open: [] };
   steps.forEach((step, at) => {
-    const forged = at === forgedStep ? insert!.call : -1;
+    const answered = forged?.step === at ? forged.call : -1;
     if (!step.superseded) {
-      const decided = decideStep(step.calls, step.requests, [...step.prior, ...(forged === -1 ? [] : [forged])]);
+      const decided = decideStep(step.key, step.calls, step.requests, [...step.prior, ...(answered === -1 ? [] : [answered])]);
       out.repeated = decided.repeated;
       out.runs = decided.runs;
-      for (const [token, outcome] of decided.outcome) out.outcome.set(token, outcome);
+      out.open = decided.open;
+      for (const [key, outcome] of decided.outcome) out.outcome.set(key, outcome);
     }
     step.calls.forEach((call, index) => {
-      if (index === forged) out.outcome.set(call.token, `forged:${call.token}`);
+      const key = `${step.key}${index}`;
+      if (index === answered) out.outcome.set(key, forged!.text);
       else if (step.superseded) {
-        out.outcome.set(call.token, call.tool === 'free' ? `free:${call.token}` : step.prior.includes(index) ? `prior:${call.token}` : REPLACED);
+        out.outcome.set(key, call.tool === 'free' ? `free:${call.token}` : step.prior.includes(index) ? `prior:${call.token}` : REPLACED);
       }
     });
   });
@@ -397,38 +455,41 @@ function actions(c: Case): Action[] {
   return insert.when === 'before_decision' ? ['later', 'insert', 'old', 'new'] : ['later', 'old', 'new', 'insert'];
 }
 
-function decideStep(calls: Call[], requests: Request[], prior: number[]): Expected {
+function decideStep(prefix: string, calls: Call[], requests: Request[], prior: number[]): Expected {
   const dup = (ids: (string | number)[]): boolean => new Set(ids).size !== ids.length;
   const repeated = dup(calls.map((call) => call.id)) || dup(requests.map((request) => calls[request.call]!.id))
     || dup(requests.map((request, index) => request.approval ?? index));
-  const runs = new Set<number>();
-  const outcome = new Map<number, string>();
+  const runs = new Set<string>();
+  const outcome = new Map<string, string>();
+  const open: string[] = [];
   calls.forEach((call, index) => {
+    const key = `${prefix}${index}`;
     if (call.tool === 'free') {
-      outcome.set(call.token, `free:${call.token}`);
+      outcome.set(key, `free:${call.token}`);
       return;
     }
     if (prior.includes(index)) {
-      outcome.set(call.token, `prior:${call.token}`);
+      outcome.set(key, `prior:${call.token}`);
       return;
     }
+    open.push(key);
     if (repeated) {
-      outcome.set(call.token, REPEATED);
+      outcome.set(key, REPEATED);
       return;
     }
     // Distinct ids: this call's own request, if it has one.
     const own = requests.find((request) => request.call === index);
     if (own?.verdict === 'approve') {
-      runs.add(call.token);
-      outcome.set(call.token, `ran:${call.token}`);
+      runs.add(key);
+      outcome.set(key, `ran:${call.token}`);
     } else if (own?.verdict === 'deny') {
-      outcome.set(call.token, own.reason ?? DENIED);
+      outcome.set(key, own.reason ?? DENIED);
     } else {
-      outcome.set(call.token, NO_RESPONSE);
+      outcome.set(key, NO_RESPONSE);
     }
   });
 
-  return { repeated, runs, outcome };
+  return { repeated, runs, outcome, open };
 }
 
 // ---------------------------------------------------------------------------
@@ -511,20 +572,65 @@ async function rows(session: Session): Promise<JsonObject[]> {
   return (await session.thread().messages()).map((entry) => entry.message);
 }
 
-/** Every stored result entry after the step's assistant row, as [token, result]. */
-async function outcomes(session: Session, skip = 0): Promise<[number, string][]> {
-  const all = await rows(session);
-  // The parked step: after `skip` earlier answered steps.
-  let step = -1;
-  for (let seen = -1; seen < skip;) {
-    step += 1;
-    if (all[step]!.type === 'assistant' && Array.isArray(all[step]!.tool_calls) && (all[step]!.tool_calls as JsonValue[]).length > 0) seen += 1;
+/** A tool-call step as the case recorded it: its calls, each with its key and its arguments as an object. */
+type RecordedStep = { calls: { key: string; id: string; name: string; args: JsonObject }[] };
+
+/** JSON with object keys sorted. */
+function canonical(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
+  if (typeof value === 'object' && value !== null) {
+    const object = value as Record<string, unknown>;
+    return `{${Object.keys(object).sort().map((key) => `${JSON.stringify(key)}:${canonical(object[key])}`).join(',')}}`;
   }
-  return all.slice(step + 1).filter((row) => row.type === 'tool_result')
-    .flatMap((row) => (row.tool_results as JsonObject[]))
-    // A result for no call of the step (an interposed row) is not an outcome of it.
-    .filter((entry) => typeof (entry.args as JsonObject).n === 'number')
-    .map((entry) => [Number((entry.args as JsonObject).n), String(entry.result)]);
+  return JSON.stringify(value);
+}
+
+/**
+ * Every recorded result, given to the call it belongs to, by the rule under
+ * test written out independently: a result answers a call of the step whose
+ * segment holds it (a replaced-step row: the step its mark names), by exact
+ * id, name and arguments, then id and name, then id, each the first call still
+ * without a result; a copy of a result an earlier row of that segment already
+ * holds answers nothing new. Returns the results by call key.
+ */
+async function attributed(session: Session, steps: RecordedStep[]): Promise<Map<string, Set<string>>> {
+  const out = new Map<string, Set<string>>();
+  const owned = steps.map(() => new Set<string>());
+  const seen = steps.map(() => new Set<string>());
+  const at = new Map<number, number>();
+  let step = -1;
+  for (const { position, message } of await session.thread().messages()) {
+    if (message.type === 'assistant' && Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
+      step += 1;
+      at.set(position, step);
+      continue;
+    }
+    if (step < 0 || message.type !== 'tool_result' || !Array.isArray(message.tool_results)) continue;
+    const mark = message.harness_replaced_step as JsonObject | undefined;
+    const target = mark !== undefined && typeof mark.position === 'number' ? at.get(mark.position) ?? step : step;
+    const calls = steps[target]?.calls ?? [];
+    const prints: string[] = [];
+    for (const entry of message.tool_results as JsonObject[]) {
+      const print = canonical([entry.tool_call_id, entry.tool_name, entry.args, entry.result]);
+      if (seen[target]!.has(print)) continue;
+      prints.push(print);
+      const give = (key: string): void => {
+        owned[target]!.add(key);
+        if (!out.has(key)) out.set(key, new Set());
+        out.get(key)!.add(String(entry.result));
+      };
+      const same = (call: RecordedStep['calls'][number]): boolean => call.id === entry.tool_call_id && call.name === entry.tool_name && canonical(call.args) === canonical(entry.args);
+      // A further result for a call that has one still counts as its outcome (so a second one is seen).
+      const exact = calls.find((call) => same(call) && !owned[target]!.has(call.key)) ?? calls.find(same);
+      if (exact !== undefined) { give(exact.key); continue; }
+      const byName = calls.find((call) => call.id === entry.tool_call_id && call.name === entry.tool_name && !owned[target]!.has(call.key));
+      if (byName !== undefined) { give(byName.key); continue; }
+      const byId = calls.find((call) => call.id === entry.tool_call_id && !owned[target]!.has(call.key));
+      if (byId !== undefined) give(byId.key);
+    }
+    for (const print of prints) seen[target]!.add(print);
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -560,6 +666,9 @@ async function runCase(c: Case): Promise<void> {
   const oracle = expected(c);
   const r = rig(c);
   let approvalIds: string[];
+  // The tool-call steps as recorded, in thread order, for attribution.
+  const recorded: RecordedStep[] = [];
+  const parkedStep: RecordedStep = { calls: c.calls.map((call, index) => ({ key: `p${index}`, id: call.id, name: call.tool, args: { n: call.token } })) };
 
   if (c.history !== null) {
     // An earlier step that reused the parked step's call ids, answered and
@@ -580,7 +689,9 @@ async function runCase(c: Case): Promise<void> {
         history.map((_h, index) => ({ approval_id: `apr_hist_${c.seed}_${index}`, approved: true, reason: null }))),
       { type: 'assistant', content: 'ok', tool_calls: [], tool_approval_requests: [] },
     ], 'run_history');
+    recorded.push({ calls: history.map((h, index) => ({ key: `h${index}`, id: h.id, name: 'echo', args: h.args })) });
   }
+  recorded.push(parkedStep);
   if (c.source === 'model') {
     const parked = await turn(r, c.initial, 'go');
     check(parked.response.finishReason === 'awaiting_approval', 'the step parks for a person', parked.response.finishReason);
@@ -613,7 +724,8 @@ async function runCase(c: Case): Promise<void> {
       },
       ...(c.prior.length === 0 ? [] : [toolResultRow(c.prior.map((index) => {
         const call = c.calls[index]!;
-        return toolResultEntry({ id: call.id, name: call.tool, arguments: { n: call.token } }, `${call.tool === 'free' ? 'free' : 'prior'}:${call.token}`);
+        // A lossy store keeps no arguments with the result: it still answers its call.
+        return toolResultEntry({ id: call.id, name: call.tool, arguments: c.lossy.includes(index) ? {} : { n: call.token } }, `${call.tool === 'free' ? 'free' : 'prior'}:${call.token}`);
       }))]),
     ]);
   }
@@ -633,6 +745,7 @@ async function runCase(c: Case): Promise<void> {
   const recordLater = async (): Promise<void> => {
     // The later step, as another writer could record it after the park.
     const later = c.later!;
+    recorded.push({ calls: later.calls.map((call, index) => ({ key: `l${index}`, id: call.id, name: call.tool, args: { n: call.token } })) });
     const laterCalls = later.calls.map((call, index) => ({ id: call.id, name: call.tool, arguments: (c.stringArgs.later[index] ? JSON.stringify({ n: call.token }) : { n: call.token }) as unknown as JsonObject }));
     await r.session.thread().record([
       {
@@ -670,7 +783,9 @@ async function runCase(c: Case): Promise<void> {
   const plan = actions(c);
   for (const [at, action] of plan.entries()) {
     if (action === 'insert') {
-      await r.session.thread().record([insertedRow(c)]);
+      const row = insertedRow(c);
+      await r.session.thread().record([row]);
+      if (c.insert!.kind === 'assistant_call') recorded.push({ calls: (row.tool_calls as JsonObject[]).map((call) => ({ key: 'x0', id: String(call.id), name: 'free', args: { n: 900 } })) });
       if (supersedes) {
         if (laterRecorded) newSuperseded = true;
         else oldSuperseded = true;
@@ -722,16 +837,20 @@ async function runCase(c: Case): Promise<void> {
   if (!resumedYet) first = await resumed(async () => await turn(r, c.resume, ''));
 
   // Invariants 1-4, then full equality with the oracle.
-  check(r.ran.length === new Set(r.ran).size, '3: a call runs at most once', r.ran);
-  const all = [...c.requests.map((q) => ({ q, call: c.calls[q.call]! })), ...(c.later?.requests ?? []).map((q) => ({ q, call: c.later!.calls[q.call]! }))];
-  const denied = new Set(all.filter(({ q }) => q.verdict === 'deny').map(({ call }) => call.token));
-  check(r.ran.every((token) => !denied.has(token)), '1: a call a person denied never runs', r.ran);
+  // Which call ran: a gated call of the step that can still run, by its
+  // arguments (unique among that step's gated calls).
+  const decidedCalls = c.later !== null ? c.later.calls.map((call, index) => ({ call, key: `l${index}` })) : c.calls.map((call, index) => ({ call, key: `p${index}` }));
+  const ranKeys = r.ran.map((token) => decidedCalls.find(({ call }) => call.tool === 'echo' && call.token === token)?.key ?? `?${token}`);
+  check(ranKeys.length === new Set(ranKeys).size, '3: a call runs at most once', ranKeys);
+  check(ranKeys.every((key) => !key.startsWith('?')), 'a replaced step\'s approvals never run anything', ranKeys);
+  const all = [...c.requests.map((q) => ({ q, key: `p${q.call}` })), ...(c.later?.requests ?? []).map((q) => ({ q, key: `l${q.call}` }))];
+  const denied = new Set(all.filter(({ q }) => q.verdict === 'deny').map(({ key }) => key));
+  check(ranKeys.every((key) => !denied.has(key)), '1: a call a person denied never runs', ranKeys);
   const approves = all.filter(({ q }) => q.verdict === 'approve');
-  check(r.ran.every((token) => approves.some(({ call }) => call.token === token)), '2: each run call has its own approve', r.ran);
-  check(r.ran.length <= approves.length, '2: one decision decides at most one call', { ran: r.ran.length, approves: approves.length });
-  if (c.later !== null) check(r.ran.every((token) => token >= 200), 'a replaced step\'s approvals never run anything', r.ran);
-  if (oracle.repeated) check(r.ran.length === 0, '4: a step with repeated ids runs none of its gated calls', r.ran);
-  check(sameSet(r.ran, oracle.runs), 'the calls that ran are exactly the oracle\'s', { ran: r.ran, expected: [...oracle.runs] });
+  check(ranKeys.every((key) => approves.some((a) => a.key === key)), '2: each run call has its own approve', ranKeys);
+  check(ranKeys.length <= approves.length, '2: one decision decides at most one call', { ran: ranKeys.length, approves: approves.length });
+  if (oracle.repeated) check(ranKeys.length === 0, '4: a step with repeated ids runs none of its gated calls', ranKeys);
+  check(JSON.stringify([...ranKeys].sort()) === JSON.stringify([...oracle.runs].sort()), 'the calls that ran are exactly the oracle\'s', { ran: ranKeys, expected: [...oracle.runs] });
 
   // Invariant 6 on the resume itself: what it says it ran is what ran.
   const firstTurn = first as Turn | null;
@@ -741,17 +860,11 @@ async function runCase(c: Case): Promise<void> {
     const ok = results.flatMap((step) => (step.ok ? [Number(step.result.replace(/^ran:/, ''))] : []));
     check(sameSet(ok, r.ran) && ok.length === r.ran.length, '6: the ok tool_result steps are the calls that ran', ok);
     // One step per open gated call of the step that is decided (none when
-    // every step was superseded): not prior, not forged.
-    const insert = c.insert;
-    const forgedToken = insert?.kind === 'tool_result' ? (insert.step === 'later' ? c.later!.calls : c.calls)[insert.call]!.token : -1;
-    const supersedes = insert !== null && SUPERSEDES.includes(insert.kind);
-    const decided = c.later !== null ? (supersedes && insert!.segment === 'later' ? [] : c.later.calls)
-      : supersedes ? [] : c.calls.filter((_call, index) => !c.prior.includes(index));
-    const open = decided.filter((call) => call.tool === 'echo' && call.token !== forgedToken).map((call) => call.token);
-    check(results.length === open.length, '6: one tool_result step per open gated call', { steps: results.length, open: open.length });
+    // every step was superseded): no result of its own yet.
+    check(results.length === oracle.open.length, '6: one tool_result step per open gated call', { steps: results.length, open: oracle.open.length });
   }
 
-  await settledOutcomes(r, c, oracle, '5');
+  await settledOutcomes(r, recorded, oracle, '5');
 
   // Repeat resumes, with later decisions in between: nothing runs twice and
   // no outcome changes.
@@ -767,22 +880,19 @@ async function runCase(c: Case): Promise<void> {
   check(JSON.stringify(r.ran) === JSON.stringify(ranBefore), '3: a call runs at most once across any resume sequence', { before: ranBefore, after: r.ran });
   check(r.freeRan.length === c.calls.filter((call) => call.tool === 'free').length || c.source === 'stored', '3: an ungated call runs once', r.freeRan);
   if (c.source === 'stored') check(r.freeRan.length === 0, 'a stored ungated call with a result never runs', r.freeRan);
-  await settledOutcomes(r, c, oracle, '5 (after repeat resumes)');
+  await settledOutcomes(r, recorded, oracle, '5 (after repeat resumes)');
 }
 
 /** Invariants 5 and 6 on the thread rows: every call has exactly one outcome, the oracle's. */
-async function settledOutcomes(r: Rig, _c: Case, oracle: Expected, label: string): Promise<void> {
-  const seen = new Map<number, Set<string>>();
-  for (const [token, result] of await outcomes(r.session, _c.history === null ? 0 : 1)) {
-    if (!seen.has(token)) seen.set(token, new Set());
-    seen.get(token)!.add(result);
+async function settledOutcomes(r: Rig, recorded: RecordedStep[], oracle: Expected, label: string): Promise<void> {
+  const seen = await attributed(r.session, recorded);
+  for (const [key, want] of oracle.outcome) {
+    const got = [...(seen.get(key) ?? [])];
+    check(got.length === 1, `${label}: every call gets exactly one recorded outcome`, { key, got });
+    check(got[0] === want, `6: the recorded outcome matches what ran`, { key, got: got[0], want });
   }
-  for (const [token, want] of oracle.outcome) {
-    const got = [...(seen.get(token) ?? [])];
-    check(got.length === 1, `${label}: every call gets exactly one recorded outcome`, { token, got });
-    check(got[0] === want, `6: the recorded outcome matches what ran`, { token, got: got[0], want });
-  }
-  check([...seen.keys()].every((token) => oracle.outcome.has(token)), `${label}: no outcome for a call that is not in the step`, [...seen.keys()]);
+  // An earlier answered step's calls and an inserted ungated call are not the case's.
+  check([...seen.keys()].every((key) => oracle.outcome.has(key) || key.startsWith('h') || key.startsWith('x')), `${label}: no outcome for a call that is not in the step`, [...seen.keys()]);
 }
 
 // ---------------------------------------------------------------------------
@@ -803,6 +913,7 @@ function withoutCall(c: Case, drop: number): Case | null {
     calls,
     requests,
     prior: c.prior.filter((index) => index !== drop).map(remap),
+    lossy: c.lossy.filter((index) => index !== drop).map(remap),
     stringArgs: { ...c.stringArgs, parked: c.stringArgs.parked.filter((_v, index) => index !== drop) },
     history: c.history === null ? null : (() => {
       const kept = c.history.filter((h) => h.call !== drop).map((h) => ({ ...h, call: remap(h.call) }));
@@ -933,7 +1044,7 @@ describe('G-392 property: approval pairing invariants over generated steps', () 
     // G-397 / G-399: every inserted row kind, before and after the decision (main's shape check).
     for (const kind of INSERT_KINDS) {
       for (const when of ['before_decision', 'after_decision'] as const) expect(has((c) => c.insert?.kind === kind && c.insert.when === when), `${kind} ${when}`).toBe(true);
-      expect(has((c) => c.insert?.kind === kind && decideStep(c.calls, c.requests, c.prior).repeated && c.requests.some((q) => q.verdict === 'approve')), `${kind} in a repeated-id step`).toBe(true);
+      expect(has((c) => c.insert?.kind === kind && decideStep('p', c.calls, c.requests, c.prior).repeated && c.requests.some((q) => q.verdict === 'approve')), `${kind} in a repeated-id step`).toBe(true);
     }
     expect(has((c) => c.insert !== null && c.recorder === 'streamDecision'), 'insert + streamDecision').toBe(true);
     // G-399: a row that does not supersede, after the decision, a resume with no assistant row (steps spent), then repeat resumes.
@@ -952,7 +1063,13 @@ describe('G-392 property: approval pairing invariants over generated steps', () 
     expect(has((c) => c.later !== null && c.insert?.kind === 'tool_result' && c.insert.segment === 'earlier' && c.insert.step === 'earlier'), 'forged, earlier segment').toBe(true);
     expect(has((c) => c.later !== null && c.insert?.kind === 'tool_result' && c.insert.segment === 'later' && c.insert.step === 'later'), 'forged, later segment, later call').toBe(true);
     expect(has((c) => c.later !== null && c.insert?.kind === 'tool_result' && c.insert.segment === 'later' && c.insert.step === 'earlier'), 'forged, later segment, earlier call').toBe(true);
-    expect(has((c) => c.later !== null && c.insert?.kind === 'tool_result' && c.insert.step === 'later' && decideStep(c.later.calls, c.later.requests, []).repeated), 'forged in a later step that repeats ids').toBe(true);
+    expect(has((c) => c.later !== null && c.insert?.kind === 'tool_result' && c.insert.step === 'later' && decideStep('l', c.later.calls, c.later.requests, []).repeated), 'forged in a later step that repeats ids').toBe(true);
+    // G-397, absolute segment ownership: results recorded with arguments that differ from their call's own; identical arguments across calls.
+    expect(has((c) => c.lossy.length > 0 && c.requests.some((q) => c.lossy.includes(q.call) && q.verdict === 'approve')), 'lossy result for an approved call').toBe(true);
+    expect(has((c) => c.calls.some((call) => call.tool === 'free' && c.calls.some((other) => other.tool === 'echo' && other.token === call.token))), 'identical arguments within a step').toBe(true);
+    expect(has((c) => c.later !== null && c.later.calls.some((call) => c.calls.some((old) => old.id === call.id && old.token === call.token))), 'a later call with an earlier call\'s id and arguments').toBe(true);
+    expect(has((c) => c.later !== null && c.insert?.kind === 'tool_result' && c.insert.segment === 'later' && c.insert.step === 'earlier'
+      && c.later.calls.some((call) => call.id === c.calls[c.insert!.call]!.id && call.tool === 'echo')), 'a result naming an earlier call in the later segment, answering a later call').toBe(true);
     // G-397: arguments stored as JSON strings, and an earlier answered step reusing the parked step's ids.
     expect(has((c) => c.source === 'stored' && c.stringArgs.parked.some((v, i) => v && c.calls[i]!.tool === 'echo') && c.requests.some((q) => q.verdict === 'approve')), 'string-stored arguments, approved').toBe(true);
     expect(has((c) => c.later !== null && c.stringArgs.later.some((v, i) => v && c.later!.calls[i]!.tool === 'echo')), 'string-stored arguments in a later step').toBe(true);
@@ -962,7 +1079,7 @@ describe('G-392 property: approval pairing invariants over generated steps', () 
       && (c.spent || c.failOnce)), 'the parked call stored as a string, an earlier step with its id and arguments, no assistant row after the resolution').toBe(true);
     // G-397: a later tool-call step replaces the parked one, with approvals for both.
     expect(has((c) => c.later !== null && c.requests.some((q) => q.verdict === 'approve') && c.later.requests.some((q) => q.verdict === 'approve')), 'later step').toBe(true);
-    expect(has((c) => c.later !== null && decideStep(c.later.calls, c.later.requests, []).repeated), 'later step repeating ids').toBe(true);
+    expect(has((c) => c.later !== null && decideStep('l', c.later.calls, c.later.requests, []).repeated), 'later step repeating ids').toBe(true);
     expect(has((c) => c.later !== null && c.later.calls.some((call) => c.calls.some((old) => old.id === call.id))), 'later step reusing an old id').toBe(true);
     // G-397: stored requests that repeat an APPROVAL id, with an approval recorded.
     expect(has((c) => c.requests.some((q) => q.approval !== undefined) && c.requests.some((q) => q.verdict === 'approve')), 'repeated approval id').toBe(true);

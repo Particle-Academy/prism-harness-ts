@@ -89,6 +89,12 @@ async function drain(stream: AsyncGenerator<RunStep, AgentResponse, undefined>):
   }
 }
 
+/** How many replaced-step denials name the call carrying `n`. */
+async function replacedFor(session: Session, n: number): Promise<number> {
+  return (await session.thread().messages()).map((entry) => entry.message).filter((row) => row.type === 'tool_result')
+    .flatMap((row) => row.tool_results as JsonObject[]).filter((entry) => (entry.args as JsonObject).n === n && entry.result === REPLACED).length;
+}
+
 /** Every distinct result recorded for the call carrying `n`. */
 async function outcomesOf(session: Session, n: number): Promise<string[]> {
   const rows = (await session.thread().messages()).map((entry) => entry.message);
@@ -219,7 +225,10 @@ describe('G-397: a parked step a later tool-call step replaced', () => {
 });
 
 describe('G-397: a result counts once, for the call it names, wherever it sits', () => {
-  it("a forged result in the LATER step's segment naming a call of the parked step is that call's only outcome; the later step's call with the same id is still decided by its own", async () => {
+  it("a result in the LATER step's segment naming a call of the parked step answers the later step's call with that id; the parked call is denied as replaced, once", async () => {
+    // Absolute segment ownership: a result counts only for calls of the step
+    // whose segment holds it. The later call with the same id and name has its
+    // result, so it never runs; the parked call has none, so it is replaced.
     const r = rig([echo('a', 1)]);
     await r.agent.send(r.session, 'go');
     await recordStep(r.session, [[echo('a', 3), 'apr_a']]);
@@ -228,9 +237,9 @@ describe('G-397: a result counts once, for the call it names, wherever it sits',
     await r.agent.send(r.session, '');
     await r.agent.send(r.session, '');
 
-    expect(r.ran).toEqual([3]);
-    expect(await outcomesOf(r.session, 1)).toEqual(['forged:1']);
-    expect(await outcomesOf(r.session, 3)).toEqual(['ran:3']);
+    expect(r.ran).toEqual([]);
+    expect(await replacedFor(r.session, 1)).toBe(1);
+    expect(await outcomesOf(r.session, 3)).toEqual([]);
   });
 
   it("a forged result in the later step's segment naming the later step's call is its only outcome; the parked step is denied as replaced, once", async () => {
@@ -285,7 +294,7 @@ describe("G-397: a step's own results are counted through the end of the thread"
     expect(await outcomesOf(r.session, 1)).toEqual(['ran:1']);
   });
 
-  it("a result recorded for a parked call after a later step that repeats its id is that call's only outcome; the later step's calls get their own", async () => {
+  it("a result naming a parked call, recorded after a later step that repeats its id, answers the later step's first call with that id; the other gets the repeated-id denial, the parked call the replaced denial", async () => {
     const r = rig([echo('c1', 1)]);
     await r.agent.send(r.session, 'go');
     await recordStep(r.session, [[echo('c1', 3), 'apr_l'], [echo('c1', 4), 'apr_m']]);
@@ -295,8 +304,8 @@ describe("G-397: a step's own results are counted through the end of the thread"
     await r.agent.send(r.session, '');
 
     expect(r.ran).toEqual([]);
-    expect(await outcomesOf(r.session, 1)).toEqual(['forged:1']);
-    expect(await outcomesOf(r.session, 3)).toEqual([REPEATED]);
+    expect(await replacedFor(r.session, 1)).toBe(1);
+    expect(await outcomesOf(r.session, 3)).toEqual([]);
     expect(await outcomesOf(r.session, 4)).toEqual([REPEATED]);
   });
 });
@@ -359,25 +368,25 @@ describe('G-397: what supersedes a parked step, and what does not', () => {
     expect(await outcomesOf(r.session, 1)).toEqual(['ran:1']);
   });
 
-  it('a run id is the caller\'s to give through Thread.record: a text row recorded under the run that owns the step is treated as inside it, so it does not supersede; the step is still decided on its own, and nothing beyond its own approval can run', async () => {
-    // Forging the owning run's id is possible through the public API (the
-    // thread is the app's own record). It changes only the label: the step is
-    // not denied as replaced, and its decisions are accepted. The approved
-    // call still does not run, because the row moved the transcript tail the
-    // tool scope is read from, so it fails closed as not available.
-    const r = rig([echo('c1', 1), echo('c2', 2)]);
-    const [one, two] = (await r.agent.send(r.session, 'go')).pendingApprovals;
-    const owner = (await r.session.thread().messages()).find((entry) => entry.message.type === 'assistant')!.runId;
-    expect(owner).not.toBeNull();
-    await r.session.thread().record([{ type: 'assistant', content: 'Forged note.', tool_calls: [], tool_approval_requests: [] }], owner);
-    await recordDecisions(r.session, [{ approvalId: one!.id, approved: false, reason: 'no' }, { approvalId: two!.id, approved: true }]);
-    await r.agent.send(r.session, '');
-    await r.agent.send(r.session, '');
+  for (const [label, row] of [['a text row', { type: 'assistant', content: 'A note.', tool_calls: [], tool_approval_requests: [] }], ['a user row', { type: 'user', content: 'Something else.' }]] as [string, JsonObject][]) {
+    it(`${label} recorded through Thread.record under the run id that owns the step is OUTSIDE the run: it supersedes, each gated call is denied as replaced once, and a later decision is refused`, async () => {
+      // Only the harness's own recording counts as inside a run; a run id
+      // given through the public Thread.record never does.
+      const r = rig([echo('c1', 1), echo('c2', 2)]);
+      const [one, two] = (await r.agent.send(r.session, 'go')).pendingApprovals;
+      const owner = (await r.session.thread().messages()).find((entry) => entry.message.type === 'assistant')!.runId;
+      expect(owner).not.toBeNull();
+      await r.session.thread().record([row], owner);
+      await expect(recordDecisions(r.session, [{ approvalId: one!.id, approved: false, reason: 'no' }, { approvalId: two!.id, approved: true }]))
+        .rejects.toMatchObject({ code: 'approval_not_pending' });
+      await r.agent.send(r.session, '');
+      await r.agent.send(r.session, '');
 
-    expect(r.ran).toEqual([]);
-    expect(await outcomesOf(r.session, 1)).toEqual(['no']);
-    expect(await outcomesOf(r.session, 2)).toEqual(['Not run: echo is not available to this run.']);
-  });
+      expect(r.ran).toEqual([]);
+      expect(await outcomesOf(r.session, 1)).toEqual([REPLACED]);
+      expect(await outcomesOf(r.session, 2)).toEqual([REPLACED]);
+    });
+  }
 });
 
 describe('G-397: a step whose approval requests repeat an approval id', () => {
