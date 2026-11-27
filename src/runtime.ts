@@ -22,6 +22,7 @@ import {
   repeatedStepSettled,
   stepResultsByPosition,
   pausedStepRepeatsCallIds,
+  pausedStepIndex,
   REPEATED_CALL_ID,
   NOT_RUN_KEY,
   REPEATED_CALL_ID_RESULT,
@@ -829,23 +830,16 @@ export class AgentRuntime {
     if (run === null || run.status === 'failed') return null;
 
     const entries = await session.thread().messages();
+    // The paused step (G-397), by the one selector.
+    const step = pausedStepIndex(entries.map((entry) => entry.message));
+    if (step === null) return null;
+    const entry = entries[step]!;
+    const message = entry.message;
+    const requests = Array.isArray(message.tool_approval_requests) ? message.tool_approval_requests : [];
+    if (!Array.isArray(message.tool_calls) || message.tool_calls.length === 0 || requests.length === 0 || entry.runId !== run.id) return null;
+    const seq = run.last_seq;
 
-    for (let index = entries.length - 1; index >= 0; index -= 1) {
-      const entry = entries[index]!;
-      const message = entry.message;
-
-      if (message.type !== 'assistant' || !Array.isArray(message.tool_calls) || message.tool_calls.length === 0) continue;
-
-      const requests = Array.isArray(message.tool_approval_requests) ? message.tool_approval_requests : [];
-
-      if (requests.length === 0 || entry.runId !== run.id) return null;
-
-      const seq = run.last_seq;
-
-      return { id: run.id, lastSeq: typeof seq === 'number' && Number.isSafeInteger(seq) && seq >= 0 ? seq : 0 };
-    }
-
-    return null;
+    return { id: run.id, lastSeq: typeof seq === 'number' && Number.isSafeInteger(seq) && seq >= 0 ? seq : 0 };
   }
 
   #tagger(context: RunContext | undefined, channel: StepChannel | null, seq: number): RunStepTagger {
@@ -1691,26 +1685,28 @@ export class AgentRuntime {
     ambiguous: Set<string>;
   } | null> {
     const rows = (await session.thread().messages()).map((entry) => entry.message);
+    // THE paused step (G-397): the one selector every decision reader uses.
+    const stored = pausedStepIndex(rows);
+    if (stored === null || list(rows[stored]!.tool_calls).length === 0) return null;
     const view = threadView(rows);
-    let index = view.length - 1;
-
-    while (index >= 0 && !(view[index]!.type === 'assistant' && (view[index] as AssistantRow).tool_calls.length > 0)) {
-      index -= 1;
-    }
-
+    // The same row in the replay view (which folds a 0.3.0 request row into it).
+    const ordinal = rows.slice(0, stored + 1).filter((row) => row.type === 'assistant').length;
+    const index = view.findIndex((row, at) => row.type === 'assistant' && view.slice(0, at + 1).filter((candidate) => candidate.type === 'assistant').length === ordinal);
     if (index === -1) return null;
 
     const assistant = view[index] as AssistantRow;
-    const answered = view.slice(index + 1).find((row) => row.type === 'tool_result') as ToolResultRow | undefined;
-    const results = new Map((answered?.tool_results ?? []).map((entry) => [entry.tool_call_id, entry]));
+    // Every result row of the step's own turn (G-399), not only the first run
+    // of them: what is carried into the resolution row.
+    const next = view.findIndex((row, at) => at > index && row.type === 'assistant');
+    const results = new Map(view.slice(index + 1, next === -1 ? undefined : next)
+      .filter((row): row is ToolResultRow => row.type === 'tool_result')
+      .flatMap((row) => row.tool_results).map((entry) => [entry.tool_call_id, entry]));
     // From the stored rows, not the replay view: the FIRST answer to an
     // approval is the answer, as the plan reads it too.
     const decisions = turnDecisions(rows);
     // Each call paired with its OWN request by position, never by a map keyed
     // by call id, where the last request for a repeated id would decide every
     // call carrying it (G-392).
-    let stored = rows.length - 1;
-    while (stored >= 0 && !(rows[stored]!.type === 'assistant' && Array.isArray(rows[stored]!.tool_calls) && (rows[stored]!.tool_calls as JsonValue[]).length > 0)) stored -= 1;
     // Results pair with calls BY POSITION (round 13), never by id: in a step
     // whose calls share an id, an ungated call's result (or the immediate
     // result of a call with unusable arguments) must not make the gated call
@@ -2203,4 +2199,8 @@ async function rememberSeq(session: Session, runId: string, steps: RunStepTagger
     // The class by the named-class rule, never the error's own words (round 11).
     process.emitWarning(`prism-harness could not record the step sequence of run [${runId}]: ${failureName(error)}.`);
   }
+}
+
+function list(value: JsonValue | undefined): JsonObject[] {
+  return Array.isArray(value) ? value.filter((entry): entry is JsonObject => typeof entry === 'object' && entry !== null && !Array.isArray(entry)) : [];
 }

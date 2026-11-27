@@ -32,6 +32,16 @@
   belongs to the call at its position, and a request pairs only with a call
   that has no result of its own, so an ungated call never takes an approval
   or a repeated-id denial.
+- A decision applies only to the step whose approvals were requested: the
+  decision checks, the repeated-id rule, the resume and the plan readers all
+  take that step from one selector (the last assistant row, unless a user row
+  follows it). A row recorded after the park can no longer make one of them
+  read another step: a decision on a step a later assistant or user row
+  superseded is refused on every path, and the resume acts on nothing of it.
+- A step's results are read from every result row after it, up to the next
+  assistant row, so a row of another kind between them (a system row, an
+  empty result row, a host's own row) can no longer hide a call's result and
+  let a resume act on it again.
 - A runner start that fails after its records are written but before its run
   begins (a plan watch for a streamed turn) now ends its own view and is
   undone, as every later failure is.

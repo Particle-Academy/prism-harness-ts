@@ -1,5 +1,5 @@
 import type { JsonObject, JsonValue } from '../json.js';
-import { endedByStart, pairStepApprovals, pendingApprovalIds, repeatedIdDenials, stepResultsByPosition } from '../thread-rows.js';
+import { endedByStart, pairStepApprovals, pausedStepIndex, pendingApprovalIds, repeatedIdDenials, stepResultsByPosition } from '../thread-rows.js';
 import { argsDigest } from '../tool-policy.js';
 import type { PendingCall } from './machine.js';
 
@@ -26,23 +26,20 @@ function digestOf(args: JsonValue | undefined): string {
 /** Every pending approval at the transcript tail, with the tool it was asked for and the digest of its stored arguments. */
 export function pendingApprovalCalls(rows: readonly JsonObject[]): PendingCall[] {
   const ids = pendingApprovalIds(rows);
-  if (ids.length === 0) return [];
+  // The paused step (G-397), by the one selector: the pending ids are its own.
+  const index = pausedStepIndex(rows);
+  if (ids.length === 0 || index === null) return [];
+  const row = rows[index]!;
+  // Each approval's call, paired by position (G-392), with a call that has
+  // no result of its own first (round 13): a call that already has one ran
+  // ungated, so it is not the one asked about.
+  const stepCalls = list(row.tool_calls);
+  const answered = stepResultsByPosition(rows, index);
+  const paired = pairStepApprovals(stepCalls, list(row.tool_approval_requests), (_call, position) => !answered[position]).approvalIds;
   const calls: PendingCall[] = [];
   for (const id of ids) {
-    for (let index = rows.length - 1; index >= 0; index -= 1) {
-      const row = rows[index]!;
-      if (row.type !== 'assistant') continue;
-      const request = list(row.tool_approval_requests).find((entry) => entry.approval_id === id);
-      if (request === undefined) continue;
-      // The call this approval was asked for, paired by position (G-392),
-      // with a call that has no result of its own first (round 13): a call
-      // that already has one ran ungated, so it is not the one asked about.
-      const stepCalls = list(row.tool_calls);
-      const answered = stepResultsByPosition(rows, index);
-      const call = stepCalls[pairStepApprovals(stepCalls, list(row.tool_approval_requests), (_call, position) => !answered[position]).approvalIds.indexOf(id)];
-      if (call !== undefined && typeof call.name === 'string') calls.push({ id, name: call.name, digest: digestOf(call.arguments) });
-      break;
-    }
+    const call = stepCalls[paired.indexOf(id)];
+    if (call !== undefined && typeof call.name === 'string') calls.push({ id, name: call.name, digest: digestOf(call.arguments) });
   }
 
   return calls;
@@ -77,32 +74,30 @@ export function approvalDecisions(rows: readonly JsonObject[]): Map<string, bool
  * self-gated tool requires before it applies anything.
  */
 export function approvedCallsAwaitingResult(rows: readonly JsonObject[], name: string, digest: string): number {
-  // Read newest first, so the last write per id is the FIRST decision
-  // recorded: the one answer that counts, as for the resume and the plan.
+  // The paused step (G-397), by the one selector every decision reader uses.
+  const step = pausedStepIndex(rows);
+  if (step === null) return 0;
+  const row = rows[step]!;
+  // A step that repeats a call id runs none of its gated calls (G-392).
+  if (pairStepApprovals(list(row.tool_calls), list(row.tool_approval_requests)).repeated) return 0;
+  // The FIRST decision recorded for an id is the one answer that counts, as
+  // for the resume and the plan.
   const decided = new Map<string, boolean>();
   const finished = new Set<string>();
-  for (let index = rows.length - 1; index >= 0; index -= 1) {
-    const row = rows[index]!;
-    if (row.type === 'tool_result') {
-      for (const result of list(row.tool_results)) {
-        if (typeof result.tool_call_id === 'string') finished.add(result.tool_call_id);
-      }
-      for (const response of list(row.tool_approval_responses).reverse()) {
-        if (typeof response.approval_id === 'string') decided.set(response.approval_id, response.approved === true);
-      }
-      continue;
+  for (const later of rows.slice(step + 1)) {
+    if (later.type !== 'tool_result') continue;
+    for (const result of list(later.tool_results)) {
+      if (typeof result.tool_call_id === 'string') finished.add(result.tool_call_id);
     }
-    if (row.type !== 'assistant') return 0;
-    // A step that repeats a call id runs none of its gated calls (G-392).
-    if (pairStepApprovals(list(row.tool_calls), list(row.tool_approval_requests)).repeated) return 0;
-
-    const approvedCalls = new Set(list(row.tool_approval_requests)
-      .filter((request) => typeof request.approval_id === 'string' && decided.get(request.approval_id) === true && typeof request.tool_call_id === 'string')
-      .map((request) => request.tool_call_id as string));
-
-    return list(row.tool_calls).filter((call) => typeof call.id === 'string' && approvedCalls.has(call.id)
-      && !finished.has(call.id) && call.name === name && digestOf(call.arguments) === digest).length;
+    for (const response of list(later.tool_approval_responses)) {
+      if (typeof response.approval_id === 'string' && !decided.has(response.approval_id)) decided.set(response.approval_id, response.approved === true);
+    }
   }
 
-  return 0;
+  const approvedCalls = new Set(list(row.tool_approval_requests)
+    .filter((request) => typeof request.approval_id === 'string' && decided.get(request.approval_id) === true && typeof request.tool_call_id === 'string')
+    .map((request) => request.tool_call_id as string));
+
+  return list(row.tool_calls).filter((call) => typeof call.id === 'string' && approvedCalls.has(call.id)
+    && !finished.has(call.id) && call.name === name && digestOf(call.arguments) === digest).length;
 }

@@ -157,8 +157,30 @@ export function threadView(rows: readonly JsonObject[]): JsonObject[] {
 }
 
 /**
- * The decisions recorded for the turn being resumed (the last assistant row
- * with tool calls), by approval id, read from the stored rows.
+ * THE step a decision applies to (G-397): the index of the assistant row the
+ * run paused at the transcript tail, or null when a user row comes after the
+ * last assistant row (a new turn ended every approval). The ONE selector:
+ * the repeated-id guard, the resolver, the decision checks and the plan
+ * readers all take the step from here, so a row recorded after the park (an
+ * assistant row, a user row, a system or tool row) can never make one of
+ * them read a different step from another. A step whose row asked nothing
+ * has nothing to decide: each reader checks the requests on THIS row.
+ *
+ * @internal
+ */
+export function pausedStepIndex(rows: readonly JsonObject[]): number | null {
+  for (let index = rows.length - 1; index >= 0; index -= 1) {
+    const type = rows[index]!.type;
+    if (type === 'user') return null;
+    if (type === 'assistant') return index;
+  }
+
+  return null;
+}
+
+/**
+ * The decisions recorded for the turn being resumed (the paused step,
+ * pausedStepIndex()), by approval id, read from the stored rows.
  *
  * An approval has ONE answer: the first one recorded. A second decision for
  * the same id (two reviewers, a retry racing the original, a row written by
@@ -167,11 +189,11 @@ export function threadView(rows: readonly JsonObject[]): JsonObject[] {
  */
 export function turnDecisions(rows: readonly JsonObject[]): Map<string, ApprovalDecisionEntry> {
   const decisions = new Map<string, ApprovalDecisionEntry>();
-  let start = rows.length;
-  while (start > 0 && !(rows[start - 1]!.type === 'assistant' && list(rows[start - 1]!.tool_calls).length > 0)) start -= 1;
-  if (start === 0) return decisions;
+  // The paused step (G-397): no decision applies to any other.
+  const step = pausedStepIndex(rows);
+  if (step === null || list(rows[step]!.tool_calls).length === 0) return decisions;
 
-  for (const row of rows.slice(start)) {
+  for (const row of rows.slice(step + 1)) {
     const answers = row.type === 'tool_result' ? list(row.tool_approval_responses)
       : row.type === 'tool_approval_response' ? [row] : [];
     for (const answer of answers) {
@@ -185,30 +207,28 @@ export function turnDecisions(rows: readonly JsonObject[]): Map<string, Approval
 
 /** Stored approval authority, kept separate from the provider replay view. */
 export function approvalToolScope(rows: readonly JsonObject[]): { names: string[]; legacy: boolean } | null {
-  for (const row of threadView(rows).reverse()) {
-    if (row.type === 'tool_result') continue;
-    if (row.type === 'user') return null;
-    if (row.type !== 'assistant') continue;
-    const requests = list(row.tool_approval_requests);
-    if (requests.length === 0) return null;
-    const ids = new Set(requests.map(request => request.approval_id));
-    const stored = [...rows].reverse().find(candidate => candidate.type === 'assistant'
-      && list(candidate.tool_approval_requests).length === requests.length
-      && list(candidate.tool_approval_requests).every(request => ids.has(request.approval_id)));
-    const scope = stored?.harness_tool_names;
-    if (Array.isArray(scope) && scope.every((name): name is string => typeof name === 'string' && name !== '' && name !== '*')) {
-      return {names: [...new Set(scope)], legacy: false};
-    }
-    // A step that repeats a call id approves nothing (G-392).
-    if (pairStepApprovals(list(row.tool_calls), requests).repeated) return {names: [], legacy: true};
-    const decisions = turnDecisions(rows);
-    const approvedCalls = new Set(requests.filter(request => typeof request.approval_id === 'string' && decisions.get(request.approval_id)?.approved === true)
-      .map(request => request.tool_call_id));
-    const names = list(row.tool_calls).filter(call => approvedCalls.has(call.id) && typeof call.name === 'string' && call.name !== '' && call.name !== '*')
-      .map(call => call.name as string);
-    return {names: [...new Set(names)], legacy: true};
+  // The paused step (G-397), as stored, and the same row in the view (which
+  // folds a 0.3.0 request row into the assistant row before it).
+  const step = pausedStepIndex(rows);
+  if (step === null) return null;
+  const ordinal = rows.slice(0, step + 1).filter((candidate) => candidate.type === 'assistant').length;
+  const row = threadView(rows).filter((candidate) => candidate.type === 'assistant')[ordinal - 1];
+  if (row === undefined) return null;
+  const requests = list(row.tool_approval_requests);
+  if (requests.length === 0) return null;
+  const stored = rows[step]!;
+  const scope = stored.harness_tool_names;
+  if (Array.isArray(scope) && scope.every((name): name is string => typeof name === 'string' && name !== '' && name !== '*')) {
+    return {names: [...new Set(scope)], legacy: false};
   }
-  return null;
+  // A step that repeats a call id approves nothing (G-392).
+  if (pairStepApprovals(list(row.tool_calls), requests).repeated) return {names: [], legacy: true};
+  const decisions = turnDecisions(rows);
+  const approvedCalls = new Set(requests.filter(request => typeof request.approval_id === 'string' && decisions.get(request.approval_id)?.approved === true)
+    .map(request => request.tool_call_id));
+  const names = list(row.tool_calls).filter(call => approvedCalls.has(call.id) && typeof call.name === 'string' && call.name !== '' && call.name !== '*')
+    .map(call => call.name as string);
+  return {names: [...new Set(names)], legacy: true};
 }
 
 /**
@@ -220,26 +240,21 @@ export function approvalToolScope(rows: readonly JsonObject[]): { names: string[
  * answered once is no longer pending.
  */
 export function pendingApprovalIds(rows: readonly JsonObject[]): string[] {
+  // The paused step (G-397); its answers are read from the rows after it.
+  const step = pausedStepIndex(rows);
+  if (step === null) return [];
   const answered = new Set<string>();
-  for (let index = rows.length - 1; index >= 0; index -= 1) {
-    const row = rows[index]!;
-    if (row.type === 'tool_result') {
-      for (const response of list(row.tool_approval_responses)) {
-        if (typeof response.approval_id === 'string') answered.add(response.approval_id);
-      }
-      continue;
+  for (const later of rows.slice(step + 1)) {
+    if (later.type !== 'tool_result') continue;
+    for (const response of list(later.tool_approval_responses)) {
+      if (typeof response.approval_id === 'string') answered.add(response.approval_id);
     }
-    if (row.type === 'user') return [];
-    if (row.type !== 'assistant') continue;
-
-    const pending = list(row.tool_approval_requests)
-      .map(request => request.approval_id)
-      .filter((id): id is string => typeof id === 'string' && id !== '' && !answered.has(id));
-
-    return [...new Set(pending)];
   }
+  const pending = list(rows[step]!.tool_approval_requests)
+    .map(request => request.approval_id)
+    .filter((id): id is string => typeof id === 'string' && id !== '' && !answered.has(id));
 
-  return [];
+  return [...new Set(pending)];
 }
 
 /**
@@ -249,35 +264,28 @@ export function pendingApprovalIds(rows: readonly JsonObject[]): string[] {
  * turn ends the scope.
  */
 export function unresolvedApprovalIds(rows: readonly JsonObject[]): string[] {
+  // The paused step (G-397); its results are read from the rows after it.
+  const step = pausedStepIndex(rows);
+  if (step === null) return [];
+  const row = rows[step]!;
+  const requests = list(row.tool_approval_requests);
+  const ids = (entries: JsonObject[]): string[] => [...new Set(entries
+    .map((request) => request.approval_id)
+    .filter((id): id is string => typeof id === 'string' && id !== ''))];
+
+  // A step that repeats a call id: a result by id cannot say whose it is
+  // (G-392), so every request is unresolved until the step is settled.
+  if (pairStepApprovals(list(row.tool_calls), requests).repeated) return repeatedStepSettled(rows, step) ? [] : ids(requests);
+
   const finished = new Set<string>();
-  for (let index = rows.length - 1; index >= 0; index -= 1) {
-    const row = rows[index]!;
-    if (row.type === 'tool_result') {
-      for (const result of list(row.tool_results)) {
-        if (typeof result.tool_call_id === 'string') finished.add(result.tool_call_id);
-      }
-      continue;
+  for (const later of rows.slice(step + 1)) {
+    if (later.type !== 'tool_result') continue;
+    for (const result of list(later.tool_results)) {
+      if (typeof result.tool_call_id === 'string') finished.add(result.tool_call_id);
     }
-    if (row.type === 'user') return [];
-    if (row.type !== 'assistant') continue;
-
-    // A step that repeats a call id: a result by id cannot say whose it is
-    // (G-392), so every request is unresolved until the step is settled.
-    if (pairStepApprovals(list(row.tool_calls), list(row.tool_approval_requests)).repeated) {
-      if (repeatedStepSettled(rows, index)) return [];
-
-      return [...new Set(list(row.tool_approval_requests)
-        .map((request) => request.approval_id)
-        .filter((id): id is string => typeof id === 'string' && id !== ''))];
-    }
-
-    return [...new Set(list(row.tool_approval_requests)
-      .filter((request) => typeof request.tool_call_id !== 'string' || !finished.has(request.tool_call_id))
-      .map((request) => request.approval_id)
-      .filter((id): id is string => typeof id === 'string' && id !== ''))];
   }
 
-  return [];
+  return ids(requests.filter((request) => typeof request.tool_call_id !== 'string' || !finished.has(request.tool_call_id)));
 }
 
 /**
@@ -378,17 +386,12 @@ export function endedByStart(rows: readonly JsonObject[]): Set<string> {
  * nothing. A turn with no new message continues exactly these calls (G-366).
  */
 export function pausedApprovalIds(rows: readonly JsonObject[]): string[] {
-  for (let index = rows.length - 1; index >= 0; index -= 1) {
-    const row = rows[index]!;
-    if (row.type === 'user') return [];
-    if (row.type !== 'assistant') continue;
+  const step = pausedStepIndex(rows);
+  if (step === null) return [];
 
-    return [...new Set(list(row.tool_approval_requests)
-      .map(request => request.approval_id)
-      .filter((id): id is string => typeof id === 'string' && id !== ''))];
-  }
-
-  return [];
+  return [...new Set(list(rows[step]!.tool_approval_requests)
+    .map(request => request.approval_id)
+    .filter((id): id is string => typeof id === 'string' && id !== ''))];
 }
 
 /**
@@ -448,8 +451,9 @@ export function pausedRunState(rows: readonly JsonObject[]): {
   stepsUsed: number | null | 'invalid';
 } | null {
   if (approvalToolScope(rows) === null) return null;
-  const paused = [...rows].reverse().find((row) => row.type === 'assistant');
-  if (paused === undefined) return null;
+  const step = pausedStepIndex(rows);
+  if (step === null) return null;
+  const paused = rows[step]!;
 
   let agentSpend: PausedAgentSpend | null = null;
   if (paused.harness_agent_spend !== undefined) {
@@ -498,13 +502,15 @@ export function storedBinding(value: JsonValue | undefined): PausedBinding | nul
  * written, because the thread view has already replaced such arguments with
  * none, and an approved call must not run on an empty set nobody sent.
  *
- * Read from the one turn being resumed, the last assistant row with tool
- * calls, never the whole thread: providers that number calls per response
- * reuse ids, and an older turn's call must not decide a newer one.
+ * Read from the one turn being resumed, the paused step (pausedStepIndex),
+ * never the whole thread: providers that number calls per response reuse
+ * ids, and an older turn's call must not decide a newer one.
  */
 export function unusableStoredCalls(rows: readonly JsonObject[]): Set<string> {
   const unusable = new Set<string>();
-  const turn = [...rows].reverse().find((row) => row.type === 'assistant' && list(row.tool_calls).length > 0);
+  // The paused step (G-397), never another turn's.
+  const step = pausedStepIndex(rows);
+  const turn = step === null ? undefined : rows[step];
 
   for (const call of list(turn?.tool_calls)) {
     if (usableArguments(call.arguments) === null) unusable.add(text(call.id));
@@ -607,8 +613,8 @@ export function pairStepApprovals(
  * BY POSITION (G-387 round 13), never by tool call id: providers repeat ids
  * within one step, and an ungated call's result (or the immediate result of
  * a call with unusable arguments) must not make a gated call sharing its id
- * look finished. Read from the result rows after the step, before the next
- * assistant or user row, as stored (the replay view folds results by id).
+ * look finished. Read from EVERY result row after the step, up to the next
+ * assistant row (G-399), as stored (the replay view folds results by id).
  * Each result pairs with the first call without one that has its id, its
  * tool name and its arguments; then its id and name; then its id.
  *
@@ -618,8 +624,10 @@ export function stepResultsByPosition(rows: readonly JsonObject[], index: number
   const calls = list(rows[index]?.tool_calls);
   const has = calls.map(() => false);
   const args = calls.map((call) => JSON.stringify(usableArguments(call.arguments) ?? {}));
+  // EVERY tool_result row after the step, up to the next assistant row
+  // (G-399): a row of another kind between them hides nothing.
   for (const row of rows.slice(index + 1)) {
-    if (row.type === 'assistant' || row.type === 'user') break;
+    if (row.type === 'assistant') break;
     if (row.type !== 'tool_result') continue;
     const entries = Array.isArray(row.tool_results) ? list(row.tool_results)
       : Object.hasOwn(row, 'tool_call_id') ? [{ tool_call_id: row.tool_call_id ?? null, tool_name: row.name ?? null }] : [];
@@ -645,15 +653,9 @@ export function stepResultsByPosition(rows: readonly JsonObject[], index: number
  * @internal
  */
 export function pausedStepRepeatsCallIds(rows: readonly JsonObject[]): boolean {
-  for (let index = rows.length - 1; index >= 0; index -= 1) {
-    const row = rows[index]!;
-    if (row.type === 'user') return false;
-    if (row.type !== 'assistant') continue;
+  const step = pausedStepIndex(rows);
 
-    return pairStepApprovals(list(row.tool_calls), list(row.tool_approval_requests)).repeated;
-  }
-
-  return false;
+  return step !== null && pairStepApprovals(list(rows[step]!.tool_calls), list(rows[step]!.tool_approval_requests)).repeated;
 }
 
 /**
