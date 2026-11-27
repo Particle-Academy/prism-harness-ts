@@ -52,8 +52,7 @@
   arguments, occurrence by occurrence (as the reference does), never by call
   id alone, so two calls that share an id each keep their result, and each
   result is shown once, in its own step's segment, even when a copy of it
-  was stored after a row of another kind. The resume carries every earlier
-  result of the step as stored.
+  was stored after a row of another kind.
 - A copy of an earlier result of the same step answers no other call.
 - Only the runtime's own record call counts as written inside its run: a row
   a store hook or listener records during that write is outside it.
