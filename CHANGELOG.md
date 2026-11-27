@@ -2,6 +2,68 @@
 
 ## Unreleased
 
+### Fixed: ended approvals in steps that repeat a call id, and cleanup on success (G-387 round 13)
+
+- An approval a runner start ended reads ended when ANY result row of its
+  request's own turn carries the start's mark naming it. It was read only
+  from the first result row carrying its call id, so in a step where an
+  ungated call (or a call with unusable arguments) shared that id and
+  already had a result, the plan could count a person's approval of a call
+  that never ran as approved work. Pinned by the harness-thread-rows corpus.
+- Every decision recorded on a step whose calls repeat a tool call id is
+  recorded as a denial with the repeated-id reason, on every decision path
+  (`recordApproval()`, `recordDecisions()`, `decide()`, `streamDecision()`),
+  as the PHP reference records it. A `decision_recorded` step still reports
+  the decision as given, as the reference streams it. Pinned by the harness-approval-pairing corpus.
+- A call's result is paired with it by its position in the step, never by
+  its tool call id: an ungated call's result no longer makes a gated call
+  sharing its id look finished, nor takes its approval in the plan's view of
+  the pending calls.
+- A run releases its holds BEFORE `run.finished`, as it already did before
+  `run.failed`, and a delegation's step-count settle is tried twice, so one
+  failed store read at the end of a completed delegation no longer leaves the
+  child's count over-charged. A completed start is never undone by its
+  cleanup.
+- `sendStructured()` on a turn that stops before any document (it parks on an
+  approval, or a budget stops it) returns the structured response with
+  `structured: null` and its pending approvals; the field was missing.
+- With the G-392 property tests (now in the suite, with a nightly long run):
+  every gated call in a step gets exactly one recorded outcome, a result
+  belongs to the call at its position, and a request pairs only with a call
+  that has no result of its own, so an ungated call never takes an approval
+  or a repeated-id denial.
+- A decision applies only to the step whose approvals were requested: the
+  decision checks, the repeated-id rule, the resume and the plan readers all
+  take that step from one selector (the last assistant row, unless a user row
+  follows it). A row recorded after the park can no longer make one of them
+  read another step: a decision on a step a later assistant or user row
+  superseded is refused on every path, and the resume acts on nothing of it.
+- A parked step is superseded by any later assistant row with tool calls,
+  or by an assistant text row or user row recorded outside the run that owns
+  it (a host's `thread().record()`, whatever run id it passes, or a new
+  message). Each of its calls that has no result then gets ONE result, `Tool
+  call was not run because a later step replaced it`, in a row the harness writes before the
+  superseding row and marks `harness_superseded: {approval_ids}`. Nothing
+  from the step runs, whatever was decided on it, and a later decision is
+  refused, all-or-nothing per batch (`approval_not_pending`). The runs that
+  own a step are the run that recorded it and every run that recorded one of
+  its results; a step whose requests repeat an APPROVAL id fails closed like
+  one that repeats a call id. **Behaviour change:** a new message no longer acts on approvals
+  recorded for the paused step first; resume with an empty prompt to act on
+  them. The same in every language (harness-approval-pairing apr-0016..0019).
+- A thread written by the 0.11.x line resumes correctly: its answer to a
+  replaced step (`harness_replaced_step: {position}`, stored after the later
+  step) is read as that earlier step's, never as the later step's results
+  or replayed to a provider, and an earlier step that line left superseded
+  but unanswered is answered once, in the same shape.
+- A step's results are read from every result row after it, up to the next
+  assistant row, so a row of another kind between them (a system row, an
+  empty result row, a host's own row) can no longer hide a call's result and
+  let a resume act on it again.
+- A runner start that fails after its records are written but before its run
+  begins (a plan watch for a streamed turn) now ends its own view and is
+  undone, as every later failure is.
+
 ### Changed: one gate for a runner start (G-387)
 
 - A runner start (`SubagentRunner.run()`, and the subagent tool that calls it)

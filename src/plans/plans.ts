@@ -16,7 +16,7 @@ import { PlanIds } from './ids.js';
 import { PlanLimits, type PlansConfig } from './limits.js';
 import { PlanMachine, phpTrim, type Plan, type PlanStep } from './machine.js';
 import { PlanRefused, PlansDisabled } from './refusal.js';
-import { endedByStart, pausedApprovalIds, pausedRunState, repeatedIdDenials } from '../thread-rows.js';
+import { endedByStart, pausedApprovalIds, pausedRunState, repeatedIdDenials, supersededApprovals } from '../thread-rows.js';
 import { approvalDecisions, pendingApprovalCalls } from './thread.js';
 import { planTools } from './tools.js';
 import { PlanView, type PlanCounts } from './view.js';
@@ -187,7 +187,7 @@ export class Plans {
 
     // Ended by a start, or denied because their step repeats a call id
     // (G-392): never acted on, so never approved work.
-    const ended = [...new Set([...endedByStart(rows), ...repeatedIdDenials(rows)])];
+    const ended = [...new Set([...endedByStart(rows), ...repeatedIdDenials(rows), ...supersededApprovals(rows)])];
 
     return this.mutate(session, (current) => PlanMachine.reconcile(current, pending, decided, this.now(), runId, superseding, ended));
   }

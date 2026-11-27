@@ -2,6 +2,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { validateAgent } from './address.js';
 import type { JsonObject, JsonValue } from './json.js';
+import { recordingInRun } from './thread.js';
 import {
   assistantRow,
   approvalToolScope, approvalRunSteps, pausedRunState, turnDecisions,
@@ -20,6 +21,11 @@ import {
   endedByStartRow,
   pairStepApprovals,
   repeatedStepSettled,
+  stepResultsByPosition,
+  pausedStepRepeatsCallIds,
+  pausedStepIndex,
+  replacedStepRow,
+  unansweredReplacedSteps,
   REPEATED_CALL_ID,
   NOT_RUN_KEY,
   REPEATED_CALL_ID_RESULT,
@@ -144,7 +150,13 @@ export interface AgentResponse {
  * transcript and a parse can be compared rather than trusted.
  */
 export interface StructuredAgentResponse extends AgentResponse {
-  /** Checked against the schema before it got here; a run that could not produce one threw. */
+  /**
+   * Checked against the schema before it got here; a run that could not
+   * produce one threw. `null` when the run stopped before any document: it
+   * parked on approval (`finishReason` `awaiting_approval`, with
+   * `pendingApprovals`) or was stopped by a budget. Resume it with
+   * `sendStructured(session, '', schema)` once the approvals are answered.
+   */
   structured: JsonValue;
 }
 
@@ -269,6 +281,8 @@ const RESOLUTION_WAIT_SECONDS = 30;
 export class AgentRuntime {
   /** A subagent child run's tree and plan budget references, by run id, while it runs. */
   readonly #childRefs = new Map<string, { tree: RunTreeRef | null; planLedger: { session: string; plan: string } | null }>();
+  /** Each running run's hold release (#turnIn), so #finish releases BEFORE run.finished (round 13). */
+  readonly #releases = new Map<string, () => Promise<void>>();
   readonly #client: LlmClient;
 
   readonly #modes: ModeRegistry;
@@ -757,6 +771,8 @@ export class AgentRuntime {
       const unwatch = await this.#watchPlan(live, tagger, decidedPlan);
 
       try {
+        // Each decision AS GIVEN, as the PHP reference streams it; what the
+        // thread recorded (a repeated-id step's as denials) is in its rows.
         for (const decision of decisions) {
           // From the APP's run context, never from the model or the request.
           tagger.decision(decision.approvalId, decision.approved, decision.reason ?? null, context?.actor ?? null);
@@ -817,23 +833,16 @@ export class AgentRuntime {
     if (run === null || run.status === 'failed') return null;
 
     const entries = await session.thread().messages();
+    // The paused step (G-397), by the one selector.
+    const step = pausedStepIndex(entries.map((entry) => entry.message));
+    if (step === null) return null;
+    const entry = entries[step]!;
+    const message = entry.message;
+    const requests = Array.isArray(message.tool_approval_requests) ? message.tool_approval_requests : [];
+    if (!Array.isArray(message.tool_calls) || message.tool_calls.length === 0 || requests.length === 0 || entry.runId !== run.id) return null;
+    const seq = run.last_seq;
 
-    for (let index = entries.length - 1; index >= 0; index -= 1) {
-      const entry = entries[index]!;
-      const message = entry.message;
-
-      if (message.type !== 'assistant' || !Array.isArray(message.tool_calls) || message.tool_calls.length === 0) continue;
-
-      const requests = Array.isArray(message.tool_approval_requests) ? message.tool_approval_requests : [];
-
-      if (requests.length === 0 || entry.runId !== run.id) return null;
-
-      const seq = run.last_seq;
-
-      return { id: run.id, lastSeq: typeof seq === 'number' && Number.isSafeInteger(seq) && seq >= 0 ? seq : 0 };
-    }
-
-    return null;
+    return { id: run.id, lastSeq: typeof seq === 'number' && Number.isSafeInteger(seq) && seq >= 0 ? seq : 0 };
   }
 
   #tagger(context: RunContext | undefined, channel: StepChannel | null, seq: number): RunStepTagger {
@@ -882,8 +891,16 @@ export class AgentRuntime {
     const response = await this.#resumeLocked(session, prompt, context, (live, stepping) =>
       this.#turn(live, prompt, toolNames, context, additionalContent, schema, stepping));
 
-    // Narrowed by #turn: with a schema it always returns the structured shape.
-    return response as StructuredAgentResponse;
+    // A run that ended with a document carries it (#loop, checked against the
+    // schema). One that stopped before any document (parked on approval, or
+    // stopped by a budget) returns the same shape with `structured: null`,
+    // its pending approvals beside it: never a missing field.
+    if (Object.hasOwn(response, 'structured')) return response as StructuredAgentResponse;
+    const shaped: StructuredAgentResponse = { ...response, structured: null };
+    const stop = STOPS.get(response);
+    if (stop !== undefined) STOPS.set(shaped, stop);
+
+    return shaped;
   }
 
   async #turn(
@@ -996,8 +1013,11 @@ export class AgentRuntime {
     if (started !== null) run = started.run;
 
     steps?.bind(session.key(), runId, run.parentRunId, run.rootRunId, session.agent);
-    const unwatchPlan = steps !== undefined && stepping?.watchPlan === true ? await this.#watchPlan(session, steps) : () => {};
+    let unwatchPlan: () => void = () => {};
     try {
+      // Inside this try (round 13): a start that committed (b) and fails
+      // here, before its run began, ends its own view and is undone too.
+      if (steps !== undefined && stepping?.watchPlan === true) unwatchPlan = await this.#watchPlan(session, steps);
       // A runner start wrote the child's mode with its records (b).
       // A runner start's run is provisional until its task row (round 9).
       await session.beginRun(runId, mode.name, provider, model, membership.tree, membership.depth, started !== null);
@@ -1025,6 +1045,9 @@ export class AgentRuntime {
       await RunTrees.finished(session, runId);
       if (delegation !== null) await settleDelegation(delegation.session, runId, run.ledger.steps - delegation.startSteps, this.#setting(session, 'lock_ttl') ?? RESOLUTION_LOCK_SECONDS);
     };
+    // On success too (round 13): #finish releases before run.finished, so
+    // no listener observes a hold of a run that has already ended.
+    this.#releases.set(runId, releaseHolds);
     try {
       // Inside the run's try (G-387 round 12): whatever this emit throws (a
       // host's own HarnessEvents may throw anything) fails the run, releases
@@ -1146,7 +1169,9 @@ export class AgentRuntime {
           ? new HarnessError(PLAN_BUDGET_EXHAUSTED, 'This plan step may not proceed (plan_budget_exhausted): the shared plan budget has nothing left for it.')
           : HarnessError.runNotPermitted('This run may not start: its step budget has nothing left (its own ceiling, its run tree or a cost budget is spent).');
       }
-      if (scope !== null) {
+      // A new message supersedes the paused step (below): its approved scope
+      // does not narrow the new turn's tools.
+      if (scope !== null && !(started === null && prompt !== '')) {
         if (scope.legacy) console.warn('Pending approval has no valid stored tool scope; offering approved requests only.');
         offered = offered.filter(tool => scope.names.includes(tool.name)
           && (mode.tools.includes('*') || mode.tools.includes(tool.name) || planApprovalGate(tool) !== null));
@@ -1160,9 +1185,10 @@ export class AgentRuntime {
       // depth and on the budget of the context the host wired its tool with.
       const turn = run;
       return await activeTurns.run({ sessionKey: session.key(), runId, run: turn }, async () => {
-        // Decisions recorded since the run stopped are acted on FIRST, before a
-        // new prompt is recorded, so the results land after the calls they answer
-        // rather than after the new turn. Never in a run tree that was
+        // A RESUME (an empty prompt) acts on the decisions recorded since the
+        // run stopped, before any model call, so the results land after the
+        // calls they answer. A new prompt supersedes the step instead
+        // (DECISION B, below). Never in a run tree that was
         // cancelled, nor under a context whose time is spent: an approved
         // call does not run after its tree was stopped or its time ran out
         // (the loop then stops the run before any model step), and the
@@ -1175,7 +1201,16 @@ export class AgentRuntime {
         // pending call is recorded as not run, in the same write as the task.
         const outOfTime = turn.budget.maxSeconds !== null && turn.ledger.elapsedSeconds() >= turn.budget.maxSeconds;
         const ended = started !== null ? await this.#endApprovals(session, mode, runId, steps) : null;
-        if (started === null && !turn.ledger.cancelled && !outOfTime) offered = await this.#resolveApprovals(session, mode, offered, runId, called, scope?.legacy === true, steps, stepping?.locked === true);
+        // A NEW message supersedes the paused step (DECISION B, G-387 round
+        // 13, as the PHP reference does): each of its open calls is denied
+        // first, whatever was decided on it, so nothing from it runs and no
+        // later decision is accepted for it. Only a resume (an empty prompt)
+        // acts on recorded decisions.
+        // A thread an older harness wrote may hold an earlier step it left
+        // superseded and unanswered: answered once, first (0.11.x shape).
+        if (started === null) await this.#answerReplacedSteps(session, mode, runId, stepping?.locked === true);
+        if (started === null && prompt !== '') await thread.supersedePausedStep();
+        else if (started === null && !turn.ledger.cancelled && !outOfTime) offered = await this.#resolveApprovals(session, mode, offered, runId, called, scope?.legacy === true, steps, stepping?.locked === true);
 
         if (prompt !== '') {
           // With attachments, the shape prism-ts's UserMessage.toObject() writes:
@@ -1186,7 +1221,7 @@ export class AgentRuntime {
               ? { type: 'user', content: prompt }
               : { type: 'user', content: prompt, additional_content: [...attachments, { text: prompt }], additional_attributes: {} };
 
-          await thread.record([...(ended?.rows ?? []), message], runId);
+          await recordingInRun(runId, () => thread.record([...(ended?.rows ?? []), message], runId));
           // Recorded the moment its row is (round 11), before any event: a
           // listener that throws or re-enters never sees a recorded task as
           // unrecorded, and a start whose task row exists is never undone.
@@ -1266,6 +1301,7 @@ export class AgentRuntime {
       session.endChildStartView(runId);
       unwatchPlan();
       this.#childRefs.delete(runId);
+      this.#releases.delete(runId);
       await releaseHolds();
       if (steps !== undefined) await rememberSeq(session, runId, steps);
     }
@@ -1413,7 +1449,7 @@ export class AgentRuntime {
           if (refs?.planLedger != null) row.harness_plan_ledger = { ...refs.planLedger };
         }
       }
-      await thread.record([row], runId);
+      await recordingInRun(runId, () => thread.record([row], runId));
 
       if (failedFinish !== null) {
         // The code travels; nothing the provider said does.
@@ -1421,8 +1457,8 @@ export class AgentRuntime {
         // Complete the transcript with refusals, never approval requests, so a
         // later resume cannot dispatch calls from this failed response.
         if (toolCalls.length > 0) {
-          await thread.record([toolResultRow(toolCalls.map(call =>
-            toolResultEntry(call, `Not run: model step failed (${failedFinish}).`)))], runId);
+          await recordingInRun(runId, () => thread.record([toolResultRow(toolCalls.map(call =>
+            toolResultEntry(call, `Not run: model step failed (${failedFinish}).`)))], runId));
         }
         throw HarnessError.modelStepFailed(failedFinish);
       }
@@ -1479,7 +1515,7 @@ export class AgentRuntime {
       }
 
       if (results.length > 0) {
-        await thread.record([toolResultRow(results)], runId);
+        await recordingInRun(runId, () => thread.record([toolResultRow(results)], runId));
       }
 
       // After the results, as core yields them: the calls that ran, then the
@@ -1634,7 +1670,7 @@ export class AgentRuntime {
         }
       }
 
-      await live.thread().record([toolResultRow([...work.results.values(), ...resolved], [...work.decisions.values()])], runId);
+      await recordingInRun(runId, () => live.thread().record([toolResultRow([...work.results.values(), ...resolved], [...work.decisions.values()])], runId));
       return bounded;
     };
 
@@ -1645,6 +1681,26 @@ export class AgentRuntime {
       this.#setting(session, 'lock_ttl') ?? RESOLUTION_LOCK_SECONDS,
       this.#setting(session, 'lock_wait') ?? RESOLUTION_WAIT_SECONDS,
     );
+  }
+
+  /**
+   * Answer, once, every earlier step a thread written by an older harness
+   * left superseded with a gated call unanswered (unansweredReplacedSteps):
+   * one replaced-step row each, in the 0.11.x shape, read again under the
+   * session lock so two turns never answer one step twice.
+   */
+  async #answerReplacedSteps(session: Session, mode: AgentMode, runId: string, alreadyLocked: boolean): Promise<void> {
+    const pending = async (live: Session): Promise<JsonObject[]> => unansweredReplacedSteps(
+      (await live.thread().messages()).map((entry) => ({ position: entry.position, message: entry.message, runId: entry.runId })),
+      (name) => mode.needsApproval(name),
+    ).map(({ position, calls }) => replacedStepRow(position, calls));
+    if ((await pending(session)).length === 0) return;
+    const answer = async (live: Session): Promise<void> => {
+      const rows = await pending(live);
+      if (rows.length > 0) await recordingInRun(runId, () => live.thread().record(rows, runId));
+    };
+    if (alreadyLocked) return await answer(session);
+    await session.lock(answer, this.#setting(session, 'lock_ttl') ?? RESOLUTION_LOCK_SECONDS, this.#setting(session, 'lock_wait') ?? RESOLUTION_WAIT_SECONDS);
   }
 
   /**
@@ -1664,37 +1720,47 @@ export class AgentRuntime {
     ambiguous: Set<string>;
   } | null> {
     const rows = (await session.thread().messages()).map((entry) => entry.message);
+    // THE paused step (G-397): the one selector every decision reader uses.
+    const stored = pausedStepIndex(rows);
+    if (stored === null || list(rows[stored]!.tool_calls).length === 0) return null;
     const view = threadView(rows);
-    let index = view.length - 1;
-
-    while (index >= 0 && !(view[index]!.type === 'assistant' && (view[index] as AssistantRow).tool_calls.length > 0)) {
-      index -= 1;
-    }
-
+    // The same row in the replay view (which folds a 0.3.0 request row into it).
+    const ordinal = rows.slice(0, stored + 1).filter((row) => row.type === 'assistant').length;
+    const index = view.findIndex((row, at) => row.type === 'assistant' && view.slice(0, at + 1).filter((candidate) => candidate.type === 'assistant').length === ordinal);
     if (index === -1) return null;
 
     const assistant = view[index] as AssistantRow;
-    const answered = view.slice(index + 1).find((row) => row.type === 'tool_result') as ToolResultRow | undefined;
-    const results = new Map((answered?.tool_results ?? []).map((entry) => [entry.tool_call_id, entry]));
+    // Every result row of the step's own turn (G-399), not only the first run
+    // of them: what is carried into the resolution row.
+    const next = view.findIndex((row, at) => at > index && row.type === 'assistant');
+    const results = new Map(view.slice(index + 1, next === -1 ? undefined : next)
+      .filter((row): row is ToolResultRow => row.type === 'tool_result')
+      .flatMap((row) => row.tool_results).map((entry) => [entry.tool_call_id, entry]));
     // From the stored rows, not the replay view: the FIRST answer to an
     // approval is the answer, as the plan reads it too.
     const decisions = turnDecisions(rows);
     // Each call paired with its OWN request by position, never by a map keyed
     // by call id, where the last request for a repeated id would decide every
     // call carrying it (G-392).
-    const pairing = pairStepApprovals(assistant.tool_calls, assistant.tool_approval_requests, (call) => typeof call.name === 'string' && mode.needsApproval(call.name));
-    // A step that repeats a call id: a result keyed by id cannot say whose it
-    // is, so its gated calls are open until the harness settled the step.
-    let stored = rows.length - 1;
-    while (stored >= 0 && !(rows[stored]!.type === 'assistant' && Array.isArray(rows[stored]!.tool_calls) && (rows[stored]!.tool_calls as JsonValue[]).length > 0)) stored -= 1;
+    // Results pair with calls BY POSITION (round 13), never by id: in a step
+    // whose calls share an id, an ungated call's result (or the immediate
+    // result of a call with unusable arguments) must not make the gated call
+    // look finished, nor take its approval.
+    const answeredAt = stepResultsByPosition(rows, stored);
+    // A request pairs only with a call that has no result of its own: the
+    // calls the step ran at once (ungated, or with unusable arguments) never
+    // take an approval. (Not the mode's list: a plan tool gates itself.)
+    const pairing = pairStepApprovals(assistant.tool_calls, assistant.tool_approval_requests, (_call, position) => !answeredAt[position]);
+    // A step that repeats a call id: its gated calls are open until the
+    // harness settled the step.
     const settled = pairing.repeated && repeatedStepSettled(rows, stored);
 
     // A call that has a result is DONE, whatever its decision says. A call that
     // needs nobody is not this method's to run.
     const open = assistant.tool_calls
-      .map((call, index) => ({ call, approvalId: pairing.approvalIds[index] }))
-      .filter(({ call, approvalId }) => (approvalId !== undefined || mode.needsApproval(call.name))
-        && (!pairing.repeated ? !results.has(call.id) : !settled && (approvalId !== undefined || !results.has(call.id))));
+      .map((call, index) => ({ call, approvalId: pairing.approvalIds[index], index }))
+      .filter(({ call, approvalId, index }) => (approvalId !== undefined || mode.needsApproval(call.name))
+        && !answeredAt[index] && !settled);
     const calls = open.map(({ call }) => call);
     const approvalIds = open.map(({ approvalId }) => approvalId);
 
@@ -1795,6 +1861,13 @@ export class AgentRuntime {
     stoppedBecause: string | null,
   ): Promise<AgentResponse> {
     await session.completeRun(runId, finishReason, called);
+    // Released BEFORE the event, as on the failure path (round 13): settling
+    // never throws (each settle reports its own failure by class name).
+    try {
+      await this.#releases.get(runId)?.();
+    } catch {
+      // The hold stays and only over-charges until it expires.
+    }
     const stop = stoppedBecause === null ? null : run.ledger.stopCode(run.budget);
     this.#events?.emit({
       type: 'run.finished',
@@ -1913,7 +1986,7 @@ async function writeDecisionsLocked(
   ttlSeconds: number = RESOLUTION_LOCK_SECONDS,
   waitSeconds: number = RESOLUTION_WAIT_SECONDS,
 ): Promise<void> {
-  await session.lock((live) => writeDecisions(live, decisions), ttlSeconds, waitSeconds);
+  await session.lock(async (live) => { await writeDecisions(live, decisions); }, ttlSeconds, waitSeconds);
 }
 
 /**
@@ -1926,17 +1999,25 @@ async function writeDecisionsLocked(
  *
  * Call it holding the session lock: the check and the write are one step.
  */
-async function writeDecisions(session: Session, decisions: readonly ApprovalDecision[], context?: RunContext): Promise<void> {
+async function writeDecisions(session: Session, decisions: readonly ApprovalDecision[], context?: RunContext): Promise<ApprovalDecision[]> {
   // A decision is never inside a runner start's own view (round 11).
   return inOwnTurnScope(() => writeDecisionsIn(session, decisions, context));
 }
 
-async function writeDecisionsIn(session: Session, decisions: readonly ApprovalDecision[], context?: RunContext): Promise<void> {
+/** Writes the decisions and returns them as RECORDED (a repeated-id step's as denials). */
+async function writeDecisionsIn(session: Session, given: readonly ApprovalDecision[], context?: RunContext): Promise<ApprovalDecision[]> {
   const rows = (await session.thread().messages()).map((entry) => entry.message);
   const pending = new Set(pendingApprovalIds(rows));
-  for (const decision of decisions) {
+  for (const decision of given) {
     if (!pending.delete(decision.approvalId)) throw HarnessError.approvalNotPending(decision.approvalId);
   }
+  // A step whose call ids repeat runs none of its gated calls (G-392), so
+  // every decision on it is RECORDED as a denial with that reason (round
+  // 13, as the PHP reference records it): what the thread says was decided
+  // is what was acted on, and no reader can take it for approved work.
+  const decisions: ApprovalDecision[] = pausedStepRepeatsCallIds(rows)
+    ? given.map((decision) => ({ approvalId: decision.approvalId, approved: false, reason: REPEATED_CALL_ID_RESULT }))
+    : [...given];
   // No budget, steps or cost, refuses a decision (G-387): acting on an
   // approved call makes no provider call, so the resume runs it and takes no
   // model step. A decision the resuming turn could not act on at all is
@@ -1956,6 +2037,8 @@ async function writeDecisionsIn(session: Session, decisions: readonly ApprovalDe
   // A plan held on one of these approvals reads the decision from the thread,
   // before the run resumes (G-360).
   await session.planService()?.decided(session);
+
+  return decisions;
 }
 
 /**
@@ -2118,10 +2201,21 @@ function executionContext(context: RunContext | undefined): RunContext | undefin
  * the lock TTL has passed, so a crash can only over-charge the delegation.
  */
 async function settleDelegation(session: Session, runId: string, took: number, ttl: number): Promise<void> {
-  try {
-    await session.settleChildSteps(runId, took, Math.floor(Date.now() / 1000), ttl);
-  } catch (error) {
-    process.emitWarning(`A delegation step budget update failed: ${failureName(error)}.`);
+  // Tried twice (round 13): one failed read at the end of a completed run
+  // must not leave its delegation over-charged, which would refuse the
+  // child's next turn. A settle is idempotent (a hold settled once is gone,
+  // and a hold already charged in full is corrected to what was taken), so
+  // a second try can never charge twice.
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      await session.settleChildSteps(runId, took, Math.floor(Date.now() / 1000), ttl);
+      return;
+    } catch (error) {
+      if (attempt >= 2) {
+        process.emitWarning(`A delegation step budget update failed: ${failureName(error)}.`);
+        return;
+      }
+    }
   }
 }
 
@@ -2140,4 +2234,8 @@ async function rememberSeq(session: Session, runId: string, steps: RunStepTagger
     // The class by the named-class rule, never the error's own words (round 11).
     process.emitWarning(`prism-harness could not record the step sequence of run [${runId}]: ${failureName(error)}.`);
   }
+}
+
+function list(value: JsonValue | undefined): JsonObject[] {
+  return Array.isArray(value) ? value.filter((entry): entry is JsonObject => typeof entry === 'object' && entry !== null && !Array.isArray(entry)) : [];
 }

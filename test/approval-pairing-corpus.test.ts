@@ -21,12 +21,15 @@ import {
  * the text `done`. `echo` is gated by mode and `free` is not. Each round
  * decides the listed approvals with one recordDecisions() call, then resumes
  * once with an empty prompt; a decision the harness refuses is swallowed.
+ * `decided` (0.2.0) is the decision the thread recorded for each approval.
  */
 interface PairingCase {
   id: string;
   title: string;
   calls: { id: string; name: string; args: JsonObject }[];
   rounds: [number, boolean][][];
+  /** DECISION B (0.2.0): what supersedes the parked step, after the park and before the rounds. */
+  supersede?: 'assistant_tool_step' | 'assistant_text' | 'user' | 'user_owning_run_id' | 'new_message';
   expected: unknown;
 }
 
@@ -69,21 +72,76 @@ async function record(row: PairingCase): Promise<unknown> {
   const session = harness.for({ type: 'User', id: 1 }).session('corpus');
   const runtime = new AgentRuntime({ client, modes, tools });
 
-  const pending = (await runtime.send(session, 'go')).pendingApprovals;
+  const parked = await runtime.send(session, 'go');
+  const pending = parked.pendingApprovals;
+  // DECISION B (0.2.0): a row that supersedes the parked step, recorded by a
+  // host (outside the run that owns the step), or a new message.
+  if (row.supersede === 'assistant_tool_step') await session.thread().record([{ type: 'assistant', content: '', tool_calls: [{ id: 'later', name: 'free', arguments: {} }], tool_approval_requests: [] }]);
+  if (row.supersede === 'assistant_text') await session.thread().record([{ type: 'assistant', content: 'A later answer.', tool_calls: [], tool_approval_requests: [] }]);
+  if (row.supersede === 'user') await session.thread().record([{ type: 'user', content: 'A later message.' }]);
+  // A caller passing the parked step's OWN run id: a run id a caller passes is always outside (UPDATE 3).
+  if (row.supersede === 'user_owning_run_id') await session.thread().record([{ type: 'user', content: 'A later message.' }], parked.runId);
+  if (row.supersede === 'new_message') await runtime.send(session, 'Something else.');
+  // The code each round was refused with, or null (0.2.0, rows with `supersede`).
+  const refusals: (string | null)[] = [];
   for (const round of row.rounds) {
     try {
       await recordDecisions(session, round.map(([index, approved]) => ({ approvalId: pending[index]!.id, approved })));
+      refusals.push(null);
     } catch (error) {
       // A decision the harness refuses is swallowed; the round still resumes.
       if (!(error instanceof HarnessError && error.code === 'approval_not_pending')) throw error;
+      refusals.push(error.code);
     }
     await runtime.send(session, '');
   }
 
-  return { approvals: pending.length, free, ran: [...ran].sort((a, b) => a - b) };
+  // The decision the thread RECORDED for each approval the first step issued,
+  // in issue order (0.2.0): the first answer, or null when none was recorded.
+  const recorded = new Map<string, boolean>();
+  for (const { message } of await session.thread().messages()) {
+    if (message.type !== 'tool_result') continue;
+    for (const answer of (message.tool_approval_responses ?? []) as JsonObject[]) {
+      if (typeof answer.approval_id === 'string' && !recorded.has(answer.approval_id)) recorded.set(answer.approval_id, answer.approved === true);
+    }
+  }
+
+  const outcome: Record<string, unknown> = { approvals: pending.length, free, ran: [...ran].sort((a, b) => a - b), decided: pending.map((approval) => recorded.get(approval.id) ?? null) };
+  if (row.supersede !== undefined) {
+    // The FIRST result each call of the first step ended with, in call
+    // order, or null (rows with `supersede` only).
+    const first = new Map<string, string>();
+    let after = false;
+    for (const { message } of await session.thread().messages()) {
+      if (!after) {
+        after = message.type === 'assistant' && Array.isArray(message.tool_calls) && message.tool_calls.length > 0;
+        continue;
+      }
+      if (message.type !== 'tool_result') continue;
+      for (const entry of (message.tool_results ?? []) as JsonObject[]) {
+        if (!first.has(entry.tool_call_id as string)) first.set(entry.tool_call_id as string, entry.result as string);
+      }
+    }
+    outcome.outcomes = row.calls.map((call) => first.get(call.id) ?? null);
+    outcome.refusals = refusals;
+  }
+
+  return outcome;
 }
 
+/** Set to an absolute path to write what this port measures for every row (for the parity recorder). */
+const RECORD = process.env.HARNESS_APPROVAL_PAIRING_RECORD;
+
 describe('harness-approval-pairing corpus', () => {
+  if (RECORD !== undefined && RECORD !== '') {
+    it("records this port's outcomes", async () => {
+      const { writeFileSync } = await import('node:fs');
+      const out: Record<string, unknown> = {};
+      for (const row of corpus.cases) out[row.id] = await record(row);
+      writeFileSync(RECORD, JSON.stringify(out, null, 2));
+    });
+  }
+
   it('has rows', () => {
     expect(corpus.cases.length).toBeGreaterThan(0);
   });

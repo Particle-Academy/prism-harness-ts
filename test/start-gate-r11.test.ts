@@ -193,12 +193,14 @@ async function heldPlanStep(r: Rig): Promise<string> {
 // ---------------------------------------------------------------------------
 
 describe('item 1: a call a runner start ended is recognised by a harness-only field, never by its text', () => {
-  it('(a) a gated tool whose result is exactly the Not run text, approved and run by a host new message: it reads approved, never superseded', async () => {
+  it('(a) a gated tool whose result is exactly the Not run text, approved and run by a host resume: it reads approved, never superseded', async () => {
     const r = new Rig({ plans: true, echo: () => endedByStartResult() });
     const echo = await heldPlanStep(r);
 
     r.text('Next done.');
-    await r.runtime.send(r.child(), 'Next message');
+    // Round 13 (DECISION B): a new message supersedes the step, so the
+      // approved call is run by a resume.
+      await r.runtime.send(r.child(), '');
 
     expect(r.ran.echo).toBe(1);
     const step = (await planOf(r)).steps[0];
@@ -224,7 +226,9 @@ describe('item 1: a call a runner start ended is recognised by a harness-only fi
     const r = new Rig({ plans: true, echo: () => endedByStartResult() });
     const echo = await heldPlanStep(r);
     r.text('Next done.');
-    await r.runtime.send(r.child(), 'Next message');
+    // Round 13 (DECISION B): a new message supersedes the step, so the
+      // approved call is run by a resume.
+      await r.runtime.send(r.child(), '');
     expect(r.ran.echo).toBe(1);
 
     r.text('Child done.');
@@ -279,7 +283,9 @@ describe('item 1: a call a runner start ended is recognised by a harness-only fi
       const echo = (await planOf(r)).steps[0].approvalIds[0] as string;
       await recordApproval(r.child(), echo, true);
       r.text('Next done.');
-      await r.runtime.send(r.child(), 'Next message');
+      // Round 13 (DECISION B): a new message supersedes the step, so the
+      // approved call is run by a resume.
+      await r.runtime.send(r.child(), '');
 
       expect(r.ran.echo).toBe(1);
       const rows = await childRows(r);
@@ -355,7 +361,9 @@ describe('items 3 and 6: a provider that reuses tool_call ids across turns', () 
     const echo = (await planOf(r)).steps[0].approvalIds[0] as string;
     await recordApproval(r.child(), echo, true);
     r.text('Next done.');
-    await r.runtime.send(r.child(), 'Next message');
+    // Round 13 (DECISION B): a new message supersedes the step, so the
+      // approved call is run by a resume.
+      await r.runtime.send(r.child(), '');
 
     expect(r.ran.echo).toBe(1);
     const step = (await planOf(r)).steps[0];
