@@ -1,5 +1,5 @@
 import type { JsonObject, JsonValue } from '../json.js';
-import { endedByStart, pairStepApprovals, pendingApprovalIds, repeatedIdDenials } from '../thread-rows.js';
+import { endedByStart, pairStepApprovals, pendingApprovalIds, repeatedIdDenials, stepResultsByPosition } from '../thread-rows.js';
 import { argsDigest } from '../tool-policy.js';
 import type { PendingCall } from './machine.js';
 
@@ -34,9 +34,12 @@ export function pendingApprovalCalls(rows: readonly JsonObject[]): PendingCall[]
       if (row.type !== 'assistant') continue;
       const request = list(row.tool_approval_requests).find((entry) => entry.approval_id === id);
       if (request === undefined) continue;
-      // The call this approval was asked for, paired by position (G-392).
+      // The call this approval was asked for, paired by position (G-392),
+      // with a call that has no result of its own first (round 13): a call
+      // that already has one ran ungated, so it is not the one asked about.
       const stepCalls = list(row.tool_calls);
-      const call = stepCalls[pairStepApprovals(stepCalls, list(row.tool_approval_requests)).approvalIds.indexOf(id)];
+      const answered = stepResultsByPosition(rows, index);
+      const call = stepCalls[pairStepApprovals(stepCalls, list(row.tool_approval_requests), (_call, position) => !answered[position]).approvalIds.indexOf(id)];
       if (call !== undefined && typeof call.name === 'string') calls.push({ id, name: call.name, digest: digestOf(call.arguments) });
       break;
     }

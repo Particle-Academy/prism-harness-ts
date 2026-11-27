@@ -20,6 +20,8 @@ import {
   endedByStartRow,
   pairStepApprovals,
   repeatedStepSettled,
+  stepResultsByPosition,
+  pausedStepRepeatsCallIds,
   REPEATED_CALL_ID,
   NOT_RUN_KEY,
   REPEATED_CALL_ID_RESULT,
@@ -269,6 +271,8 @@ const RESOLUTION_WAIT_SECONDS = 30;
 export class AgentRuntime {
   /** A subagent child run's tree and plan budget references, by run id, while it runs. */
   readonly #childRefs = new Map<string, { tree: RunTreeRef | null; planLedger: { session: string; plan: string } | null }>();
+  /** Each running run's hold release (#turnIn), so #finish releases BEFORE run.finished (round 13). */
+  readonly #releases = new Map<string, () => Promise<void>>();
   readonly #client: LlmClient;
 
   readonly #modes: ModeRegistry;
@@ -743,9 +747,10 @@ export class AgentRuntime {
       // (G-360): this stream opens with it even when the decision ended it, or
       // the reader would never learn that a draft was rejected.
       let decidedPlan = false;
+      let recorded: ApprovalDecision[];
       const capture = live.planService()?.watch(live.key(), () => { decidedPlan = true; }) ?? (() => {});
       try {
-        await writeDecisions(live, decisions, context);
+        recorded = await writeDecisions(live, decisions, context);
       } finally {
         capture();
       }
@@ -757,7 +762,8 @@ export class AgentRuntime {
       const unwatch = await this.#watchPlan(live, tagger, decidedPlan);
 
       try {
-        for (const decision of decisions) {
+        // Each decision as RECORDED (round 13: a repeated-id step's as denials).
+        for (const decision of recorded) {
           // From the APP's run context, never from the model or the request.
           tagger.decision(decision.approvalId, decision.approved, decision.reason ?? null, context?.actor ?? null);
         }
@@ -996,8 +1002,11 @@ export class AgentRuntime {
     if (started !== null) run = started.run;
 
     steps?.bind(session.key(), runId, run.parentRunId, run.rootRunId, session.agent);
-    const unwatchPlan = steps !== undefined && stepping?.watchPlan === true ? await this.#watchPlan(session, steps) : () => {};
+    let unwatchPlan: () => void = () => {};
     try {
+      // Inside this try (round 13): a start that committed (b) and fails
+      // here, before its run began, ends its own view and is undone too.
+      if (steps !== undefined && stepping?.watchPlan === true) unwatchPlan = await this.#watchPlan(session, steps);
       // A runner start wrote the child's mode with its records (b).
       // A runner start's run is provisional until its task row (round 9).
       await session.beginRun(runId, mode.name, provider, model, membership.tree, membership.depth, started !== null);
@@ -1025,6 +1034,9 @@ export class AgentRuntime {
       await RunTrees.finished(session, runId);
       if (delegation !== null) await settleDelegation(delegation.session, runId, run.ledger.steps - delegation.startSteps, this.#setting(session, 'lock_ttl') ?? RESOLUTION_LOCK_SECONDS);
     };
+    // On success too (round 13): #finish releases before run.finished, so
+    // no listener observes a hold of a run that has already ended.
+    this.#releases.set(runId, releaseHolds);
     try {
       // Inside the run's try (G-387 round 12): whatever this emit throws (a
       // host's own HarnessEvents may throw anything) fails the run, releases
@@ -1266,6 +1278,7 @@ export class AgentRuntime {
       session.endChildStartView(runId);
       unwatchPlan();
       this.#childRefs.delete(runId);
+      this.#releases.delete(runId);
       await releaseHolds();
       if (steps !== undefined) await rememberSeq(session, runId, steps);
     }
@@ -1682,19 +1695,25 @@ export class AgentRuntime {
     // Each call paired with its OWN request by position, never by a map keyed
     // by call id, where the last request for a repeated id would decide every
     // call carrying it (G-392).
-    const pairing = pairStepApprovals(assistant.tool_calls, assistant.tool_approval_requests, (call) => typeof call.name === 'string' && mode.needsApproval(call.name));
-    // A step that repeats a call id: a result keyed by id cannot say whose it
-    // is, so its gated calls are open until the harness settled the step.
     let stored = rows.length - 1;
     while (stored >= 0 && !(rows[stored]!.type === 'assistant' && Array.isArray(rows[stored]!.tool_calls) && (rows[stored]!.tool_calls as JsonValue[]).length > 0)) stored -= 1;
+    // Results pair with calls BY POSITION (round 13), never by id: in a step
+    // whose calls share an id, an ungated call's result (or the immediate
+    // result of a call with unusable arguments) must not make the gated call
+    // look finished, nor take its approval.
+    const answeredAt = stepResultsByPosition(rows, stored);
+    const pairing = pairStepApprovals(assistant.tool_calls, assistant.tool_approval_requests,
+      (call, position) => typeof call.name === 'string' && mode.needsApproval(call.name) && !answeredAt[position]);
+    // A step that repeats a call id: its gated calls are open until the
+    // harness settled the step.
     const settled = pairing.repeated && repeatedStepSettled(rows, stored);
 
     // A call that has a result is DONE, whatever its decision says. A call that
     // needs nobody is not this method's to run.
     const open = assistant.tool_calls
-      .map((call, index) => ({ call, approvalId: pairing.approvalIds[index] }))
-      .filter(({ call, approvalId }) => (approvalId !== undefined || mode.needsApproval(call.name))
-        && (!pairing.repeated ? !results.has(call.id) : !settled && (approvalId !== undefined || !results.has(call.id))));
+      .map((call, index) => ({ call, approvalId: pairing.approvalIds[index], index }))
+      .filter(({ call, approvalId, index }) => (approvalId !== undefined || mode.needsApproval(call.name))
+        && !answeredAt[index] && !settled);
     const calls = open.map(({ call }) => call);
     const approvalIds = open.map(({ approvalId }) => approvalId);
 
@@ -1795,6 +1814,13 @@ export class AgentRuntime {
     stoppedBecause: string | null,
   ): Promise<AgentResponse> {
     await session.completeRun(runId, finishReason, called);
+    // Released BEFORE the event, as on the failure path (round 13): settling
+    // never throws (each settle reports its own failure by class name).
+    try {
+      await this.#releases.get(runId)?.();
+    } catch {
+      // The hold stays and only over-charges until it expires.
+    }
     const stop = stoppedBecause === null ? null : run.ledger.stopCode(run.budget);
     this.#events?.emit({
       type: 'run.finished',
@@ -1913,7 +1939,7 @@ async function writeDecisionsLocked(
   ttlSeconds: number = RESOLUTION_LOCK_SECONDS,
   waitSeconds: number = RESOLUTION_WAIT_SECONDS,
 ): Promise<void> {
-  await session.lock((live) => writeDecisions(live, decisions), ttlSeconds, waitSeconds);
+  await session.lock(async (live) => { await writeDecisions(live, decisions); }, ttlSeconds, waitSeconds);
 }
 
 /**
@@ -1926,17 +1952,25 @@ async function writeDecisionsLocked(
  *
  * Call it holding the session lock: the check and the write are one step.
  */
-async function writeDecisions(session: Session, decisions: readonly ApprovalDecision[], context?: RunContext): Promise<void> {
+async function writeDecisions(session: Session, decisions: readonly ApprovalDecision[], context?: RunContext): Promise<ApprovalDecision[]> {
   // A decision is never inside a runner start's own view (round 11).
   return inOwnTurnScope(() => writeDecisionsIn(session, decisions, context));
 }
 
-async function writeDecisionsIn(session: Session, decisions: readonly ApprovalDecision[], context?: RunContext): Promise<void> {
+/** Writes the decisions and returns them as RECORDED (a repeated-id step's as denials). */
+async function writeDecisionsIn(session: Session, given: readonly ApprovalDecision[], context?: RunContext): Promise<ApprovalDecision[]> {
   const rows = (await session.thread().messages()).map((entry) => entry.message);
   const pending = new Set(pendingApprovalIds(rows));
-  for (const decision of decisions) {
+  for (const decision of given) {
     if (!pending.delete(decision.approvalId)) throw HarnessError.approvalNotPending(decision.approvalId);
   }
+  // A step whose call ids repeat runs none of its gated calls (G-392), so
+  // every decision on it is RECORDED as a denial with that reason (round
+  // 13, as the PHP reference records it): what the thread says was decided
+  // is what was acted on, and no reader can take it for approved work.
+  const decisions: ApprovalDecision[] = pausedStepRepeatsCallIds(rows)
+    ? given.map((decision) => ({ approvalId: decision.approvalId, approved: false, reason: REPEATED_CALL_ID_RESULT }))
+    : [...given];
   // No budget, steps or cost, refuses a decision (G-387): acting on an
   // approved call makes no provider call, so the resume runs it and takes no
   // model step. A decision the resuming turn could not act on at all is
@@ -1956,6 +1990,8 @@ async function writeDecisionsIn(session: Session, decisions: readonly ApprovalDe
   // A plan held on one of these approvals reads the decision from the thread,
   // before the run resumes (G-360).
   await session.planService()?.decided(session);
+
+  return decisions;
 }
 
 /**
@@ -2118,10 +2154,21 @@ function executionContext(context: RunContext | undefined): RunContext | undefin
  * the lock TTL has passed, so a crash can only over-charge the delegation.
  */
 async function settleDelegation(session: Session, runId: string, took: number, ttl: number): Promise<void> {
-  try {
-    await session.settleChildSteps(runId, took, Math.floor(Date.now() / 1000), ttl);
-  } catch (error) {
-    process.emitWarning(`A delegation step budget update failed: ${failureName(error)}.`);
+  // Tried twice (round 13): one failed read at the end of a completed run
+  // must not leave its delegation over-charged, which would refuse the
+  // child's next turn. A settle is idempotent (a hold settled once is gone,
+  // and a hold already charged in full is corrected to what was taken), so
+  // a second try can never charge twice.
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      await session.settleChildSteps(runId, took, Math.floor(Date.now() / 1000), ttl);
+      return;
+    } catch (error) {
+      if (attempt >= 2) {
+        process.emitWarning(`A delegation step budget update failed: ${failureName(error)}.`);
+        return;
+      }
+    }
   }
 }
 

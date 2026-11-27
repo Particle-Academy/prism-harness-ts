@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+### Fixed: ended approvals in steps that repeat a call id, and cleanup on success (G-387 round 13)
+
+- An approval a runner start ended reads ended when ANY result row of its
+  request's own turn carries the start's mark naming it. It was read only
+  from the first result row carrying its call id, so in a step where an
+  ungated call (or a call with unusable arguments) shared that id and
+  already had a result, the plan could count a person's approval of a call
+  that never ran as approved work. Pinned by the harness-thread-rows corpus.
+- Every decision recorded on a step whose calls repeat a tool call id is
+  recorded as a denial with the repeated-id reason, on every decision path
+  (`recordApproval()`, `recordDecisions()`, `decide()`, `streamDecision()`,
+  whose `decision_recorded` step now reports the decision as recorded), as
+  the PHP reference records it. Pinned by the harness-approval-pairing corpus.
+- A call's result is paired with it by its position in the step, never by
+  its tool call id: an ungated call's result no longer makes a gated call
+  sharing its id look finished, nor takes its approval in the plan's view of
+  the pending calls.
+- A run releases its holds BEFORE `run.finished`, as it already did before
+  `run.failed`, and a delegation's step-count settle is tried twice, so one
+  failed store read at the end of a completed delegation no longer leaves the
+  child's count over-charged. A completed start is never undone by its
+  cleanup.
+- A runner start that fails after its records are written but before its run
+  begins (a plan watch for a streamed turn) now ends its own view and is
+  undone, as every later failure is.
+
 ### Changed: one gate for a runner start (G-387)
 
 - A runner start (`SubagentRunner.run()`, and the subagent tool that calls it)

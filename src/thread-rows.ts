@@ -334,35 +334,38 @@ export function endedByStartRow(calls: readonly ToolCallInput[], approvalIds: re
  * (G-387 round 10): their decision, if any, was never acted on, so it reads
  * as ended, never as approved.
  *
- * The reference's rule (round 12), read the same in every language: for
- * each approval, its request row; then the FIRST result of its call after
- * that row, before any later assistant row (a later step means the call had
- * no result in its own turn). The approval is ended only when that result's
- * row carries the mark and the mark names this approval. Never by the
- * result text (a tool can return any text), and never by tool_call id
- * across the thread (providers reuse call ids: one per function name, or
- * numbered per response).
+ * The rule (round 13, the same in every language): for each approval, its
+ * request row; the approval is ended when ANY result row after that row and
+ * before the next assistant row carries the mark and the mark names this
+ * approval. Not only the first row carrying its call id (round 12): in a
+ * step whose calls share an id, an ungated call's result, or the immediate
+ * result of a call with unusable arguments, carries that id too, unmarked,
+ * and must not hide the start's mark. Only the harness writes the mark, so
+ * this is no looser. Never by the result text (a tool can return any text),
+ * and never by tool_call id across the thread (providers reuse call ids: one
+ * per function name, or numbered per response). Pinned by the
+ * harness-thread-rows corpus.
  *
  * @internal
  */
 export function endedByStart(rows: readonly JsonObject[]): Set<string> {
-  const requests = new Map<string, { index: number; call: string }>();
+  const requests = new Map<string, number>();
   for (const [index, row] of rows.entries()) {
     if (row.type !== 'assistant') continue;
     for (const request of list(row.tool_approval_requests)) {
-      if (typeof request.approval_id === 'string' && typeof request.tool_call_id === 'string') {
-        requests.set(request.approval_id, { index, call: request.tool_call_id });
-      }
+      if (typeof request.approval_id === 'string' && typeof request.tool_call_id === 'string') requests.set(request.approval_id, index);
     }
   }
   const ended = new Set<string>();
-  for (const [approval, request] of requests) {
-    for (const row of rows.slice(request.index + 1)) {
+  for (const [approval, index] of requests) {
+    for (const row of rows.slice(index + 1)) {
       if (row.type === 'assistant') break;
-      if (row.type !== 'tool_result' || !list(row.tool_results).some((result) => result.tool_call_id === request.call)) continue;
+      if (row.type !== 'tool_result') continue;
       const mark = row[ENDED_BY_START_KEY];
-      if (isObject(mark) && Array.isArray(mark.approval_ids) && mark.approval_ids.includes(approval)) ended.add(approval);
-      break;
+      if (isObject(mark) && Array.isArray(mark.approval_ids) && mark.approval_ids.includes(approval)) {
+        ended.add(approval);
+        break;
+      }
     }
   }
 
@@ -571,7 +574,7 @@ export const NOT_RUN_KEY = 'not_run';
 export function pairStepApprovals(
   calls: readonly JsonObject[],
   requests: readonly JsonObject[],
-  gated: (call: JsonObject) => boolean = () => true,
+  gated: (call: JsonObject, position: number) => boolean = () => true,
 ): { approvalIds: (string | undefined)[]; repeated: boolean } {
   const ids = calls.map((call) => text(call.id));
   const asked = requests.map((request) => text(request.tool_call_id));
@@ -582,8 +585,8 @@ export function pairStepApprovals(
     // A call that needs approval first, so an ungated call sharing the id is
     // not taken for the gated one; then any call that names it.
     const free = (position: number, id: string): boolean => approvalIds[position] === undefined && id === want;
-    let at = ids.findIndex((id, position) => position >= cursor && free(position, id) && gated(calls[position]!));
-    if (at === -1) at = ids.findIndex((id, position) => free(position, id) && gated(calls[position]!));
+    let at = ids.findIndex((id, position) => position >= cursor && free(position, id) && gated(calls[position]!, position));
+    if (at === -1) at = ids.findIndex((id, position) => free(position, id) && gated(calls[position]!, position));
     if (at === -1) at = ids.findIndex((id, position) => position >= cursor && free(position, id));
     if (at === -1) at = ids.findIndex((id, position) => free(position, id));
     if (at === -1) continue;
@@ -592,6 +595,60 @@ export function pairStepApprovals(
   }
 
   return { approvalIds, repeated: new Set(ids).size !== ids.length || new Set(asked).size !== asked.length };
+}
+
+/**
+ * Which calls of the stored assistant step at `index` have a result, paired
+ * BY POSITION (G-387 round 13), never by tool call id: providers repeat ids
+ * within one step, and an ungated call's result (or the immediate result of
+ * a call with unusable arguments) must not make a gated call sharing its id
+ * look finished. Read from the result rows after the step, before the next
+ * assistant or user row, as stored (the replay view folds results by id).
+ * Each result pairs with the first call without one that has its id, its
+ * tool name and its arguments; then its id and name; then its id.
+ *
+ * @internal
+ */
+export function stepResultsByPosition(rows: readonly JsonObject[], index: number): boolean[] {
+  const calls = list(rows[index]?.tool_calls);
+  const has = calls.map(() => false);
+  const args = calls.map((call) => JSON.stringify(usableArguments(call.arguments) ?? {}));
+  for (const row of rows.slice(index + 1)) {
+    if (row.type === 'assistant' || row.type === 'user') break;
+    if (row.type !== 'tool_result') continue;
+    const entries = Array.isArray(row.tool_results) ? list(row.tool_results)
+      : Object.hasOwn(row, 'tool_call_id') ? [{ tool_call_id: row.tool_call_id ?? null, tool_name: row.name ?? null }] : [];
+    for (const entry of entries) {
+      const id = text(entry.tool_call_id);
+      const open = (position: number): boolean => !has[position] && text(calls[position]!.id) === id;
+      let at = calls.findIndex((call, position) => open(position) && call.name === entry.tool_name && args[position] === JSON.stringify(isObject(entry.args) ? entry.args : {}));
+      if (at === -1) at = calls.findIndex((call, position) => open(position) && call.name === entry.tool_name);
+      if (at === -1) at = calls.findIndex((_call, position) => open(position));
+      if (at !== -1) has[at] = true;
+    }
+  }
+
+  return has;
+}
+
+/**
+ * Whether the step the run paused at the transcript tail (the last assistant
+ * row, unless a user row comes after it) repeats a call id, among its calls
+ * or its approval requests (G-392). Every decision recorded for such a step
+ * is recorded as a denial (round 13, as the PHP reference records it).
+ *
+ * @internal
+ */
+export function pausedStepRepeatsCallIds(rows: readonly JsonObject[]): boolean {
+  for (let index = rows.length - 1; index >= 0; index -= 1) {
+    const row = rows[index]!;
+    if (row.type === 'user') return false;
+    if (row.type !== 'assistant') continue;
+
+    return pairStepApprovals(list(row.tool_calls), list(row.tool_approval_requests)).repeated;
+  }
+
+  return false;
 }
 
 /**

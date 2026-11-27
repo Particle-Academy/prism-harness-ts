@@ -336,7 +336,16 @@ mark it writes itself on that result row (`harness_ended_by_start`, the same
 shape in every language), naming the approvals it ended; never by
 the result's words or by a tool call id, so a tool whose output happens to
 read "Not run", or a provider that reuses call ids, cannot make an approved
-call that ran read as ended, nor end a later approval. A decision a person recorded that a resume
+call that ran read as ended, nor end a later approval. Any result row of
+the request's own turn that carries that mark ends the approvals it names,
+so an earlier result sharing the call's id (an ungated call in the same
+step, or a call whose arguments could not be used) never hides it. A
+decision recorded on a step whose calls repeat a tool call id is recorded
+as a denial ("another call in this step has the same id"): none of that
+step's gated calls runs, so the thread never says one was approved, and a
+call's result is matched to it by its position in the step, never by its
+id. A start that completed is never undone by its own cleanup: a store
+read that fails after its task row only ends its own view. A decision a person recorded that a resume
 could still act on refuses the start, as an approval waiting on a person
 does, so a re-delegation never ends a call a person decided. While its
 records are provisional the child keeps the run tree and plan budget it was

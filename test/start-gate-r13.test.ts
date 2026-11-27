@@ -38,6 +38,8 @@ class Store extends MemorySessionStore {
   /** Reads of a child key that throw: a count, or `always` until disarmed. */
   failReads: number | 'always' = 0;
   failed = 0;
+  /** Writes of a child key that land, and then throw (a lost acknowledgement). */
+  failAfterWrite = 0;
 
   constructor(private readonly kind: Durability) {
     super();
@@ -59,6 +61,10 @@ class Store extends MemorySessionStore {
   override async put(key: string, payload: JsonObject, ttlSeconds: number | null = null): Promise<void> {
     this.keys.add(key);
     await super.put(key, payload, ttlSeconds);
+    if (key.includes('::sub::') && this.failAfterWrite > 0) {
+      this.failAfterWrite -= 1;
+      throw new Error('STORE-SECRET acknowledgement lost');
+    }
   }
 }
 
@@ -548,4 +554,57 @@ describe("item 4: the start's own view ends with its run; holds release before r
       expect(await at!).toBe(false);
     });
   }
+});
+
+// ---------------------------------------------------------------------------
+// New channels the round-13 fixes could open, each pinned.
+// ---------------------------------------------------------------------------
+
+describe('round 13: new channels', () => {
+  it('the settle is retried: a write that landed and then threw is not charged twice', async () => {
+    const r = new Rig();
+    await r.session().usingMode('lead');
+    vi.spyOn(process, 'emitWarning').mockImplementation((() => {}) as typeof process.emitWarning);
+    const settle = Session.prototype.settleChildSteps;
+    vi.spyOn(Session.prototype, 'settleChildSteps').mockImplementation(async function (this: Session, ...args: Parameters<Session['settleChildSteps']>) {
+      r.durable.failAfterWrite = 1;
+      vi.mocked(Session.prototype.settleChildSteps).mockImplementation(settle);
+      return settle.apply(this, args);
+    });
+
+    r.calls([['echo', { n: 1 }]]);
+    await r.run('Work');
+    vi.restoreAllMocks();
+
+    const record = (await r.durable.get(`${r.child().key()}:durable`)) as { child_steps?: { steps: number; holds: JsonObject } };
+    // One model step taken, charged once, and no hold left behind.
+    expect(record.child_steps?.steps).toBe(1);
+    expect(record.child_steps?.holds).toEqual({});
+  });
+
+  it("a start launched from the child's run.finished listener (holds now released before it) completes, and the child is consistent after", async () => {
+    const r = new Rig();
+    await r.session().usingMode('lead');
+    let second: Promise<{ outcome: string }> | null = null;
+    let fired = false;
+    r.events.listen((event: HarnessEvent) => {
+      if (event.type === 'run.finished' && event.sessionKey === r.child().key() && !fired) {
+        fired = true;
+        r.text('Second done.');
+        second = r.run('Second');
+      }
+    });
+
+    r.text('First done.');
+    expect((await r.run('First')).outcome).toBe('completed');
+    expect(second).not.toBeNull();
+    expect((await second!).outcome).toBe('completed');
+
+    const child = r.child();
+    expect(await child.childStartUnconfirmed()).toBe(false);
+    expect(await child.childBinding()).not.toBeNull();
+    expect(await child.childTurnLive(Math.floor(Date.now() / 1000), 300)).toBe(false);
+    const tasks = (await r.rows()).filter((row) => row.type === 'user').map((row) => row.content);
+    expect(tasks).toEqual(['First', 'Second']);
+  });
 });
