@@ -149,7 +149,49 @@ export function threadView(rows: readonly JsonObject[]): JsonObject[] {
     }
   }
 
-  return view;
+  return onceEach(view);
+}
+
+/**
+ * Each result of a step EXACTLY ONCE in its step's segment (G-405), across
+ * result rows that are not consecutive (a host row, a new message between
+ * them): a later occurrence of the same result (resultKey, occurrence by
+ * occurrence) replaces the earlier one in its position and is not shown
+ * again. A result row left with nothing to show is dropped.
+ */
+function onceEach(view: JsonObject[]): JsonObject[] {
+  let shown = new Map<string, { row: number; entry: number }[]>();
+  const removed = new Set<string>();
+  view.forEach((row, at) => {
+    if (row.type === 'assistant' && list(row.tool_calls).length > 0) { shown = new Map(); return; }
+    if (row.type !== 'tool_result') return;
+    const results = (row as ToolResultRow).tool_results;
+    const here = new Map<string, number>();
+    results.forEach((entry, index) => {
+      const key = resultKey(entry);
+      const occurrence = here.get(key) ?? 0;
+      here.set(key, occurrence + 1);
+      const earlier = shown.get(key) ?? [];
+      const target = earlier[occurrence];
+      if (target === undefined) {
+        earlier.push({ row: at, entry: index });
+        shown.set(key, earlier);
+        return;
+      }
+      // The same result again: it replaces the one already shown.
+      (view[target.row] as ToolResultRow).tool_results[target.entry] = entry;
+      removed.add(`${at}:${index}`);
+    });
+  });
+  if (removed.size === 0) return view;
+  return view.flatMap((row, at) => {
+    if (row.type !== 'tool_result') return [row];
+    const result = row as ToolResultRow;
+    const kept = result.tool_results.filter((_entry, index) => !removed.has(`${at}:${index}`));
+    if (kept.length === result.tool_results.length) return [row];
+    if (kept.length === 0 && result.tool_approval_responses.length === 0) return [];
+    return [toolResultRow(kept, result.tool_approval_responses)];
+  });
 }
 
 /** Stored approval authority, kept separate from the provider replay view. */
