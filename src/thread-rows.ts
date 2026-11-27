@@ -595,7 +595,9 @@ export function startedDecisions(messages: readonly StoredRow[], index: number):
 }
 
 /**
- * The stored rows in the order the model is shown them (G-412): the answer the
+ * The stored rows in the order the model is shown them (G-412), each host
+ * assistant row without provider content that is not its own (G-415,
+ * `withoutHostToolItems`): the answer the
  * harness recorded for a replaced step (G-397) is moved to directly after the
  * step it names, without its mark, so that step's calls are answered where
  * they were made. Only a mark the harness recorded, naming an EARLIER
@@ -619,7 +621,56 @@ export function replayRows(messages: readonly StoredRow[]): JsonObject[] {
     after.set(step, [...(after.get(step) ?? []), plain]);
     moved.add(index);
   });
-  return messages.flatMap(({ message }, index) => (moved.has(index) ? [] : [message, ...(after.get(index) ?? [])]));
+  return messages.flatMap(({ message, harness }, index) => (moved.has(index) ? [] : [withoutHostToolItems(message, harness), ...(after.get(index) ?? [])]));
+}
+
+/**
+ * `row` as the model is sent it (G-415). A client built on prism-ts replays an
+ * assistant message's provider-native content as given: OpenAI Responses
+ * `additional_content.output_items` and Anthropic
+ * `additional_content.content_blocks` (from a 'fallback' block on, every
+ * block). Content a host copied from another step could send a tool call with
+ * no result, replace the row's own text, or send a reasoning item twice.
+ *
+ * So an assistant row a host recorded (not the harness) keeps its provider
+ * content ONLY when it is that row's own: its tool items are the row's tool
+ * calls exactly (id and name, as a multiset) and its text is the row's
+ * content, read as prism-ts reads it. Otherwise both keys are dropped and the
+ * client maps the row from `content` and `tool_calls`. Every other key is
+ * kept, rows the harness wrote are returned as they are, and the stored row is
+ * unchanged.
+ */
+function withoutHostToolItems(row: JsonObject, harness: true | undefined): JsonObject {
+  if (harness === true || row.type !== 'assistant' || !isObject(row.additional_content)) return row;
+  const additional = row.additional_content;
+  const own = callPrints(list(row.tool_calls).map((call) => [text(call.id), text(call.name)]));
+  const content = typeof row.content === 'string' ? row.content : '';
+  const outputItems = additional.output_items;
+  const contentBlocks = additional.content_blocks;
+  const openaiOwn = !Array.isArray(outputItems) || (
+    !outputItems.some((item) => isObject(item) && item.type === 'function_call_output')
+    && callPrints(outputItems.filter(isObject).filter((item) => item.type === 'function_call').map((item) => [text(item.id), text(item.name)])) === own
+    && openaiText(outputItems) === content);
+  const anthropicOwn = !Array.isArray(contentBlocks) || (
+    callPrints(contentBlocks.filter(isObject).filter((block) => block.type === 'tool_use').map((block) => [text(block.id), text(block.name)])) === own
+    && contentBlocks.filter(isObject).filter((block) => block.type === 'text').map((block) => (typeof block.text === 'string' ? block.text : '')).join('') === content);
+  if (openaiOwn && anthropicOwn) return row;
+  const kept: JsonObject = { ...additional };
+  delete kept.output_items;
+  delete kept.content_blocks;
+  return { ...row, additional_content: kept };
+}
+
+/** A multiset of (id, name) pairs, as one comparable string. */
+function callPrints(pairs: [string, string][]): string {
+  return pairs.map(([id, name]) => `${id.length}:${id}${name.length}:${name}`).sort().join('|');
+}
+
+/** An OpenAI reply's text as prism-ts reads it: the first content part of the last output item. */
+function openaiText(items: readonly JsonValue[]): string {
+  const last = items.filter(isObject).at(-1);
+  const first = Array.isArray(last?.content) ? last.content[0] : undefined;
+  return isObject(first) && typeof first.text === 'string' ? first.text : '';
 }
 
 /**

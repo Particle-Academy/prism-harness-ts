@@ -307,13 +307,38 @@ function insertion(seed: number, calls: Call[], prior: number[], later: LaterSte
   return { kind, when, segment, step, call: kind === 'tool_result' ? rng.pick(open) : rng.int(0, target.length - 1) };
 }
 
+type ProviderCopy = 'openai' | 'anthropic' | 'fallback';
+
+/**
+ * G-415: the provider-native content an inserted assistant row carries,
+ * copied from another step, from a stream of its own (the seed's other draws
+ * are unchanged): OpenAI output_items, Anthropic content_blocks, or Anthropic
+ * blocks after a 'fallback' block. Its tool item and text are never the row's
+ * own, so it is never the row's content to send.
+ */
+function providerCopy(c: Case): ProviderCopy | null {
+  if (c.insert?.kind !== 'assistant_text' && c.insert?.kind !== 'assistant_call') return null;
+  const rng = new Rng((c.seed ^ 0x415415) >>> 0);
+  return rng.chance(0.75) ? rng.pick<ProviderCopy>(['openai', 'anthropic', 'fallback']) : null;
+}
+
+function copiedContent(copy: ProviderCopy | null): JsonObject {
+  switch (copy) {
+    case null: return {};
+    case 'openai': return { output_items: [{ type: 'reasoning', id: 'rs_copied', summary: [] }, { type: 'function_call', id: 'copied', call_id: 'c_copied', name: 'echo', arguments: '{"n":1}' }, { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Copied.' }] }] };
+    case 'anthropic': return { content_blocks: [{ type: 'text', text: 'Copied.' }, { type: 'tool_use', id: 'copied', name: 'echo', input: { n: 1 } }] };
+    case 'fallback': return { content_blocks: [{ type: 'fallback' }, { type: 'tool_use', id: 'copied', name: 'echo', input: { n: 1 } }, { type: 'text', text: 'Copied.' }] };
+  }
+}
+
 /** The row G-397 inserts. Its own call's token (900) is never a step call's. */
 function insertedRow(c: Case): JsonObject {
   const insert = c.insert!;
   const call = (insert.step === 'later' ? c.later!.calls : c.calls)[insert.call]!;
+  const copied = copiedContent(providerCopy(c));
   switch (insert.kind) {
-    case 'assistant_text': return { type: 'assistant', content: 'A note.', tool_calls: [], tool_approval_requests: [] };
-    case 'assistant_call': return { type: 'assistant', content: '', tool_calls: [{ id: call.id, name: 'free', arguments: { n: 900 } }], tool_approval_requests: [] };
+    case 'assistant_text': return { type: 'assistant', content: 'A note.', tool_calls: [], tool_approval_requests: [], ...(providerCopy(c) === null ? {} : { additional_content: copied }) };
+    case 'assistant_call': return { type: 'assistant', content: '', tool_calls: [{ id: call.id, name: 'free', arguments: { n: 900 } }], tool_approval_requests: [], ...(providerCopy(c) === null ? {} : { additional_content: copied }) };
     case 'user': return { type: 'user', content: 'Something else.' };
     case 'system': return { type: 'system', content: 'A system note.' };
     case 'tool_empty': return toolResultRow([]);
@@ -1110,7 +1135,30 @@ function sentRequestsAnswerEveryCall(sent: JsonObject[][]): void {
       const missing = (row.tool_calls as JsonObject[]).map((call) => call.id).filter((id) => !answered.has(id as string));
       check(missing.length === 0, '7: every sent request answers every tool call directly after its step', { request, row: at, missing, next: next?.type ?? null });
     });
+    messages.forEach((row, at) => {
+      if (row.type !== 'assistant') return;
+      check(providerContentIsOwn(row), '8: an assistant row is sent with provider content only when it is its own: same tool calls, same text (G-415)', { request, row: at, additional: row.additional_content });
+    });
   });
+}
+
+/** The oracle's own reading of G-415: tool items (id, name) as the row's tool calls, and text as the row's content. */
+function providerContentIsOwn(row: JsonObject): boolean {
+  const extra = (row.additional_content ?? {}) as JsonObject;
+  const pairs = (items: JsonObject[]): string => items.map((item) => `${String(item.id)}/${String(item.name)}`).sort().join(',');
+  const own = pairs(Array.isArray(row.tool_calls) ? (row.tool_calls as JsonObject[]).filter((call) => typeof call === 'object' && call !== null) : []);
+  const content = typeof row.content === 'string' ? row.content : '';
+  if (Array.isArray(extra.output_items)) {
+    const items = extra.output_items as JsonObject[];
+    const last = items.at(-1)?.content;
+    const text = Array.isArray(last) && typeof (last[0] as JsonObject | undefined)?.text === 'string' ? (last[0] as JsonObject).text : '';
+    if (items.some((item) => item.type === 'function_call_output') || pairs(items.filter((item) => item.type === 'function_call')) !== own || text !== content) return false;
+  }
+  if (Array.isArray(extra.content_blocks)) {
+    const blocks = extra.content_blocks as JsonObject[];
+    if (pairs(blocks.filter((block) => block.type === 'tool_use')) !== own || blocks.filter((block) => block.type === 'text').map((block) => block.text).join('') !== content) return false;
+  }
+  return true;
 }
 
 /** Invariants 5 and 6 on the thread rows: every call has exactly one outcome, the oracle's. */
@@ -1342,6 +1390,9 @@ describe('G-392 property: approval pairing invariants over generated steps', () 
     // G-397 / G-399: every inserted row kind, before and after the decision (main's shape check).
     for (const kind of INSERT_KINDS) {
       for (const when of ['before_decision', 'after_decision'] as const) expect(has((c) => c.insert?.kind === kind && c.insert.when === when), `${kind} ${when}`).toBe(true);
+      if (kind === 'assistant_text' || kind === 'assistant_call') {
+        for (const copy of ['openai', 'anthropic', 'fallback'] as const) expect(has((c) => c.insert?.kind === kind && providerCopy(c) === copy), `${kind} with copied ${copy} content (G-415)`).toBe(true);
+      }
       expect(has((c) => c.insert?.kind === kind && decideStep('p', c.calls, c.requests, c.prior).repeated && c.requests.some((q) => q.verdict === 'approve')), `${kind} in a repeated-id step`).toBe(true);
     }
     expect(has((c) => c.insert !== null && c.recorder === 'streamDecision'), 'insert + streamDecision').toBe(true);
