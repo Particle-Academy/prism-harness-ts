@@ -930,6 +930,14 @@ async function replayKeepsEveryResult(session: Session, label: string): Promise<
       check((got[at]?.get(key) ?? 0) >= count, `${label}: the replay view keeps every result of a step, by id, name and arguments`, { step: at, key, stored: count, shown: got[at]?.get(key) ?? 0 });
     }
   });
+  // And emits each exactly once: no result occurrence (id, name, arguments)
+  // shown more often in a step's segment than it occurs in one stored row,
+  // across every row of the replay (some providers refuse a repeated result).
+  got.forEach((segment, at) => {
+    for (const [key, count] of segment) {
+      check(count <= (want[at]?.get(key) ?? 0), `${label}: the replay view emits each result of a step exactly once`, { step: at, key, stored: want[at]?.get(key) ?? 0, shown: count });
+    }
+  });
 }
 
 // ---------------------------------------------------------------------------
