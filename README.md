@@ -417,6 +417,12 @@ response.structured; // { title: 'Ship it', steps: ['write', 'test'] }
 response.text; // the document as the model wrote it
 ```
 
+A structured turn that stops before any document, because it parked on an
+approval or a budget stopped it, returns the same shape with `structured:
+null`, its `finishReason` (`awaiting_approval`, `budget_exhausted`) and its
+`pendingApprovals`. Answer them and resume with `sendStructured(session, '',
+schema)` for the document.
+
 It is the same run as `send()` — the mode's system prompt, its tools, the step
 budget, the events — asking the provider for structured output. Your client
 receives the schema as `request.schema` and returns what it parsed as

@@ -146,7 +146,13 @@ export interface AgentResponse {
  * transcript and a parse can be compared rather than trusted.
  */
 export interface StructuredAgentResponse extends AgentResponse {
-  /** Checked against the schema before it got here; a run that could not produce one threw. */
+  /**
+   * Checked against the schema before it got here; a run that could not
+   * produce one threw. `null` when the run stopped before any document: it
+   * parked on approval (`finishReason` `awaiting_approval`, with
+   * `pendingApprovals`) or was stopped by a budget. Resume it with
+   * `sendStructured(session, '', schema)` once the approvals are answered.
+   */
   structured: JsonValue;
 }
 
@@ -888,8 +894,16 @@ export class AgentRuntime {
     const response = await this.#resumeLocked(session, prompt, context, (live, stepping) =>
       this.#turn(live, prompt, toolNames, context, additionalContent, schema, stepping));
 
-    // Narrowed by #turn: with a schema it always returns the structured shape.
-    return response as StructuredAgentResponse;
+    // A run that ended with a document carries it (#loop, checked against the
+    // schema). One that stopped before any document (parked on approval, or
+    // stopped by a budget) returns the same shape with `structured: null`,
+    // its pending approvals beside it: never a missing field.
+    if (Object.hasOwn(response, 'structured')) return response as StructuredAgentResponse;
+    const shaped: StructuredAgentResponse = { ...response, structured: null };
+    const stop = STOPS.get(response);
+    if (stop !== undefined) STOPS.set(shaped, stop);
+
+    return shaped;
   }
 
   async #turn(

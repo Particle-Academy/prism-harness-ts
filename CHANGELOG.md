@@ -24,6 +24,14 @@
   failed store read at the end of a completed delegation no longer leaves the
   child's count over-charged. A completed start is never undone by its
   cleanup.
+- `sendStructured()` on a turn that stops before any document (it parks on an
+  approval, or a budget stops it) returns the structured response with
+  `structured: null` and its pending approvals; the field was missing.
+- With the G-392 property tests (now in the suite, with a nightly long run):
+  every gated call in a step gets exactly one recorded outcome, a result
+  belongs to the call at its position, and a request pairs only with a call
+  that has no result of its own, so an ungated call never takes an approval
+  or a repeated-id denial.
 - A runner start that fails after its records are written but before its run
   begins (a plan watch for a streamed turn) now ends its own view and is
   undone, as every later failure is.
