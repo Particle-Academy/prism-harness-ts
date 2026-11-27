@@ -645,7 +645,7 @@ describe("item 5: a host tool provider may read the child's session state while 
     }, 'host', 'host_probe');
 
     await expect(r.runtime.effectiveTools(r.child())).resolves.toBeDefined();
-    expect(read).toEqual(['run_child', null]);
+    expect(read).toEqual([null, null]);
   });
 });
 
@@ -785,14 +785,19 @@ describe('item 8: a call a runner start ended reads as ended, never approved', (
     expect(step.state).toBe('held');
     const echo = step.approvalIds[0] as string;
     await recordApproval(r.child(), echo, true);
-    // The binding is lost: nobody can act on it; a re-delegation ends the call.
-    await setChildRecord(r, ({ child_binding: _gone, ...rest }) => rest);
+    // Nobody can act on it any more (its run would be nested too deep): a
+    // re-delegation ends the call, and the decision on it was never acted on.
+    await setChildRecord(r, (stored) => ({ ...stored, child_depth: 1_000 }));
+    await expect(r.runtime.send(r.child(), '')).rejects.toMatchObject({ code: 'run_not_permitted' });
     r.queue.length = 0;
     r.text('Child done.');
-    expect((await r.run(ROOT(), 'New task')).outcome).toBe('completed');
+    const redo = await r.run(ROOT(), 'New task');
+    expect(redo.text).toBe('Child done.');
+    expect(redo.outcome).toBe('completed');
     expect(r.ran.echo).toBeUndefined();
 
     const after = (await plan()).steps[0];
     expect(after.approvedIds).not.toContain(echo);
+    expect(after.supersededApprovalIds).toContain(echo);
   });
 });
