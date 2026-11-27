@@ -2,7 +2,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { validateAgent } from './address.js';
 import type { JsonObject, JsonValue } from './json.js';
-import { recordingInRun } from './thread.js';
+import { recordingInRun, withThreadSnapshots } from './thread.js';
 import type { Thread, ThreadMessage } from './thread.js';
 import {
   assistantRow,
@@ -832,10 +832,23 @@ export class AgentRuntime {
    * reader stopped early (the turn still runs to its end, then releases).
    */
   async #holdingTurnLock<T>(session: Session, turn: (live: Session) => Promise<T>): Promise<T> {
+    return await this.#holding(session, turn);
+  }
+
+  /**
+   * `callback` under the session lock with this session's agent's
+   * `lock_ttl` / `lock_wait`, noting (heldLocks) that this turn holds it and
+   * with which settings: a decision a tool records on its own session while
+   * the lock is held waits the CONFIGURED lock_wait, never a fixed one
+   * (round 16, item 6).
+   */
+  async #holding<T>(session: Session, callback: (live: Session) => Promise<T>): Promise<T> {
+    const ttl = this.#setting(session, 'lock_ttl') ?? RESOLUTION_LOCK_SECONDS;
+    const wait = this.#setting(session, 'lock_wait') ?? RESOLUTION_WAIT_SECONDS;
     return await session.lock(
-      turn,
-      this.#setting(session, 'lock_ttl') ?? RESOLUTION_LOCK_SECONDS,
-      this.#setting(session, 'lock_wait') ?? RESOLUTION_WAIT_SECONDS,
+      (live) => heldLocks.run([...(heldLocks.getStore() ?? []), { key: session.key(), ttl, wait }], () => callback(live)),
+      ttl,
+      wait,
     );
   }
 
@@ -933,7 +946,9 @@ export class AgentRuntime {
   ): Promise<AgentResponse> {
     // Every turn has a scope of its own (round 11): a runner start's view of
     // its own records reaches no other turn, nested or not.
-    return inOwnTurnScope(() => this.#turnIn(session, prompt, toolNames, context, additionalContent, schema, stepping));
+    // One read of the thread serves every reader before the turn's first
+    // write (BRIEF-R16 item 7, withThreadSnapshots).
+    return inOwnTurnScope(() => withThreadSnapshots(() => this.#turnIn(session, prompt, toolNames, context, additionalContent, schema, stepping)));
   }
 
   async #turnIn(
@@ -1229,7 +1244,21 @@ export class AgentRuntime {
         // A thread an older harness wrote may hold an earlier step it left
         // superseded and unanswered: answered once, first (0.11.x shape).
         if (started === null) await this.#answerReplacedSteps(session, mode, runId, stepping?.locked === true);
-        if (started === null && prompt === '' && !turn.ledger.cancelled && !outOfTime) offered = await this.#resolveApprovals(session, mode, offered, runId, called, scope?.legacy === true, steps, stepping?.locked === true);
+        const resolvedStep: { position: number | null } = { position: null };
+        if (started === null && prompt === '' && !turn.ledger.cancelled && !outOfTime) offered = await this.#resolveApprovals(session, mode, offered, runId, called, scope?.legacy === true, steps, stepping?.locked === true, resolvedStep);
+        // A NESTED PARK (round 16, item 3): a tool this resume ran sent on its
+        // own session and that turn parked a NEWER step for a person. This
+        // resume is no longer the newest run: it stops here, with no model
+        // step, so it neither sends a request whose last step has unanswered
+        // calls nor replaces the step just reported as awaiting approval.
+        if (resolvedStep.position !== null) {
+          const nested = await this.#nestedPark(session, resolvedStep.position);
+          if (nested !== null) {
+            taskRecorded = true;
+            const finished = await this.#finish(session, runId, called, 'awaiting_approval', '', turn, null);
+            return { ...finished, pendingApprovals: nested };
+          }
+        }
 
         if (prompt !== '') {
           // With attachments, the shape prism-ts's UserMessage.toObject() writes:
@@ -1520,6 +1549,17 @@ export class AgentRuntime {
 
       for (const call of gated) this.#toolDecision('tool_approval_asked', session, runId, call, offered.find((tool) => tool.name === call.name), 'person');
 
+      // WRITE-AHEAD for the UNGATED batch too (round 16, item 3): each call
+      // that may run now gets its started row, in one write under the
+      // private in-run token, before any of them runs. A results write that
+      // then fails leaves each reading interrupted ("it may have run"):
+      // never "not run", never run again, and a superseding write answers it
+      // as in progress.
+      const ungated = toolCalls.filter((candidate) => !gated.includes(candidate) && !unusable.has(candidate));
+      if (ungated.length > 0 && recordedStep !== undefined) {
+        await recordingInRun(runId, () => thread.record(ungated.map((call) => startedRow(call, null, recordedStep.position)), runId));
+      }
+
       for (const call of toolCalls.filter((candidate) => !gated.includes(candidate))) {
         if (unusable.has(call)) {
           const entry = toolResultEntry(call, `Not run: the arguments for ${call.name} are not a JSON object.`);
@@ -1636,6 +1676,7 @@ export class AgentRuntime {
     legacyDiagnosticEmitted: boolean,
     steps?: RunStepTagger,
     alreadyLocked = false,
+    resolvedStep: { position: number | null } = { position: null },
   ): Promise<HarnessTool[]> {
     // A read without the lock first: nearly every send() has nothing to resolve
     // and should not wait on the session lock to find that out.
@@ -1668,6 +1709,7 @@ export class AgentRuntime {
       // interrupted and never runs again. No claim, no ttl.
       const thread = live.thread();
       const resolved: { entry: ToolResultEntry; at: number; started: boolean }[] = [];
+      resolvedStep.position = work.position;
 
       for (const [index, call] of work.calls.entries()) {
         const input = { id: call.id, name: call.name, arguments: call.arguments, resultId: call.result_id };
@@ -1710,7 +1752,17 @@ export class AgentRuntime {
           // The started row, written only while the call is still open on its
           // step: a call a superseding write already answered (it was denied
           // as replaced while an earlier call ran) never runs.
-          if (!(await this.#start(thread, runId, work.position, at, input, approvalId))) continue;
+          const start = await this.#start(thread, runId, work.position, at, input, approvalId);
+          if (start === 'answered') continue;
+          if (start !== true) {
+            // Revoked before it started (a denial recorded since the read):
+            // not run, and that denial is its one outcome.
+            this.#toolDecision('tool_denied', live, runId, input, declared, 'person');
+            const entry = toolResultEntry(input, start.reason ?? 'User denied tool execution');
+            steps?.toolResult(call.id, entry.result, { ok: false, code: 'approval_denied', refused: true });
+            resolved.push({ entry, at, started: false });
+            continue;
+          }
           this.#toolDecision('tool_approved', live, runId, input, declared, 'person');
           called.push(call.name);
           const invoked = await this.#runApproved(bounded, input);
@@ -1740,10 +1792,13 @@ export class AgentRuntime {
           // key with one of them (an identical duplicate call) is counted
           // beyond it, occurrence by occurrence, as the fold counts.
           const own = newResults(rows, stepIndex, [...work.results, ...resolved.filter(({ at, started }) => started || !answered[at]).map(({ entry }) => entry)]);
+          // The decisions as they STAND now (round 16), never a copy read
+          // before a revocation landed.
+          const decisions = turnDecisions(rows);
           // A row left with no results and no decisions is not written.
-          if (own.length === 0 && work.decisions.size === 0) return [];
+          if (own.length === 0 && decisions.size === 0) return [];
 
-          const row = toolResultRow(own, [...work.decisions.values()]);
+          const row = toolResultRow(own, [...decisions.values()]);
           // A row that carries results names the step it answers.
           return [own.length === 0 ? row : answeringStep(row, work.position)];
         },
@@ -1753,11 +1808,28 @@ export class AgentRuntime {
 
     if (alreadyLocked) return await resolve(session);
 
-    return await session.lock(
-      resolve,
-      this.#setting(session, 'lock_ttl') ?? RESOLUTION_LOCK_SECONDS,
-      this.#setting(session, 'lock_wait') ?? RESOLUTION_WAIT_SECONDS,
-    );
+    return await this.#holding(session, resolve);
+  }
+
+  /**
+   * The approvals a NEWER step than the one at `position` is parked on (a
+   * nested turn's, recorded while this resume resolved), or null when the
+   * thread is not parked on one.
+   */
+  async #nestedPark(session: Session, position: number): Promise<AgentResponse['pendingApprovals'] | null> {
+    const rows = await session.thread().readerRows();
+    const paused = pausedStepIndex(rows);
+    if (paused === null || paused + 1 <= position || !isToolStep(rows[paused])) return null;
+    const pending = pendingApprovalIds(rows);
+    if (pending.length === 0) return null;
+    // Each approval's own call, paired by position (G-392).
+    const calls = stepCalls(rows[paused]);
+    const answered = stepResultsByPosition(rows, paused);
+    const paired = pairStepApprovals(calls, ownRequests(rows, paused), (_call, at) => !answered[at]).approvalIds;
+    return pending.map((id) => {
+      const call = calls[paired.indexOf(id)];
+      return { id, toolCallId: typeof call?.id === 'string' ? call.id : '', tool: typeof call?.name === 'string' ? call.name : '', arguments: usableArguments(call?.arguments) ?? {} };
+    });
   }
 
   /**
@@ -1766,14 +1838,25 @@ export class AgentRuntime {
    * the thread lock with the write. False, with nothing written, when a
    * superseding write answered it since it was read: then it must not run.
    */
-  async #start(thread: Thread, runId: string, position: number, at: number, call: LlmToolCall, approvalId: string): Promise<boolean> {
+  async #start(thread: Thread, runId: string, position: number, at: number, call: LlmToolCall, approvalId: string): Promise<true | 'answered' | ApprovalDecisionEntry> {
+    let revoked: ApprovalDecisionEntry | null = null;
     try {
       await recordingInRun(runId, () => thread.record([startedRow(call, approvalId, position)], runId, {
-        guard: (rows) => { if (answeredCalls(rows, position - 1)[at] !== false) throw NOT_OPEN; },
+        guard: (rows) => {
+          if (answeredCalls(rows, position - 1)[at] !== false) throw NOT_OPEN;
+          // The approval must still STAND (round 16, TS run19 F1): a denial
+          // recorded by any channel before this row revoked it, and then the
+          // call does not run; that denial is its one outcome.
+          const standing = turnDecisions(rows).get(approvalId);
+          if (standing?.approved !== true) {
+            revoked = standing ?? { approval_id: approvalId, approved: false, reason: null };
+            throw NOT_OPEN;
+          }
+        },
       }));
       return true;
     } catch (error) {
-      if (error === NOT_OPEN) return false;
+      if (error === NOT_OPEN) return revoked ?? 'answered';
       throw error;
     }
   }
@@ -1799,7 +1882,7 @@ export class AgentRuntime {
       if (rows.length > 0) await recordingInRun(runId, () => live.thread().record(rows, runId));
     };
     if (alreadyLocked) return await answer(session);
-    await session.lock(answer, this.#setting(session, 'lock_ttl') ?? RESOLUTION_LOCK_SECONDS, this.#setting(session, 'lock_wait') ?? RESOLUTION_WAIT_SECONDS);
+    await this.#holding(session, answer);
   }
 
   /**
@@ -2106,11 +2189,19 @@ export async function recordDecisions(session: Session, decisions: readonly Appr
 async function writeDecisionsLocked(
   session: Session,
   decisions: readonly ApprovalDecision[],
-  ttlSeconds: number = RESOLUTION_LOCK_SECONDS,
-  waitSeconds: number = RESOLUTION_WAIT_SECONDS,
+  ttlSeconds?: number,
+  waitSeconds?: number,
 ): Promise<void> {
-  await session.lock(async (live) => { await writeDecisions(live, decisions); }, ttlSeconds, waitSeconds);
+  // Inside a turn that holds THIS session's lock (a tool deciding on its own
+  // session while its turn resolves): the agent's configured settings, never
+  // the fixed defaults (round 16, item 6). The refusal names no session.
+  const held = (heldLocks.getStore() ?? []).find((lock) => lock.key === session.key());
+  await session.lock(async (live) => { await writeDecisions(live, decisions); },
+    ttlSeconds ?? held?.ttl ?? RESOLUTION_LOCK_SECONDS, waitSeconds ?? held?.wait ?? RESOLUTION_WAIT_SECONDS);
 }
+
+/** The session locks the current turn holds, with the settings it took each with (#holding). */
+const heldLocks = new AsyncLocalStorage<readonly { key: string; ttl: number; wait: number }[]>();
 
 /**
  * Where decisions are made durable, for every path that takes them.

@@ -241,7 +241,9 @@ describe('what the next step is sent back (G-58)', () => {
 
     await runtime(client).send(session, 'go');
 
-    const rows = (await session.thread().messages()).map((m) => m.message);
+    // Round 16: each ungated call's write-ahead started row precedes its
+    // batch; it holds no result and is never replayed.
+    const rows = (await session.thread().messages()).map((m) => m.message).filter((row) => row.harness_started === undefined);
 
     expect(rows.map((row) => row.type)).toEqual(['user', 'assistant', 'tool_result', 'assistant']);
     expect((rows[2]?.tool_results as { result: string }[]).map((entry) => entry.result)).toEqual(['echoed:a', 'echoed:b']);
@@ -361,7 +363,8 @@ describe('approvals', () => {
 
     expect(counts).toEqual({ shout: 1 });
     expect(response.pendingApprovals.map((pending) => pending.toolCallId)).toEqual(['c1']);
-    expect((await session.thread().messages()).map((m) => m.message.type)).toEqual(['user', 'assistant', 'tool_result']);
+    // Round 16: the ungated call's write-ahead started row precedes its result.
+    expect((await session.thread().messages()).map((m) => m.message).filter((row) => row.harness_started === undefined).map((row) => row.type)).toEqual(['user', 'assistant', 'tool_result']);
   });
 
   it('runs an approved call ONCE on the resumed turn, without asking the model again', async () => {
@@ -544,7 +547,8 @@ describe('tools', () => {
     const response = await runtime(client, { tools }).send(session, 'go');
 
     expect(response.text).toBe('Recovered.');
-    const result = (await session.thread().messages()).find((m) => m.message.type === 'tool_result');
+    // The results row (round 16: after the call's write-ahead started row).
+    const result = (await session.thread().messages()).find((m) => m.message.type === 'tool_result' && m.message.harness_started === undefined);
     expect(String((result?.message.tool_results as { result: string }[])[0]?.result)).toContain('exploded');
   });
 

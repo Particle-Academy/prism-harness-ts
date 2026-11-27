@@ -164,10 +164,13 @@ export class HarnessError extends Error {
     this.problems = options.problems ?? [];
   }
 
-  static sessionLocked(key: string, waitSeconds: number): HarnessError {
+  static sessionLocked(_key: string, waitSeconds: number): HarnessError {
+    // The text names NO session, thread key, participant or session name
+    // (round 16, item 6): a tool can put an error's text in front of the
+    // model. The caller knows which session it asked for.
     return new HarnessError(
       'session_locked',
-      `Could not acquire the lock on session [${key}] within ${waitSeconds}s. ` +
+      `Could not acquire the session lock within ${waitSeconds}s. ` +
         'Another worker is holding it; the callback was NOT run.',
     );
   }

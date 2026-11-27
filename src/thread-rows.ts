@@ -271,22 +271,17 @@ export function replayView(rows: readonly JsonObject[]): JsonObject[] {
 /**
  * The stored rows as the replay places them (round 15, the reference's
  * Thread::placedRows): in the order replayOrder() gives; every decision
- * entry rewritten to the decision that STANDS for its approval (a denial if
- * any was recorded, else the first approval: prevails()); and a step's
+ * entry rewritten to the decision that STANDS for its approval
+ * (standingDecisions(): the one that stood when its call was resolved,
+ * never one recorded after its call had an outcome, which is left out,
+ * round 16); and a step's
  * request that repeats an approval id an EARLIER step asked for dropped (it
  * asks for nothing, G-408 / #92).
  *
  * @internal
  */
 export function placedRows(rows: readonly JsonObject[]): JsonObject[] {
-  const standing = new Map<string, ApprovalDecisionEntry>();
-  for (const row of rows) {
-    const answers = row.type === 'tool_result' ? list(row.tool_approval_responses) : row.type === 'tool_approval_response' ? [row] : [];
-    for (const answer of answers) {
-      const entry = decision(answer);
-      if (prevails(standing.get(entry.approval_id), entry.approved)) standing.set(entry.approval_id, entry);
-    }
-  }
+  const standing = standingDecisions(rows);
   const asked = new Set<string>();
   return replayOrder(rows).map((row) => {
     if (isToolStep(row) && Array.isArray(row.tool_approval_requests)) {
@@ -295,7 +290,9 @@ export function placedRows(rows: readonly JsonObject[]): JsonObject[] {
       return own.length === row.tool_approval_requests.length ? row : { ...row, tool_approval_requests: own };
     }
     if (row.type === 'tool_result' && Array.isArray(row.tool_approval_responses)) {
-      const answers = row.tool_approval_responses.map((answer) => (isObject(answer) ? standing.get(text(answer.approval_id)) ?? answer : answer));
+      // A decision that never stood (recorded once its call had an outcome)
+      // is never shown (round 16, item 10).
+      const answers = row.tool_approval_responses.flatMap((answer): JsonValue[] => (!isObject(answer) ? [answer] : standing.has(text(answer.approval_id)) ? [standing.get(text(answer.approval_id))!] : []));
       return { ...row, tool_approval_responses: answers as JsonValue[] };
     }
     if (row.type === 'tool_approval_response') {
@@ -323,18 +320,22 @@ function replayOrder(rows: readonly JsonObject[]): readonly JsonObject[] {
   // What each step's replay is given (round 15): its started calls with no
   // result read INTERRUPTED; a step that is NOT the paused one, a requested
   // call of which has no outcome (a thread an older version wrote, item 9),
-  // reads REPLACED. One row per step, in call order.
+  // reads REPLACED; and ANY other call of such a step with no stored result
+  // reads INTERRUPTED (round 16, item 3: an ungated call whose result never
+  // landed), so a provider request answers every call. One row per step, in
+  // call order.
   const synthesised = new Map<number, JsonObject>();
   for (const [index, row] of rows.entries()) {
     if (!isToolStep(row)) continue;
     const requests = ownRequests(rows, index);
-    if (requests.length === 0 && !anyMarked) continue;
-    const calls = stepCalls(row);
     const answers = stepAnswers(rows, index);
+    if (index === paused && !answers.includes('started')) continue;
+    if (index !== paused && !answers.includes(null) && !answers.includes('started')) continue;
+    const calls = stepCalls(row);
     const requested = pairStepApprovals(calls, requests, (_call, position) => answers[position] === null).approvalIds;
     const entries = answers.flatMap((answer, position) => {
       const result = answer === 'started' ? INTERRUPTED_RESULT
-        : answer === null && index !== paused && requested[position] !== undefined ? SUPERSEDED_RESULT : null;
+        : answer === null && index !== paused ? (requested[position] !== undefined ? SUPERSEDED_RESULT : INTERRUPTED_RESULT) : null;
       if (result === null) return [];
       const call = calls[position]!;
       return [{
@@ -495,9 +496,7 @@ export function stepRequests(row: JsonObject | undefined): JsonObject[] {
  */
 export function askedBefore(rows: readonly JsonObject[], index: number): Set<string> {
   const asked = new Set<string>();
-  for (let at = 0; at < index && at < rows.length; at += 1) {
-    for (const request of stepRequests(rows[at])) if (typeof request.approval_id === 'string') asked.add(request.approval_id);
-  }
+  for (const [id, step] of rowIndex(rows).firstAsker) if (step < index) asked.add(id);
   return asked;
 }
 
@@ -511,8 +510,8 @@ export function askedBefore(rows: readonly JsonObject[], index: number): Set<str
 export function ownRequests(rows: readonly JsonObject[], index: number): JsonObject[] {
   const requests = stepRequests(rows[index]);
   if (requests.length === 0) return requests;
-  const asked = askedBefore(rows, index);
-  return asked.size === 0 ? requests : requests.filter((request) => typeof request.approval_id !== 'string' || !asked.has(request.approval_id));
+  const first = rowIndex(rows).firstAsker;
+  return requests.filter((request) => typeof request.approval_id !== 'string' || (first.get(request.approval_id) ?? index) >= index);
 }
 
 /**
@@ -549,8 +548,14 @@ export const STARTED_KEY = 'harness_started';
 /** The outcome of a started call that never got a result (no final period; the reference's text). @internal */
 export const INTERRUPTED_RESULT = 'Tool call was interrupted, it may have run';
 
-/** The started row for `call` of the step at `position`, run under `approvalId` (STARTED_KEY). @internal */
-export function startedRow(call: { id: string; name: string }, approvalId: string, position: number): JsonObject {
+/**
+ * The started row for `call` of the step at `position`, run under
+ * `approvalId` (STARTED_KEY); null for a call that needs nobody's approval
+ * (round 16: an UNGATED call gets its started row too, before its batch
+ * runs, so a result that never lands reads interrupted, never "not run").
+ * @internal
+ */
+export function startedRow(call: { id: string; name: string }, approvalId: string | null, position: number): JsonObject {
   return {
     type: 'tool_result',
     tool_results: [],
@@ -583,8 +588,12 @@ export function isStartedRow(row: JsonObject): boolean {
  * @internal
  */
 export function markedOwner(rows: readonly JsonObject[], index: number): number | undefined {
-  const row = rows[index];
-  if (row === undefined || row.type !== 'tool_result' || row.harness !== true) return undefined;
+  return rowIndex(rows).owners[index];
+}
+
+/** markedOwner(), computed (rowIndex() keeps it). */
+function ownerOf(rows: readonly JsonObject[], row: JsonObject, index: number): number | undefined {
+  if (row.type !== 'tool_result' || row.harness !== true) return undefined;
   const mark = row[ANSWERS_STEP_KEY];
   if (!isObject(mark) || typeof mark.position !== 'number' || !Number.isSafeInteger(mark.position)) return undefined;
   const step = mark.position - 1;
@@ -604,36 +613,42 @@ export function markedOwner(rows: readonly JsonObject[], index: number): number 
  * mark names (markedOwner); any other row is the segment's that holds it:
  * the rows after the step up to the next assistant row (G-399). A row owned
  * by another step counts for nothing where it sits. Results pair BY
- * POSITION (round 13), never by tool call id: each result with the first
- * call without one that has its id, its tool name and its arguments; then
- * its id and name; then its id.
+ * POSITION (round 13), never by tool call id: each result with the FIRST
+ * call without an outcome that has its id, its tool name and its arguments;
+ * then its id and name; then its id (a started call last: it is still open
+ * to its own result).
  *
  * @internal
  */
-export function stepAnswers(rows: readonly JsonObject[], index: number): ('result' | 'started' | null)[] {
-  const calls = stepCalls(rows[index]);
-  const has: ('result' | 'started' | null)[] = calls.map(() => null);
-  if (calls.length === 0) return has;
-  const args = calls.map((call) => JSON.stringify(usableArguments(call.arguments) ?? {}));
-  // A result an EARLIER row of the step already holds (a copy: the same id,
-  // tool, arguments and result) answers nothing new (TS I-1, as 0.11.x reads
-  // it): the resolution row carries the step's earlier results, and a copy
-  // must never claim another open call that shares its id.
-  const prints = new Set<string>();
-  let inSegment = true;
-  for (let at = index + 1; at < rows.length; at += 1) {
-    const row = rows[at]!;
-    if (row.type === 'assistant') inSegment = false;
-    // A 0.11.x replaced-step answer is an EARLIER step's (it names that
-    // step's position): never this step's results.
-    if (row.type !== 'tool_result' || isReplacedStepRow(row)) continue;
-    const owner = markedOwner(rows, at);
-    if (owner === undefined ? !inSegment : owner !== index) continue;
-    if (owner !== undefined && isStartedRow(row)) {
+export function stepAnswers(rows: readonly JsonObject[], index: number): Answer[] {
+  const known = rowIndex(rows).steps.get(index);
+  return known === undefined ? stepCalls(rows[index]).map(() => null) : [...known.has];
+}
+
+type Answer = 'result' | 'started' | null;
+
+/** One tool-call step's answers as the index's pass reads them, row by row (stepAnswers' rule). */
+class StepAnswers {
+  readonly calls: JsonObject[];
+  readonly has: Answer[];
+  readonly #args: string[];
+  /** A result an EARLIER row of the step already holds (a copy: the same id, tool, arguments and result) answers nothing new (TS I-1). */
+  readonly #prints = new Set<string>();
+
+  constructor(row: JsonObject) {
+    this.calls = stepCalls(row);
+    this.has = this.calls.map(() => null);
+    this.#args = this.calls.map((call) => JSON.stringify(usableArguments(call.arguments) ?? {}));
+  }
+
+  /** Apply one row the step owns; `honoured`: its mark named this step. */
+  feed(row: JsonObject, honoured: boolean): void {
+    const { calls, has } = this;
+    if (honoured && isStartedRow(row)) {
       const started = row[STARTED_KEY] as JsonObject;
       const call = calls.findIndex((candidate, position) => has[position] === null && text(candidate.id) === text(started.tool_call_id) && text(candidate.name) === text(started.tool_name));
       if (call !== -1) has[call] = 'started';
-      continue;
+      return;
     }
     const entries = Array.isArray(row.tool_results) ? list(row.tool_results)
       : Object.hasOwn(row, 'tool_call_id') ? [{ tool_call_id: row.tool_call_id ?? null, tool_name: row.name ?? null }] : [];
@@ -641,7 +656,7 @@ export function stepAnswers(rows: readonly JsonObject[], index: number): ('resul
     for (const entry of entries) {
       const id = text(entry.tool_call_id);
       const print = sortedJson([id, text(entry.tool_name), isObject(entry.args) ? entry.args : {}, text(entry.result)]);
-      if (prints.has(print)) continue;
+      if (this.#prints.has(print)) continue;
       added.push(print);
       // A started call is still open to ITS result (the real one, wherever it lands).
       const open = (position: number): boolean => has[position] !== 'result' && text(calls[position]!.id) === id;
@@ -649,15 +664,115 @@ export function stepAnswers(rows: readonly JsonObject[], index: number): ('resul
         const unstarted = calls.findIndex((call, position) => has[position] === null && open(position) && test(call, position));
         return unstarted !== -1 ? unstarted : calls.findIndex((call, position) => open(position) && test(call, position));
       };
-      let found = first((call, position) => call.name === entry.tool_name && args[position] === JSON.stringify(isObject(entry.args) ? entry.args : {}));
+      let found = first((call, position) => call.name === entry.tool_name && this.#args[position] === JSON.stringify(isObject(entry.args) ? entry.args : {}));
       if (found === -1) found = first((call) => call.name === entry.tool_name);
       if (found === -1) found = first(() => true);
       if (found !== -1) has[found] = 'result';
     }
-    for (const print of added) prints.add(print);
+    for (const print of added) this.#prints.add(print);
+  }
+}
+
+/**
+ * Everything the readers need from one stored thread, read in ONE pass
+ * (BRIEF-R16 item 7): no reader walks the thread once per step, per
+ * approval or per row. Kept per rows array (rowIndex), so every reader of
+ * one read of the thread shares it.
+ */
+interface RowIndex {
+  /** markedOwner() of each row. */
+  owners: (number | undefined)[];
+  /** The tool-call step that FIRST asked for each approval id (G-408): askedBefore()'s rule. */
+  firstAsker: Map<string, number>;
+  /** Each tool-call step's answers (stepAnswers()). */
+  steps: Map<number, StepAnswers>;
+  /** The approvals each harness mark names within its own request's turn (markedApprovals()). */
+  marked: Map<string, Set<string>>;
+  /**
+   * The decision that STANDS for each approval (round 16, BRIEF-R16 items 1
+   * and 10) and the row it was recorded in: the first decision recorded
+   * while its call had NO outcome (no started row, no result), except that
+   * a later denial recorded while it still had none revokes an approval
+   * (prevails(), G-401). A decision recorded once its call has an outcome is
+   * never the answer, whoever wrote it.
+   */
+  standing: Map<string, { entry: ApprovalDecisionEntry; at: number }>;
+}
+
+const INDEXES = new WeakMap<readonly JsonObject[], { length: number; index: RowIndex }>();
+
+/** The one-pass index of `rows` (RowIndex), built once per rows array. */
+function rowIndex(rows: readonly JsonObject[]): RowIndex {
+  const known = INDEXES.get(rows);
+  if (known !== undefined && known.length === rows.length) return known.index;
+  const index = buildIndex(rows);
+  INDEXES.set(rows, { length: rows.length, index });
+  return index;
+}
+
+function buildIndex(rows: readonly JsonObject[]): RowIndex {
+  const owners: (number | undefined)[] = [];
+  const firstAsker = new Map<string, number>();
+  // The requests markedApprovals() reads: the first assistant row asking with a call id.
+  const markAsker = new Map<string, number>();
+  const steps = new Map<number, StepAnswers>();
+  const marked = new Map<string, Set<string>>([[ENDED_BY_START_KEY, new Set()], [SUPERSEDED_KEY, new Set()]]);
+  const standing = new Map<string, { entry: ApprovalDecisionEntry; at: number }>();
+  // Each step's own requests (firstAsker's), to pair a decision with its call.
+  const ownOf = new Map<number, JsonObject[]>();
+  let segment: number | null = null;
+  let lastAssistant = -1;
+
+  const decide = (answer: JsonObject, at: number): void => {
+    const entry = decision(answer);
+    const step = firstAsker.get(entry.approval_id);
+    if (step !== undefined) {
+      // Counted only while its call (paired by position with the step's
+      // calls that have no outcome yet) has none.
+      const state = steps.get(step)!;
+      const paired = pairStepApprovals(state.calls, ownOf.get(step) ?? [], (_call, position) => state.has[position] === null).approvalIds;
+      const position = paired.indexOf(entry.approval_id);
+      if (position === -1 || state.has[position] !== null) return;
+    }
+    if (prevails(standing.get(entry.approval_id)?.entry, entry.approved)) standing.set(entry.approval_id, { entry, at });
+  };
+
+  for (const [at, row] of rows.entries()) {
+    const owner = ownerOf(rows, row, at);
+    owners.push(owner);
+    if (row.type === 'assistant') {
+      lastAssistant = at;
+      if (!isToolStep(row)) { segment = null; continue; }
+      segment = at;
+      steps.set(at, new StepAnswers(row));
+      const own: JsonObject[] = [];
+      for (const request of stepRequests(row)) {
+        const id = request.approval_id;
+        if (typeof id !== 'string') { own.push(request); continue; }
+        if (!firstAsker.has(id)) firstAsker.set(id, at);
+        if (firstAsker.get(id) === at) own.push(request);
+        if (typeof request.tool_call_id === 'string' && !markAsker.has(id)) markAsker.set(id, at);
+      }
+      ownOf.set(at, own);
+      continue;
+    }
+    if (row.type === 'tool_approval_response') { decide(row, at); continue; }
+    if (row.type !== 'tool_result') continue;
+    // The row's decisions first, against what the calls had BEFORE it.
+    for (const answer of list(row.tool_approval_responses)) decide(answer, at);
+    for (const [key, set] of marked) {
+      const mark = row[key];
+      if (!isObject(mark) || !Array.isArray(mark.approval_ids)) continue;
+      for (const id of mark.approval_ids) if (typeof id === 'string' && markAsker.get(id) === lastAssistant) set.add(id);
+    }
+    // A 0.11.x replaced-step answer is an EARLIER step's (it names that
+    // step's position): never this step's results.
+    if (isReplacedStepRow(row)) continue;
+    const target = owner ?? segment;
+    if (target !== null) steps.get(target)?.feed(row, owner !== undefined);
   }
 
-  return has;
+  return { owners, firstAsker, steps, marked, standing };
 }
 
 /**
@@ -686,29 +801,33 @@ export function pausedStepIndex(rows: readonly JsonObject[]): number | null {
  * The decisions recorded for the turn being resumed (the paused step,
  * pausedStepIndex()), by approval id, read from the stored rows.
  *
- * An approval has ONE answer: the first one recorded, except that a later
- * DENIAL revokes an approval whose call has not started (prevails(), G-401).
- * Any other second decision for the same id (two reviewers, a retry racing
- * the original, a row written by hand) is never the one that counts, here or
- * in the plan's reading of the thread, so what runs and what the plan
- * records cannot disagree.
+ * An approval has ONE answer, the one that STANDS (standingDecisions()):
+ * the first one recorded while its call had no outcome, except that a later
+ * DENIAL, recorded while the call still had none (no started row, no
+ * result), revokes an approval (prevails(), G-401). Any other decision for
+ * the same id (two reviewers, a retry racing the original, a row written by
+ * hand, one recorded after the call started or ran) is never the one that
+ * counts, here, in the plan's reading of the thread or in the replay, so
+ * what ran and what the thread says was decided cannot disagree.
  */
 export function turnDecisions(rows: readonly JsonObject[]): Map<string, ApprovalDecisionEntry> {
   const decisions = new Map<string, ApprovalDecisionEntry>();
   // The paused step (G-397): no decision applies to any other.
   const step = pausedStepIndex(rows);
   if (step === null || !isToolStep(rows[step])) return decisions;
-
-  for (const row of rows.slice(step + 1)) {
-    const answers = row.type === 'tool_result' ? list(row.tool_approval_responses)
-      : row.type === 'tool_approval_response' ? [row] : [];
-    for (const answer of answers) {
-      const entry = decision(answer);
-      if (prevails(decisions.get(entry.approval_id), entry.approved)) decisions.set(entry.approval_id, entry);
-    }
-  }
+  for (const [id, { entry, at }] of rowIndex(rows).standing) if (at > step) decisions.set(id, entry);
 
   return decisions;
+}
+
+/**
+ * The decision that STANDS for every approval in the thread (round 16): see
+ * turnDecisions(). One pass, shared by every reader (rowIndex).
+ *
+ * @internal
+ */
+export function standingDecisions(rows: readonly JsonObject[]): Map<string, ApprovalDecisionEntry> {
+  return new Map([...rowIndex(rows).standing].map(([id, { entry }]) => [id, entry]));
 }
 
 /**
@@ -788,9 +907,13 @@ export function pendingApprovalIds(rows: readonly JsonObject[]): string[] {
       if (typeof response.approval_id === 'string') answered.add(response.approval_id);
     }
   }
+  // Nor is one whose call already has an OUTCOME (round 16, TS run19 F2): a
+  // result its step owns, or a started row. By the SAME pairing as
+  // unresolvedApprovalIds() and the replay, so the two never disagree.
+  const open = new Set(unresolvedApprovalIds(rows));
   const pending = ownRequests(rows, step)
     .map(request => request.approval_id)
-    .filter((id): id is string => typeof id === 'string' && id !== '' && !answered.has(id));
+    .filter((id): id is string => typeof id === 'string' && id !== '' && !answered.has(id) && open.has(id));
 
   return [...new Set(pending)];
 }
@@ -1005,15 +1128,17 @@ export function unansweredReplacedSteps(rows: readonly PositionedRow[], gated: (
   for (const [index, step] of messages.entries()) {
     if (index === paused || !isToolStep(step)) continue;
     if (answeredAt.has(rows[index]!.position)) continue;
+    // ONE TRUST SIGNAL (round 16): only rows the runtime wrote make a run an
+    // owner (a reader row the harness wrote carries `harness: true`).
     const owners = new Set<string>();
-    if (rows[index]!.runId !== null) owners.add(rows[index]!.runId!);
+    if (rows[index]!.runId !== null && step.harness === true) owners.add(rows[index]!.runId!);
     let end = -1;
     for (let at = index + 1; at < rows.length; at += 1) {
       const { message, runId } = rows[at]!;
       if (isToolStep(message)) { end = at; break; }
       // A result row a harness mark gives to another step is not this one's (round 15).
       const owner = markedOwner(messages, at);
-      if (message.type === 'tool_result' && runId !== null && list(message.tool_results).length > 0 && (owner === undefined || owner === index)) owners.add(runId);
+      if (message.type === 'tool_result' && message.harness === true && runId !== null && list(message.tool_results).length > 0 && (owner === undefined || owner === index)) owners.add(runId);
       if ((message.type === 'user' || message.type === 'assistant') && (runId === null || !owners.has(runId))) { end = at; break; }
     }
     if (end === -1) continue;
@@ -1076,28 +1201,9 @@ export function endedByStart(rows: readonly JsonObject[]): Set<string> {
 
 /** The approvals a harness mark under `key` names, each within its own request's turn (the endedByStart() rule). */
 function markedApprovals(rows: readonly JsonObject[], key: string): Set<string> {
-  const requests = new Map<string, number>();
-  for (const [index, row] of rows.entries()) {
-    if (row.type !== 'assistant') continue;
-    for (const request of stepRequests(row)) {
-      // The step that FIRST asked for an approval owns it (G-408).
-      if (typeof request.approval_id === 'string' && typeof request.tool_call_id === 'string' && !requests.has(request.approval_id)) requests.set(request.approval_id, index);
-    }
-  }
-  const ended = new Set<string>();
-  for (const [approval, index] of requests) {
-    for (const row of rows.slice(index + 1)) {
-      if (row.type === 'assistant') break;
-      if (row.type !== 'tool_result') continue;
-      const mark = row[key];
-      if (isObject(mark) && Array.isArray(mark.approval_ids) && mark.approval_ids.includes(approval)) {
-        ended.add(approval);
-        break;
-      }
-    }
-  }
-
-  return ended;
+  // The step that FIRST asked for an approval owns it (G-408); read in the
+  // index's one pass (rowIndex).
+  return new Set(rowIndex(rows).marked.get(key));
 }
 
 /**

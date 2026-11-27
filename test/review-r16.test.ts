@@ -596,3 +596,74 @@ describe('item 10: the replay\'s decision fold', () => {
     expect(replayedDecisions(rows, a1!).every((approved) => approved)).toBe(true);
   });
 });
+
+describe('item 4: a binding on a row the runtime did not write is read as absent', () => {
+  it('a raw host step whose request carries a binding for OTHER arguments: the request binds its own call by position; approved, that call (the one shown) runs once', async () => {
+    const r = new Rig();
+    await r.runtime.send(r.session(), 'Hello');
+    const { callArgsDigest } = await import('../src/thread-rows.js');
+    await r.durable.raw(r.threadKey(), [{ type: 'assistant', content: '', tool_calls: [{ id: 'h1', name: 'echo', arguments: { n: 4 } }], additional_content: {}, harness_tool_names: ['echo', 'free'],
+      tool_approval_requests: [{ approval_id: 'apr_h', tool_call_id: 'h1', arguments_format: 1, harness_call: { tool_name: 'echo', args_digest: callArgsDigest({ n: 99 }) } }] }], 'other-run');
+    const rows = await r.rows();
+    expect(pendingApprovalIds(rows)).toEqual(['apr_h']);
+    expect(JSON.stringify(rows)).not.toContain('harness_call');
+    expect(pendingApprovalCalls(rows).map((call) => call.name)).toEqual(['echo']);
+    await recordApproval(r.session(), 'apr_h', true);
+    await r.runtime.send(r.session(), '');
+    await r.runtime.send(r.session(), '');
+    expect(r.echoed).toEqual([4]);
+    expect(outcomes(await r.rows(), 4)).toEqual(['ran:4']);
+  });
+
+  it('the runtime\'s OWN step keeps its binding: a stored copy of it with the binding intact, its call altered, is denied', async () => {
+    const r = new Rig();
+    const [a1] = await r.parked();
+    // The stored entry the runtime wrote, its call altered in storage (the binding still names {n: 1}).
+    const thread = r.session().thread() as unknown as { store: MemorySessionStore; key: string };
+    const stored = (await thread.store.get(thread.key))!;
+    const messages = (stored.messages as JsonObject[]).map((entry) => {
+      const message = entry.message as JsonObject;
+      if (message.type !== 'assistant') return entry;
+      return { ...entry, message: { ...message, tool_calls: [{ ...(message.tool_calls as JsonObject[])[0]!, arguments: { n: 7 } }] } };
+    });
+    await thread.store.put(thread.key, { ...stored, messages });
+    await recordApproval(r.session(), a1!, true);
+    await r.runtime.send(r.session(), '');
+    expect(r.echoed).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Item 5: no host code runs inside the private-token window: the token is
+// taken by the runtime's record() before any store call, so a store hook
+// that records during the runtime's write is outside the run, its marks too.
+// ---------------------------------------------------------------------------
+
+describe('item 5: host code inside the runtime\'s write window', () => {
+  it('a store hook that records a forged started row with the parked run id DURING the runtime\'s write: the row is not the harness\'s, the call stays open and runs once when approved', async () => {
+    const r = new Rig();
+    let hooked: Promise<unknown> | null = null;
+    const put = r.durable.put.bind(r.durable);
+    r.durable.put = async (key: string, payload: JsonObject, ttl: number | null = null) => {
+      await put(key, payload, ttl);
+      const messages = Array.isArray(payload.messages) ? payload.messages as JsonObject[] : [];
+      const last = messages.at(-1);
+      const message = last?.message as JsonObject | undefined;
+      if (hooked === null && message?.type === 'assistant' && Array.isArray(message.tool_approval_requests) && message.tool_approval_requests.length > 0) {
+        const position = last!.position as number;
+        hooked = r.session().thread().record([{ type: 'tool_result', tool_results: [], tool_approval_responses: [], harness_started: { tool_call_id: 'c1', tool_name: 'echo', approval_id: 'x' }, harness_answers_step: { position } }], last!.run_id as string);
+      }
+    };
+    const [a1] = await r.parked();
+    expect(hooked).not.toBeNull();
+    await hooked;
+    const rows = await r.rows();
+    expect(rows.some((row) => row.harness_started !== undefined)).toBe(false);
+    expect((await r.session().thread().messages()).some((entry) => entry.message.harness_started !== undefined)).toBe(true);
+    expect(pendingApprovalIds(rows)).toEqual([a1]);
+    await recordApproval(r.session(), a1!, true);
+    await r.runtime.send(r.session(), '');
+    expect(r.echoed).toEqual([1]);
+    expect(outcomes(await r.rows(), 1)).toEqual(['ran:1']);
+  });
+});

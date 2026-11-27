@@ -359,10 +359,25 @@ result row the harness writes names the step it answers
 (`harness_answers_step: {position}`), and pairs to that step wherever it lands.
 A started call whose result never lands (the process died, the write failed)
 reads "Tool call was interrupted, it may have run": it is never run again, and
-running it again takes a new call and a new approval. The harness's marks are
-read only on rows the harness itself wrote; on a host row they are ignored. A
-denial recorded after an approval, before the call starts, revokes it; nothing
-overrides a denial. An assistant row is a tool-call step only when its
+running it again takes a new call and a new approval. The calls a step runs
+at once (those that need nobody) get their `started` rows too, before they
+run, so one whose result could not be stored reads interrupted as well, never
+"not run". The replay a provider is sent gives any call of an earlier step
+that has no stored result that interrupted result, so every request answers
+every call. If a tool's own `send()` on its session parks a newer step for a
+person while a resume runs it, that resume stops with no model step and
+reports the newer step's approvals: it never replaces a step that was just
+reported as awaiting approval. The harness's marks (started, answers-step,
+ended, superseded, replaced, the repeated-id mark and a request's binding)
+are read only on rows the runtime itself wrote; on any other row, whatever
+run id it carries, they are read as absent. A run id is never a trust
+signal. A decision counts only while its call has no outcome: a denial
+recorded after an approval, before the call starts, revokes it (and the
+resume re-checks that the approval still stands just before it starts the
+call); a decision recorded once the call has started or ran, by any channel,
+changes nothing, in the thread, the plan or the replay; nothing overrides a
+denial. An approval whose call already has an outcome is not pending, and a
+decision on it is refused `approval_not_pending`. An assistant row is a tool-call step only when its
 `tool_calls` is a list holding at least one object (its calls are those
 objects), and an approval belongs only to the step that first asked for it.
 Every stored approval request is bound to the call it was asked for
@@ -561,8 +576,11 @@ Recording a decision takes the session lock, which is not re-entrant: do not
 call these from inside your own `session.lock(...)` callback. `recordApproval()`
 and `recordDecisions()` wait up to 30 s for the lock; `runtime.decide(session,
 approvalId, approved, reason?)` records the same decision using the session's
-agent `lock_ttl` / `lock_wait`. A caller that cannot get the lock gets
-`session_locked`, and nothing is recorded.
+agent `lock_ttl` / `lock_wait`. A tool that records a decision on its OWN
+session while its turn holds that session's lock waits the agent's configured
+`lock_wait`, not 30 s. A caller that cannot get the lock gets
+`session_locked`, and nothing is recorded; the error's text names no session,
+thread key or participant.
 
 A decision must answer an approval the session is waiting on. `recordApproval()`,
 `recordDecisions()` and `streamDecision()` reject with a `HarnessError` coded

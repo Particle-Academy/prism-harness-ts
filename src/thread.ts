@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { JsonObject, JsonValue } from './json.js';
 import { isJsonObject } from './json.js';
-import { ANSWERS_STEP_KEY, ENDED_BY_START_KEY, NOT_RUN_KEY, REPLACED_STEP_KEY, STARTED_KEY, SUPERSEDED_KEY, markedOwner, pausedStepIndex, supersededRow, supersedes, withBoundRequests } from './thread-rows.js';
+import { ANSWERS_STEP_KEY, CALL_BINDING_KEY, ENDED_BY_START_KEY, NOT_RUN_KEY, REPLACED_STEP_KEY, STARTED_KEY, SUPERSEDED_KEY, markedOwner, pausedStepIndex, supersededRow, supersedes, withBoundRequests } from './thread-rows.js';
 import { HarnessError } from './errors.js';
 
 /**
@@ -67,18 +67,24 @@ export function readerRows(entries: readonly { message: JsonObject; harness?: bo
 function readerRow(message: JsonObject, harness: boolean): JsonObject {
   if (harness) return { ...message, harness: true };
   const marked = Object.hasOwn(message, 'harness') || ROW_MARKS.some((key) => Object.hasOwn(message, key))
-    || (Array.isArray(message.tool_results) && message.tool_results.some((entry) => isJsonObject(entry) && Object.hasOwn(entry, NOT_RUN_KEY)));
+    || (Array.isArray(message.tool_results) && message.tool_results.some((entry) => isJsonObject(entry) && Object.hasOwn(entry, NOT_RUN_KEY)))
+    || (Array.isArray(message.tool_approval_requests) && message.tool_approval_requests.some((entry) => isJsonObject(entry) && Object.hasOwn(entry, CALL_BINDING_KEY)));
   if (!marked) return message;
+  // Every mark is read as ABSENT (round 16, ONE TRUST SIGNAL), the request
+  // binding included: a request on a row the runtime did not write binds to
+  // its own step's call by position, the documented rule for a request with
+  // none (the binding Thread.record() wrote on it names that same call).
+  const without = (key: string) => (entry: JsonValue): JsonValue => {
+    if (!isJsonObject(entry) || !Object.hasOwn(entry, key)) return entry;
+    const { [key]: _mark, ...rest } = entry;
+    return rest;
+  };
   const row: JsonObject = {};
   for (const [key, value] of Object.entries(message)) {
     if (key === 'harness' || ROW_MARKS.includes(key)) continue;
-    row[key] = key === 'tool_results' && Array.isArray(value)
-      ? value.map((entry) => {
-        if (!isJsonObject(entry) || !Object.hasOwn(entry, NOT_RUN_KEY)) return entry;
-        const { [NOT_RUN_KEY]: _mark, ...rest } = entry;
-        return rest;
-      })
-      : value as JsonValue;
+    row[key] = key === 'tool_results' && Array.isArray(value) ? value.map(without(NOT_RUN_KEY))
+      : key === 'tool_approval_requests' && Array.isArray(value) ? value.map(without(CALL_BINDING_KEY))
+        : value as JsonValue;
   }
   return row;
 }
@@ -111,12 +117,25 @@ export class Thread {
   }
 
   async messages(): Promise<ThreadMessage[]> {
-    if (supportsAppendLog(this.store)) {
-      const log = await this.store.readLog(this.key);
-      if (log !== null) return log.map((entry) => this.#toMessage(entry));
-    }
+    return (await this.#read()).map((entry) => this.#toMessage(entry));
+  }
 
-    return (await this.#stored()).map((entry) => this.#toMessage(entry));
+  /**
+   * Every stored entry, read ONCE per turn's snapshot (BRIEF-R16 item 7):
+   * inside a turn (withThreadSnapshots), the readers before its first write
+   * share one read of the thread; any write through a Thread, and taking the
+   * session lock, ends it. Outside a turn, a fresh read every time. The
+   * thread's own locked reads (record()'s guard and build) never use it.
+   */
+  async #read(): Promise<JsonObject[]> {
+    const snapshot = snapshots.getStore();
+    const kept = snapshot?.get(this.key);
+    if (kept !== undefined && kept.store === this.store) return kept.entries;
+    let entries: JsonObject[] | null = null;
+    if (supportsAppendLog(this.store)) entries = await this.store.readLog(this.key);
+    entries ??= await this.#stored();
+    snapshot?.set(this.key, { store: this.store, entries });
+    return entries;
   }
 
   /** The whole-payload form: every store before the log, and any store without one. */
@@ -147,7 +166,15 @@ export class Thread {
    */
   async record(messages: readonly JsonObject[], runId: string | null = null, options: RecordOptions = {}): Promise<ThreadMessage[]> {
     if (messages.length === 0) return [];
+    try {
+      return await this.#record(messages, runId, options);
+    } finally {
+      // A write ends the turn's snapshot of this thread (item 7), written or not.
+      forgetThreadSnapshot(this.key);
+    }
+  }
 
+  async #record(messages: readonly JsonObject[], runId: string | null, options: RecordOptions): Promise<ThreadMessage[]> {
     const store = this.store;
     // Inside the run that owns a step is only what the RUNTIME records for
     // that run (recordingInRun): a run id a caller passes here proves nothing.
@@ -219,12 +246,7 @@ export class Thread {
    * the runtime reads to decide. @internal
    */
   async readerRows(): Promise<JsonObject[]> {
-    if (supportsAppendLog(this.store)) {
-      const log = await this.store.readLog(this.key);
-      if (log !== null) return this.#view(log);
-    }
-
-    return this.#view(await this.#stored());
+    return this.#view(await this.#read());
   }
 
   /**
@@ -250,15 +272,20 @@ export class Thread {
    */
   async clear(): Promise<void> {
     const store = this.store;
+    forgetThreadSnapshot(this.key);
 
-    await store.withLock(this.key, async () => {
-      if (supportsAppendLog(store)) await store.clearLog(this.key);
-      const stored = await store.get(this.key);
-      if (stored !== null) {
-        const { [OPEN_STEP_KEY]: _open, ...rest } = stored;
-        await store.put(this.key, { ...rest, messages: [] });
-      }
-    });
+    try {
+      await store.withLock(this.key, async () => {
+        if (supportsAppendLog(store)) await store.clearLog(this.key);
+        const stored = await store.get(this.key);
+        if (stored !== null) {
+          const { [OPEN_STEP_KEY]: _open, ...rest } = stored;
+          await store.put(this.key, { ...rest, messages: [] });
+        }
+      });
+    } finally {
+      forgetThreadSnapshot(this.key);
+    }
   }
 
   /**
@@ -316,6 +343,24 @@ export class Thread {
       recordedAt: typeof entry.recorded_at === 'string' ? entry.recorded_at : '',
     };
   }
+}
+
+/** The turn's snapshot of each thread it read (Thread.#read), by thread key. */
+const snapshots = new AsyncLocalStorage<Map<string, { store: SessionStore; entries: JsonObject[] }>>();
+
+/**
+ * Run `body` as one turn (BRIEF-R16 item 7): the thread reads it makes before
+ * its first write share one read of each thread. @internal Used by the runtime.
+ */
+export function withThreadSnapshots<T>(body: () => T): T {
+  // A nested turn (a tool's own send) shares its outer turn's snapshot, so a
+  // write by either ends it for both.
+  return snapshots.run(snapshots.getStore() ?? new Map(), body);
+}
+
+/** End the current turn's snapshot of the thread under `key` (a write, a session lock). @internal */
+export function forgetThreadSnapshot(key: string): void {
+  snapshots.getStore()?.delete(key);
 }
 
 /**
@@ -383,10 +428,12 @@ function supersedingAt(rows: readonly JsonObject[], runIds: readonly (string | n
   const step = pausedStepIndex(rows);
   const owners = new Set<string>();
   if (step !== null) {
-    const own = runIds[step] ?? null;
+    // ONE TRUST SIGNAL (round 16): only rows the runtime wrote make a run an
+    // owner; a run id a host row carries is never evidence of anything.
+    const own = rows[step]?.harness === true ? runIds[step] ?? null : null;
     if (own !== null) owners.add(own);
     for (const [index, row] of rows.entries()) {
-      if (index <= step) continue;
+      if (index <= step || row.harness !== true) continue;
       const runId = runIds[index] ?? null;
       // A result row a harness mark gives to an EARLIER step (round 15) is
       // that step's: its run does not own this one.
