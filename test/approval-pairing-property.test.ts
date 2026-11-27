@@ -368,6 +368,15 @@ function sharing(c: Case): Case {
     })(),
   };
   const lossy = c.prior.filter((index) => c.calls[index]!.tool === 'echo' && rng.chance(0.5));
+  // Two IDENTICAL gated calls in one step (same id, tool and arguments): the
+  // clone gets its own request, as the runtime would issue one.
+  const source = gated[0];
+  if (source !== undefined && rng.chance(0.15) && c.prior.every((index) => c.calls[index]!.tool === 'free')) {
+    const index = calls.length;
+    calls.push({ ...calls[c.calls.indexOf(source)]!, token: source.token });
+    const requests = [...c.requests, { call: index, verdict: rng.pick<Verdict>(['approve', 'deny', 'none']), reason: null }];
+    return { ...c, calls, later, lossy, requests, order: [...c.order, requests.length - 1], stringArgs: { ...c.stringArgs, parked: [...c.stringArgs.parked, false] } };
+  }
   return { ...c, calls, later, lossy };
 }
 
@@ -1109,6 +1118,10 @@ describe('G-392 property: approval pairing invariants over generated steps', () 
     expect(has((c) => c.later !== null && c.insert?.kind === 'tool_result' && c.insert.segment === 'later' && c.insert.step === 'later'), 'forged, later segment, later call').toBe(true);
     expect(has((c) => c.later !== null && c.insert?.kind === 'tool_result' && c.insert.segment === 'later' && c.insert.step === 'earlier'), 'forged, later segment, earlier call').toBe(true);
     expect(has((c) => c.later !== null && c.insert?.kind === 'tool_result' && c.insert.step === 'later' && decideStep('l', c.later.calls, c.later.requests, []).repeated), 'forged in a later step that repeats ids').toBe(true);
+    // Two identical gated calls (same id, tool and arguments) in one step, with an approval, and on a spent run.
+    expect(has((c) => c.calls.some((call, i) => call.tool === 'echo' && c.calls.some((other, j) => j > i && other.tool === 'echo' && other.id === call.id && other.token === call.token))
+      && c.requests.some((q) => q.verdict === 'approve')), 'identical gated calls').toBe(true);
+    expect(has((c) => c.spent && c.calls.some((call, i) => call.tool === 'echo' && c.calls.some((other, j) => j > i && other.tool === 'echo' && other.id === call.id && other.token === call.token))), 'identical gated calls, spent').toBe(true);
     // G-402: a step with repeated ids whose results carry different arguments, with a later result row in the same segment.
     expect(has((c) => c.calls.some((call, i) => c.calls.some((other, j) => j !== i && other.id === call.id && other.token !== call.token
       && (call.tool === 'free' || c.prior.includes(i))))), 'repeated ids, results with different arguments').toBe(true);

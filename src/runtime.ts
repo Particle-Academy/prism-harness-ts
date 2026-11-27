@@ -21,6 +21,7 @@ import {
   resultOwners,
   approvalSuperseded,
   REPLACED_STEP_KEY,
+  answeringStep,
   REPLACED_STEP_RESULT,
   ARGUMENTS_AS_SENT,
 } from './thread-rows.js';
@@ -716,7 +717,10 @@ export class AgentRuntime {
 
       const row: JsonObject = assistantRow(response.text, toolCalls, metadata, requests);
       if (requests.length > 0) row.harness_tool_names = offered.map(tool => tool.name);
-      await thread.record([row], runId, HARNESS_RECORDING);
+      const [recordedStep] = await thread.record([row], runId, HARNESS_RECORDING);
+      // Every result row the harness writes for this step names it: a step
+      // recorded while a call runs never takes the call's result (G-407).
+      const forStep = (resultRow: JsonObject): JsonObject => answeringStep(resultRow, recordedStep?.position);
 
       if (failedFinish !== null) {
         // The code travels; nothing the provider said does.
@@ -724,8 +728,8 @@ export class AgentRuntime {
         // Complete the transcript with refusals, never approval requests, so a
         // later resume cannot dispatch calls from this failed response.
         if (toolCalls.length > 0) {
-          await thread.record([toolResultRow(toolCalls.map(call =>
-            toolResultEntry(call, `Not run: model step failed (${failedFinish}).`)))], runId, HARNESS_RECORDING);
+          await thread.record([forStep(toolResultRow(toolCalls.map(call =>
+            toolResultEntry(call, `Not run: model step failed (${failedFinish}).`))))], runId, HARNESS_RECORDING);
         }
         throw HarnessError.modelStepFailed(failedFinish);
       }
@@ -767,7 +771,7 @@ export class AgentRuntime {
       }
 
       if (results.length > 0) {
-        await thread.record([toolResultRow(results)], runId, HARNESS_RECORDING);
+        await thread.record([forStep(toolResultRow(results))], runId, HARNESS_RECORDING);
       }
 
       // After the results, as core yields them: the calls that ran, then the
@@ -907,7 +911,7 @@ export class AgentRuntime {
       }) as JsonObject);
       await live.thread().record([
         ...replaced,
-        ...(work.calls.length === 0 ? [] : [toolResultRow([...work.results, ...resolved], [...work.decisions.values()])]),
+        ...(work.calls.length === 0 ? [] : [answeringStep(toolResultRow([...work.results, ...resolved], [...work.decisions.values()]), work.position)]),
       ], runId, HARNESS_RECORDING);
       // Only replaced steps were answered: this turn's tools are not narrowed.
       return work.calls.length === 0 ? offered : bounded;
@@ -936,6 +940,8 @@ export class AgentRuntime {
     repeated: boolean;
     /** Earlier parked steps a later tool-call step replaced, with their unanswered gated calls (G-397). */
     replaced: { position: number; calls: JsonObject[] }[];
+    /** The thread position of the step resolved here (its result row names it). */
+    position: number | undefined;
     scope: ReturnType<typeof approvalToolScope>;
     unusable: Set<string>;
     ambiguous: Set<string>;
@@ -988,7 +994,7 @@ export class AgentRuntime {
           (call, at) => !done.has(at) && (approvalIds.has(call.id) || mode.needsApproval(call.name)),
         );
 
-    return calls.length === 0 && replaced.length === 0 ? null : { calls, results, decisions, approvalIds, repeated, replaced, scope: approvalToolScope(rows), unusable: unusableStoredCalls(rows), ambiguous: ambiguousCalls(assistant) };
+    return calls.length === 0 && replaced.length === 0 ? null : { calls, results, decisions, approvalIds, repeated, replaced, position: messages[stored]?.position, scope: approvalToolScope(rows), unusable: unusableStoredCalls(rows), ambiguous: ambiguousCalls(assistant) };
   }
 
   /**
