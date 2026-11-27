@@ -1038,7 +1038,9 @@ async function runCase(c: Case): Promise<void> {
   check(ranKeys.length === new Set(ranKeys).size, '3: a call runs at most once', ranKeys);
   check(ranKeys.every((key) => !key.startsWith('?')), 'a replaced step\'s approvals never run anything', ranKeys);
   const all = [...c.requests.map((q) => ({ q, key: `p${q.call}` })), ...(c.later?.requests ?? []).map((q) => ({ q, key: `l${q.call}` }))];
-  const denied = new Set(all.filter(({ q }) => q.verdict === 'deny').map(({ key }) => key));
+  // No exemption: a call a person denied, by its first decision or a later
+  // one, never runs, whichever decision the rule lets stand (G-401).
+  const denied = new Set(all.filter(({ q }) => q.verdict === 'deny' || q.second?.verdict === 'deny').map(({ key }) => key));
   check(ranKeys.every((key) => !denied.has(key)), '1: a call a person denied never runs', ranKeys);
   const approves = all.filter(({ q }) => q.verdict === 'approve');
   check(ranKeys.every((key) => approves.some((a) => a.key === key)), '2: each run call has its own approve', ranKeys);
