@@ -737,3 +737,65 @@ describe('G-397: rows between the park and the decision', () => {
     });
   }
 });
+
+// ---------------------------------------------------------------------------
+// G-399: results and decisions for the parked step are read from EVERY
+// tool_result row after it, up to the next assistant row. A row of another
+// kind between them hides no result: an approved call runs exactly once
+// however many resumes follow.
+// ---------------------------------------------------------------------------
+
+describe('G-399: a row between the results does not hide one', () => {
+  const ROWS: [string, JsonObject][] = [
+    ['a system row', { type: 'system', content: 'A system note.' }],
+    ['an empty tool row', { type: 'tool_result', tool_results: [], tool_approval_responses: [] }],
+    ['a row of an unknown kind', { type: 'note', content: 'Host bookkeeping.' }],
+  ];
+  // Each resume runs under a context with no model step left, so it acts on
+  // the recorded decisions and adds NO assistant row: the parked step stays
+  // the tail step, and only its results say the call already ran.
+  const noStep = (resume: number): RunContext => RunContext.root(`g399_${resume}`, new RunBudget(0));
+
+  for (const [name, row] of ROWS) {
+    for (const where of ['between the decision and the first resume', 'after every resume'] as const) {
+      it(`${name} ${where}: the approved call runs exactly once in three resumes`, async () => {
+        const r = new Rig();
+        const root = r.session('g399');
+        await root.usingMode('work');
+        r.calls([['echo', { n: 1 }]]);
+        const parked = await r.runtime.send(root, 'Go');
+        await recordApproval(root, parked.pendingApprovals[0]!.id, true);
+        await root.thread().record([row]);
+        for (let resume = 0; resume < 3; resume += 1) {
+          await r.runtime.send(root, '', undefined, noStep(resume));
+          if (where === 'after every resume') await root.thread().record([row]);
+        }
+        expect(r.echoed).toEqual([1]);
+        // No model step was taken by any resume.
+        expect(r.requests).toHaveLength(1);
+      });
+    }
+  }
+
+  it('stored rows: system rows around the decision, then a resume that takes no model step, three times: runs once', async () => {
+    const r = new Rig();
+    const root = r.session('g399-stored');
+    await root.usingMode('work');
+    await root.thread().record([
+      { type: 'user', content: 'Go' },
+      { ...assistantRowOf([{ id: 'c1', name: 'echo', arguments: { n: 1 } }], [{ approval_id: 'apr_1', tool_call_id: 'c1', arguments_format: 1 }]), harness_tool_names: ['echo', 'free'] },
+      { type: 'system', content: 'Note 1.' },
+      { type: 'tool_result', tool_results: [], tool_approval_responses: [{ approval_id: 'apr_1', approved: true, reason: null }] },
+      { type: 'system', content: 'Note 2.' },
+    ]);
+    for (let resume = 0; resume < 3; resume += 1) {
+      await r.runtime.send(root, '', undefined, noStep(resume));
+      await root.thread().record([{ type: 'system', content: `After ${resume}.` }]);
+    }
+    expect(r.echoed).toEqual([1]);
+  });
+});
+
+function assistantRowOf(calls: JsonObject[], requests: JsonObject[]): JsonObject {
+  return { type: 'assistant', content: '', tool_calls: calls, additional_content: {}, tool_approval_requests: requests };
+}

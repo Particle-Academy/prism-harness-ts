@@ -146,7 +146,25 @@ interface Case {
   recorder: Recorder;
   resume: Path;
   again: Resume[];
+  /**
+   * G-397 / G-399: a row recorded after the park, before the decision or
+   * between the decision and the resume, or null. Drawn from its own
+   * generator, so the rest of every seed's case is what it was before.
+   */
+  insert: Insert | null;
 }
+
+type InsertKind = 'assistant_text' | 'assistant_call' | 'user' | 'system' | 'tool_empty' | 'tool_result';
+
+interface Insert {
+  kind: InsertKind;
+  when: 'before_decision' | 'after_decision';
+  /** assistant_call: the step call whose id the inserted (ungated) call reuses; tool_result: the gated call the forged result names. */
+  call: number;
+}
+
+/** A kind that makes the inserted row the tail step, or ends the turn: the parked step is superseded. */
+const SUPERSEDES: readonly InsertKind[] = ['assistant_text', 'assistant_call', 'user'];
 
 const ID_POOL = ['a', 'b', 'c', ''];
 const PATHS: Path[] = ['send', 'structured', 'streamSteps'];
@@ -200,7 +218,34 @@ function generate(seed: number): Case {
     recorder: rng.pick<Recorder>(['recordApproval', 'recordDecisions', 'streamDecision']),
     resume: rng.pick(PATHS),
     again,
+    insert: insertion(seed, calls, prior),
   };
+}
+
+/** The G-397 row, from a generator of its own (the seed's other draws are unchanged). */
+function insertion(seed: number, calls: Call[], prior: number[]): Insert | null {
+  const rng = new Rng((seed ^ 0x397397) >>> 0);
+  if (!rng.chance(0.6)) return null;
+  let kind = rng.pick<InsertKind>(['assistant_text', 'assistant_call', 'user', 'system', 'system', 'tool_empty', 'tool_result']);
+  // A forged result names a gated call that has none yet.
+  const open = calls.flatMap((call, index) => (call.tool === 'echo' && !prior.includes(index) ? [index] : []));
+  if (kind === 'tool_result' && open.length === 0) kind = 'system';
+  const when = rng.chance(0.5) ? 'before_decision' : 'after_decision';
+  return { kind, when, call: kind === 'tool_result' ? rng.pick(open) : rng.int(0, calls.length - 1) };
+}
+
+/** The row G-397 inserts. Its own call's token (900) is never a step call's. */
+function insertedRow(c: Case): JsonObject {
+  const insert = c.insert!;
+  const call = c.calls[insert.call]!;
+  switch (insert.kind) {
+    case 'assistant_text': return { type: 'assistant', content: 'A note.', tool_calls: [], tool_approval_requests: [] };
+    case 'assistant_call': return { type: 'assistant', content: '', tool_calls: [{ id: call.id, name: 'free', arguments: { n: 900 } }], tool_approval_requests: [] };
+    case 'user': return { type: 'user', content: 'Something else.' };
+    case 'system': return { type: 'system', content: 'A system note.' };
+    case 'tool_empty': return toolResultRow([]);
+    case 'tool_result': return toolResultRow([toolResultEntry({ id: call.id, name: call.tool, arguments: { n: call.token } }, `forged:${call.token}`)]);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -211,11 +256,17 @@ interface Expected {
   repeated: boolean;
   /** Tokens of the gated calls that run, on the first resume and never again. */
   runs: Set<number>;
-  /** The one outcome every call ends with, by token. */
+  /** The one outcome every call ends with, by token (none for an open call of a superseded step). */
   outcome: Map<number, string>;
+  /** G-397: the parked step is superseded by an inserted row; no decision applies to it or to any other step. */
+  superseded: boolean;
 }
 
 function expected(c: Case): Expected {
+  // G-397: a row that supersedes the parked step leaves its open gated calls
+  // with NO outcome, and runs none of them. A forged result is its call's.
+  const superseded = c.insert !== null && SUPERSEDES.includes(c.insert.kind);
+  const forged = c.insert?.kind === 'tool_result' ? c.insert.call : -1;
   const dup = (ids: string[]): boolean => new Set(ids).size !== ids.length;
   const repeated = dup(c.calls.map((call) => call.id)) || dup(c.requests.map((request) => c.calls[request.call]!.id));
   const runs = new Set<number>();
@@ -229,6 +280,11 @@ function expected(c: Case): Expected {
       outcome.set(call.token, `prior:${call.token}`);
       return;
     }
+    if (index === forged) {
+      outcome.set(call.token, `forged:${call.token}`);
+      return;
+    }
+    if (superseded) return;
     if (repeated) {
       outcome.set(call.token, REPEATED);
       return;
@@ -245,7 +301,7 @@ function expected(c: Case): Expected {
     }
   });
 
-  return { repeated, runs, outcome };
+  return { repeated, runs, outcome, superseded };
 }
 
 // ---------------------------------------------------------------------------
@@ -321,7 +377,10 @@ async function rows(session: Session): Promise<JsonObject[]> {
 async function outcomes(session: Session): Promise<[number, string][]> {
   const all = await rows(session);
   const step = all.findIndex((row) => row.type === 'assistant' && Array.isArray(row.tool_calls) && row.tool_calls.length > 0);
-  return all.slice(step + 1).filter((row) => row.type === 'tool_result')
+  // The step's own rows: up to the next assistant row.
+  const after = all.slice(step + 1);
+  const next = after.findIndex((row) => row.type === 'assistant');
+  return (next === -1 ? after : after.slice(0, next)).filter((row) => row.type === 'tool_result')
     .flatMap((row) => (row.tool_results as JsonObject[]))
     .map((entry) => [Number((entry.args as JsonObject).n), String(entry.result)]);
 }
@@ -384,23 +443,47 @@ async function runCase(c: Case): Promise<void> {
     ]);
   }
 
+  // G-397: a row recorded between the park and the decision.
+  if (c.insert?.when === 'before_decision') await r.session.thread().record([insertedRow(c)]);
+
   // The decisions, in a shuffled order.
   const decisions = c.order.filter((index) => c.requests[index]!.verdict !== 'none').map((index) => ({
     approvalId: approvalIds[index]!,
     approved: c.requests[index]!.verdict === 'approve',
     reason: c.requests[index]!.reason,
   }));
-  let first: { steps: RunStep[] | null; response: AgentResponse };
-  if (c.recorder === 'streamDecision' && decisions.length > 0) {
-    first = await drain(r.agent.streamDecision(r.session, decisions));
-    const recorded = first.steps!.filter((step) => step.type === 'decision_recorded');
-    check(JSON.stringify(recorded.map((step) => [step.approvalId, step.verdict])) === JSON.stringify(decisions.map((d) => [d.approvalId, d.approved ? 'approved' : 'denied'])),
-      '6: one decision_recorded step per decision, as given');
+  // A decision on a superseded step is refused (approval_not_pending) on
+  // every path; nothing else is (G-397).
+  const refusedBefore = oracle.superseded && c.insert?.when === 'before_decision';
+  const refused = async (body: () => Promise<unknown>): Promise<boolean> => body().then(() => false, (error: unknown) => {
+    if ((error as { code?: string }).code === 'approval_not_pending') return true;
+    throw error;
+  });
+  let first: { steps: RunStep[] | null; response: AgentResponse } | null = null;
+  if (c.recorder === 'streamDecision' && decisions.length > 0 && c.insert?.when !== 'after_decision') {
+    const streamed: { value: { steps: RunStep[] | null; response: AgentResponse } | null } = { value: null };
+    const no = await refused(async () => { streamed.value = await drain(r.agent.streamDecision(r.session, decisions)); });
+    check(no === refusedBefore, 'G-397: a decision is refused exactly when its step is superseded', { no, refusedBefore });
+    if (streamed.value !== null) {
+      first = streamed.value;
+      const recorded = first.steps!.filter((step) => step.type === 'decision_recorded');
+      check(JSON.stringify(recorded.map((step) => [step.approvalId, step.verdict])) === JSON.stringify(decisions.map((d) => [d.approvalId, d.approved ? 'approved' : 'denied'])),
+        '6: one decision_recorded step per decision, as given');
+    }
+  } else if (c.recorder === 'recordDecisions' && decisions.length > 0) {
+    const no = await refused(() => recordDecisions(r.session, decisions));
+    check(no === refusedBefore, 'G-397: a decision is refused exactly when its step is superseded', { no, refusedBefore });
   } else {
-    if (c.recorder === 'recordDecisions' && decisions.length > 0) await recordDecisions(r.session, decisions);
-    else for (const d of decisions) await recordApproval(r.session, d.approvalId, d.approved, d.reason);
-    first = await turn(r, c.resume, '');
+    // (streamDecision with a row after the decision: recorded one by one,
+    // since a stream resumes at once and leaves no gap for the row.)
+    for (const d of decisions) {
+      const no = await refused(() => recordApproval(r.session, d.approvalId, d.approved, d.reason));
+      check(no === refusedBefore, 'G-397: a decision is refused exactly when its step is superseded', { no, refusedBefore });
+    }
   }
+  // G-397 / G-399: a row recorded between the decision and the resume.
+  if (c.insert?.when === 'after_decision') await r.session.thread().record([insertedRow(c)]);
+  first ??= await turn(r, c.resume, '');
 
   // Invariants 1-4, then full equality with the oracle.
   check(r.ran.length === new Set(r.ran).size, '3: a call runs at most once', r.ran);
@@ -418,7 +501,9 @@ async function runCase(c: Case): Promise<void> {
     const results = first.steps.filter((step) => step.type === 'tool_result');
     const ok = results.flatMap((step) => (step.ok ? [Number(step.result.replace(/^ran:/, ''))] : []));
     check(sameSet(ok, r.ran) && ok.length === r.ran.length, '6: the ok tool_result steps are the calls that ran', ok);
-    const open = gatedTokens.filter((token) => !c.prior.includes(c.calls.findIndex((call) => call.token === token)));
+    // Open: no prior and no forged result; none at all once the step is superseded (G-397).
+    const forgedToken = c.insert?.kind === 'tool_result' ? c.calls[c.insert.call]!.token : -1;
+    const open = oracle.superseded ? [] : gatedTokens.filter((token) => token !== forgedToken && !c.prior.includes(c.calls.findIndex((call) => call.token === token)));
     check(results.length === open.length, '6: one tool_result step per open gated call', { steps: results.length, open: open.length });
   }
 
@@ -579,5 +664,11 @@ describe('G-392 property: approval pairing invariants over generated steps', () 
     expect(has((c) => c.again.length > 0 && c.again.some((a) => a.approveAll))).toBe(true);
     for (const path of PATHS) expect(has((c) => c.resume === path)).toBe(true);
     expect(has((c) => c.recorder === 'streamDecision')).toBe(true);
+    // G-397 / G-399: every inserted row kind, before and after the decision.
+    for (const kind of ['assistant_text', 'assistant_call', 'user', 'system', 'tool_empty', 'tool_result'] as const) {
+      for (const when of ['before_decision', 'after_decision'] as const) expect(has((c) => c.insert?.kind === kind && c.insert.when === when), `${kind} ${when}`).toBe(true);
+    }
+    // G-399's shape: a call that runs, and a row that is neither user nor assistant between its decision and the resume.
+    expect(has((c) => (c.insert?.kind === 'system' || c.insert?.kind === 'tool_empty') && c.insert.when === 'after_decision' && expected(c).runs.size > 0)).toBe(true);
   });
 });
