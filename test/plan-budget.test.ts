@@ -21,7 +21,7 @@ import {
   type LlmResponse,
   type ModeConfig,
   type PlansConfig,
-  type Session,
+  Session,
 } from '../src/index.js';
 
 // G-366: a plan's budget is the app's choice (Wish, q_fb920047): one shared
@@ -598,5 +598,42 @@ describe('plan budgets (G-366)', () => {
     expect(r.queue).toHaveLength(0);
     const grandchild = r.harness.for({ type: 'User', id: 1 }).session('chat::sub::research::sub::dig');
     expect(await grandchild.childRefs()).toEqual(saved);
+  });
+
+  // G-387 round 10 (Py F1, TS I-3): a child whose record a failed runner
+  // start left provisional (its undo failed too) reads as the plan budget it
+  // was last CONFIRMED with, never as none: the next direct start keeps it,
+  // and a host turn on the child still spends from it.
+  it('keeps the shared plan budget of a child left provisional by a failed start whose undo failed too', async () => {
+    const { r, child, id } = await pausedChild(20);
+    r.text('Child answer.');
+    await recordApproval(child, id, true);
+    await r.runtime.send(child, '');
+    const saved = await child.childRefs();
+    expect(saved?.tree).not.toBeNull();
+    expect(saved?.planLedger).not.toBeNull();
+    const research = new SubagentRunner(r.harness, r.runtime);
+    const declared = (await r.runtime.modeOf(r.session())).subagents.research!;
+    const direct = (task: string) => research.run(declared, r.session(), RunContext.root('host', new RunBudget(100)), 'host_run', task);
+
+    const resolve = ToolRegistry.prototype.resolveDetailed;
+    vi.spyOn(ToolRegistry.prototype, 'resolveDetailed').mockImplementation(function (this: ToolRegistry, ...args: Parameters<ToolRegistry['resolveDetailed']>) {
+      if (args[1]?.scope.includes('::sub::') === true) throw new Error('REGISTRY-SECRET');
+      return resolve.apply(this, args);
+    });
+    vi.spyOn(Session.prototype, 'undoChildStart').mockRejectedValue(new Error('STORE-SECRET'));
+    expect((await direct('Retry')).outcome).toBe('failed');
+    vi.restoreAllMocks();
+    expect(await child.childRefs()).toEqual(saved);
+
+    vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 301_000);
+    r.text('Child again.');
+    expect((await direct('Again')).outcome).toBe('completed');
+    expect(await child.childRefs()).toEqual(saved);
+
+    const before = (await (await r.handle()).budget())!.steps;
+    r.text('Child answer.');
+    await r.runtime.send(child, 'New question');
+    expect((await (await r.handle()).budget())!.steps).toBe(before + 1);
   });
 });
