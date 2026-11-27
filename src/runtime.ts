@@ -1071,9 +1071,15 @@ export class AgentRuntime {
     const messages = await session.thread().messages();
     if (resultOwners(messages).get(stepIndex)?.has(at) === true || startedCalls(messages, stepIndex).has(at)) return false;
     let approved = false;
-    for (const row of threadView(messages.slice(stepIndex + 1).map((entry) => entry.message))) {
+    let seen = false;
+    for (const row of messages.slice(stepIndex + 1).flatMap((entry) => threadView([entry.message]))) {
       if (row.type !== 'tool_result') continue;
-      for (const entry of (row as ToolResultRow).tool_approval_responses) if (entry.approval_id === approvalId) approved = entry.approved;
+      // The decision that stands (G-401): the first one recorded.
+      for (const entry of (row as ToolResultRow).tool_approval_responses) {
+        if (entry.approval_id !== approvalId || seen) continue;
+        approved = entry.approved;
+        seen = true;
+      }
     }
     return approved;
   }
