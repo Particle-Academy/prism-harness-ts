@@ -150,11 +150,28 @@ export class Session {
 
   async mode(): Promise<string | null> {
     if (this.#resolvedMode !== null) return this.#resolvedMode;
+    // A mode a runner start wrote is provisional until its task row (G-387
+    // round 9): until then the mode is the one the session had before it.
+    const state = await this.state();
+    if (Object.hasOwn(state, 'mode_provisional')) {
+      const mark = state.mode_provisional;
+      const confirmed = isJsonObject(mark) && await this.#taskRecorded(mark.run);
+      if (!confirmed) {
+        const prior = isJsonObject(mark) ? mark.prior : null;
+        return typeof prior === 'string' ? prior : null;
+      }
+    }
     return this.#readString('mode');
   }
 
   async usingMode(mode: string): Promise<this> {
-    return this.#write('mode', mode);
+    this.#assertWritable();
+    const { mode_provisional: _mark, ...state } = await this.state();
+    const next: JsonObject = { ...state, mode };
+    await this.#ephemeral.put(this.#ephemeralKey(), next, this.#ttlSeconds);
+    this.#cachedState = next;
+
+    return this;
   }
 
   async model(): Promise<string | null> {
@@ -276,8 +293,12 @@ export class Session {
    * @internal Read by the runtime and Plans.
    */
   async childRefs(): Promise<ChildRefs | null> {
-    const stored = (await this.#durable.get(this.#durableKey())) ?? {};
-    const refs = stored.child_refs;
+    const record = await this.#childRecord();
+    // A provisional start with no task row (G-387 round 9): the child's
+    // records are absent, but it IS a child, so every turn the runner did
+    // not start fails closed (no binding, no tree).
+    if (record === 'unconfirmed') return { tree: null, planLedger: null };
+    const refs = record.child_refs;
     if (!isJsonObject(refs)) return null;
     const pair = (value: JsonValue | undefined, first: string, second: string): Record<string, string> | null => {
       if (!isJsonObject(value)) return null;
@@ -306,8 +327,9 @@ export class Session {
    * @internal Read by the runtime.
    */
   async childBinding(): Promise<ModelBinding | null> {
-    const stored = (await this.#durable.get(this.#durableKey())) ?? {};
-    const binding = storedBinding(stored.child_binding);
+    const record = await this.#childRecord();
+    if (record === 'unconfirmed') return null;
+    const binding = storedBinding(record.child_binding);
 
     return binding === null ? null : { session: binding.session, declared: binding.declared, parentMode: binding.parent_mode };
   }
@@ -320,8 +342,9 @@ export class Session {
    * @internal Read by the runtime.
    */
   async childDepth(): Promise<number> {
-    const stored = (await this.#durable.get(this.#durableKey())) ?? {};
-    const depth = stored.child_depth;
+    const record = await this.#childRecord();
+    if (record === 'unconfirmed') return 0;
+    const depth = record.child_depth;
 
     return typeof depth === 'number' && Number.isSafeInteger(depth) && depth > 0 ? depth : 0;
   }
@@ -338,11 +361,87 @@ export class Session {
    * @internal Read by the runtime.
    */
   async childCeiling(): Promise<number | null | 'invalid'> {
-    const stored = (await this.#durable.get(this.#durableKey())) ?? {};
-    if (!Object.hasOwn(stored, 'child_ceiling') || stored.child_ceiling === undefined) return null;
-    const ceiling = stored.child_ceiling;
+    const record = await this.#childRecord();
+    if (record === 'unconfirmed' || !Object.hasOwn(record, 'child_ceiling') || record.child_ceiling === undefined) return null;
+    const ceiling = record.child_ceiling;
 
     return typeof ceiling === 'number' && Number.isSafeInteger(ceiling) && ceiling >= 0 ? ceiling : 'invalid';
+  }
+
+  /**
+   * True when this child's records were written by a runner start whose
+   * task row is not in the thread (G-387 round 9): they read as ABSENT, so
+   * every turn the runner does not start, every decision on it and the
+   * delegation count fail closed. A garbage mark is never confirmed.
+   *
+   * @internal Read by the runtime.
+   */
+  async childStartUnconfirmed(): Promise<boolean> {
+    return await this.#childRecord() === 'unconfirmed';
+  }
+
+  /**
+   * Clear a confirmed start's provisional marks (G-387 round 9), on the
+   * child's records and its run state, once its task row is recorded. Pure
+   * housekeeping: the task row is the authority, so a mark left behind (this
+   * write failing, or a crash before it) reads exactly as a cleared one.
+   *
+   * @internal Called by the runtime after a runner start's task row.
+   */
+  async confirmChildStart(runId: string): Promise<void> {
+    this.#assertWritable();
+    const name = this.#durableKey();
+    await this.#durable.withLock(name, async () => {
+      const stored = await this.#durable.get(name);
+      if (stored == null || stored.child_provisional !== runId) return;
+      const { child_provisional: _confirmed, ...rest } = stored;
+      await this.#durable.put(name, rest);
+    }, 10, 5);
+    this.#cachedState = null;
+    const state = await this.state();
+    const run = state.run;
+    const mark = state.mode_provisional;
+    const runMarked = isJsonObject(run) && run.id === runId && Object.hasOwn(run, 'provisional');
+    const modeMarked = isJsonObject(mark) && mark.run === runId;
+    if (runMarked || modeMarked) {
+      const { mode_provisional: _m, run: _r, ...rest } = state;
+      const next: JsonObject = { ...rest, ...(modeMarked ? {} : Object.hasOwn(state, 'mode_provisional') ? { mode_provisional: mark! } : {}) };
+      if (run !== undefined) {
+        if (runMarked) {
+          const { provisional: _p, prior: _q, ...kept } = run as JsonObject;
+          next.run = kept;
+        } else next.run = run;
+      }
+      await this.#ephemeral.put(this.#ephemeralKey(), next, this.#ttlSeconds);
+      this.#cachedState = next;
+    }
+  }
+
+  /**
+   * The child's durable record as every reader sees it (G-387 round 9):
+   * 'unconfirmed' when a runner start marked it `child_provisional` and its
+   * task row (the user row recorded under that run id) is not in the thread,
+   * or the mark is not a run id; otherwise the record. A record with no mark
+   * (a legacy one, or one whose mark was cleared) is confirmed.
+   */
+  async #childRecord(): Promise<JsonObject | 'unconfirmed'> {
+    const record = (await this.#durable.get(this.#durableKey())) ?? {};
+
+    return await this.#confirmed(record) ? record : 'unconfirmed';
+  }
+
+  /** Whether `record`'s provisional mark, if any, is confirmed by its run's task row. */
+  async #confirmed(record: JsonObject): Promise<boolean> {
+    if (!Object.hasOwn(record, 'child_provisional')) return true;
+
+    return await this.#taskRecorded(record.child_provisional);
+  }
+
+  /** True when `runId` is a run id with a user row recorded under it in this thread. */
+  async #taskRecorded(runId: JsonValue | undefined): Promise<boolean> {
+    if (typeof runId !== 'string' || runId === '') return false;
+
+    return (await this.thread().messages()).some((entry) => entry.runId === runId && entry.message.type === 'user');
   }
 
   /**
@@ -420,6 +519,10 @@ export class Session {
           tree: refs.tree === null ? null : { ...refs.tree },
           plan_ledger: refs.planLedger === null ? null : { ...refs.planLedger },
         },
+        // PROVISIONAL (round 9): every reader treats all of the above as
+        // absent until this run's task row is in the child's thread. A
+        // start that fails before it needs no second write to be safe.
+        child_provisional: hold.runId,
       };
       const prior: JsonObject = {};
       for (const key of CHILD_START_KEYS) if (Object.hasOwn(stored, key)) prior[key] = stored[key]!;
@@ -431,8 +534,13 @@ export class Session {
         try {
           this.#cachedState = null;
           const state = await this.state();
-          priorMode = Object.hasOwn(state, 'mode') && typeof state.mode === 'string' ? state.mode : null;
-          await this.#write('mode', mode);
+          priorMode = await this.mode();
+          // Provisional with the rest (round 9): the mode before it is kept
+          // beside it, and read until this run's task row is recorded.
+          const { mode_provisional: _old, ...kept } = state;
+          const next: JsonObject = { ...kept, mode, mode_provisional: { run: hold.runId, prior: priorMode } };
+          await this.#ephemeral.put(this.#ephemeralKey(), next, this.#ttlSeconds);
+          this.#cachedState = next;
         } catch (error) {
           if (binding !== null) {
             if (existing == null) await this.#durable.forget(name);
@@ -477,8 +585,9 @@ export class Session {
     if (start.mode !== null && restored) {
       this.#cachedState = null;
       const state = await this.state();
-      if (state.mode === start.mode) {
-        const { mode: _written, ...rest } = state;
+      const mark = state.mode_provisional;
+      if (state.mode === start.mode && isJsonObject(mark) && mark.run === start.holdRunId) {
+        const { mode: _written, mode_provisional: _mark, ...rest } = state;
         const next: JsonObject = start.priorMode === null ? rest : { ...rest, mode: start.priorMode };
         await this.#ephemeral.put(this.#ephemeralKey(), next, this.#ttlSeconds);
         this.#cachedState = next;
@@ -498,8 +607,14 @@ export class Session {
    * @internal Called by the runtime when a turn the runner did not start begins.
    */
   async claimChildSteps(runId: string, now: number, ttlSeconds: number, claim: (used: number | null) => number): Promise<void> {
+    // A provisional start's count is absent (round 9): confirmed by reading
+    // its task row before the write, and the mark re-compared inside it (a
+    // task row is never removed, so a confirmed mark stays confirmed).
+    const before = (await this.#durable.get(this.#durableKey())) ?? {};
+    const mark = canonical(before.child_provisional);
+    const confirmed = await this.#confirmed(before);
     await this.#writeDurable((stored) => {
-      const read = childSteps(stored.child_steps);
+      const read = !confirmed || canonical(stored.child_provisional) !== mark ? null : childSteps(stored.child_steps);
       // A run id that already holds (or was charged) is not a new turn: two
       // live turns under one id would overwrite each other's hold. Closed.
       const count = read === null || Object.hasOwn(read.holds, runId) || Object.hasOwn(read.charged, runId) ? null : expired(read, now, ttlSeconds);
@@ -578,6 +693,8 @@ export class Session {
     const stored = (await this.#durable.get(this.#runTreesKey())) ?? {};
     const runs = stored.runs;
     const entry = isJsonObject(runs) && Object.hasOwn(runs, runId) ? runs[runId] : undefined;
+    // A runner start's entry is absent until its task row (G-387 round 9).
+    if (isJsonObject(entry) && Object.hasOwn(entry, 'provisional') && !await this.#taskRecorded(runId)) return null;
     const tree = isJsonObject(entry) ? entry.tree : undefined;
     if (!isJsonObject(tree)) return null;
     const { session, run } = tree;
@@ -625,7 +742,7 @@ export class Session {
    * order, and a run whose approvals the thread is still parked on is never
    * dropped: a resume that keeps failing must not forget the tree it resumes.
    */
-  async #rememberRunTree(id: string, tree: { session: string; run: string } | 'host' | 'none', depth: number): Promise<void> {
+  async #rememberRunTree(id: string, tree: { session: string; run: string } | 'host' | 'none', depth: number, provisional = false): Promise<void> {
     this.#assertWritable();
     // Read before the lock: stale, it can only keep an extra entry or miss
     // pinning a run that parked a moment ago, which has the newest seq.
@@ -637,7 +754,7 @@ export class Session {
       const stored = (await this.#durable.get(name)) ?? {};
       const runs: JsonObject = isJsonObject(stored.runs) ? { ...stored.runs } : {};
       const seq = typeof stored.seq === 'number' && Number.isSafeInteger(stored.seq) ? stored.seq + 1 : 1;
-      runs[id] = { tree, depth, seq };
+      runs[id] = provisional ? { tree, depth, seq, provisional: true } : { tree, depth, seq };
       const order = Object.keys(runs).map((runId) => {
         const entry = runs[runId];
 
@@ -677,10 +794,24 @@ export class Session {
 
   // -- runs ------------------------------------------------------------------
 
+  /**
+   * The session's current run. A runner start's run is PROVISIONAL until its
+   * task row is in the thread (G-387 round 9): until then this is the run
+   * the session had before it (`prior`), so a start that failed before its
+   * task row leaves the parked or finished run current, with no second write.
+   */
   async run(): Promise<RunState | null> {
     const run = (await this.state()).run;
+    if (!isJsonObject(run) || typeof run.id !== 'string') return null;
+    if (!Object.hasOwn(run, 'provisional')) return run as RunState;
+    if (run.provisional === run.id && await this.#taskRecorded(run.id)) {
+      const { provisional: _p, prior: _q, ...confirmed } = run;
 
-    return isJsonObject(run) && typeof run.id === 'string' ? (run as RunState) : null;
+      return confirmed as RunState;
+    }
+    const prior = run.prior;
+
+    return isJsonObject(prior) && typeof prior.id === 'string' && !Object.hasOwn(prior, 'provisional') ? (prior as RunState) : null;
   }
 
   /**
@@ -688,10 +819,14 @@ export class Session {
    *   (RunTrees.membership): a tree of this runtime, `host` or `none` (G-381)
    * @param depth the depth it runs at, from the same decision
    */
-  async beginRun(id: string, mode: string, provider: string, model: string, tree?: { session: string; run: string } | 'host' | 'none', depth?: number): Promise<this> {
-    if (tree !== undefined) await this.#rememberRunTree(id, typeof tree === 'object' ? { session: tree.session, run: tree.run } : tree, depth ?? 0);
+  async beginRun(id: string, mode: string, provider: string, model: string, tree?: { session: string; run: string } | 'host' | 'none', depth?: number, provisional = false): Promise<this> {
+    // A runner start's run (G-387 round 9) is provisional until its task
+    // row: it keeps the run the session had, which run() reads until then.
+    const prior = provisional ? await this.run() : null;
+    if (tree !== undefined) await this.#rememberRunTree(id, typeof tree === 'object' ? { session: tree.session, run: tree.run } : tree, depth ?? 0, provisional);
 
     return this.#write('run', {
+      ...(provisional ? { provisional: id, prior: prior === null ? null : { ...prior } } : {}),
       id,
       status: 'running',
       mode,
@@ -835,6 +970,12 @@ export class Session {
     if (current !== null && current.id !== id) {
       return this;
     }
+    // Nor does a runner start that never recorded its task row (G-387
+    // round 9): it stays absent, and the run before it stays current.
+    if (current === null) {
+      const raw = (await this.state()).run;
+      if (isJsonObject(raw) && raw.id === id && Object.hasOwn(raw, 'provisional')) return this;
+    }
 
     await this.#write('run', {
       ...(current ?? { id }),
@@ -937,7 +1078,7 @@ export interface ChildStart {
 }
 
 /** The child records a runner start writes in its one locked write. */
-const CHILD_START_KEYS: readonly string[] = ['child_binding', 'child_depth', 'child_ceiling', 'child_steps', 'child_refs'];
+const CHILD_START_KEYS: readonly string[] = ['child_binding', 'child_depth', 'child_ceiling', 'child_steps', 'child_refs', 'child_provisional'];
 
 /** A value as text with its object keys sorted, for comparing stored JSON. */
 function canonical(value: JsonValue | undefined): string {

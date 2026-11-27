@@ -301,6 +301,8 @@ describe('R12-1: a failed start whose undo fails too leaves nothing answerable',
       const r = new Rig();
       await r.session().usingMode('lead');
       await deadChild(r);
+      // The mode it had before: the start writes `work`.
+      await r.child().usingMode('lead');
       failChildRegistry();
       failUndo();
 
@@ -313,6 +315,8 @@ describe('R12-1: a failed start whose undo fails too leaves nothing answerable',
       expect((await childRecord(r)).child_binding).toBeDefined();
       expect(await r.child().childBinding()).toBeNull();
       expect(await r.child().childCeiling()).toBeNull();
+      expect((await r.child().state()).mode).toBe('work');
+      expect(await r.child().mode()).toBe('lead');
       await childUnreachable(r, 'apr_dead');
 
       // Once the start's hold has expired, a re-delegation is not blocked.
@@ -396,6 +400,8 @@ describe('a provisional record whose task row exists is a confirmed one', () => 
     // Housekeeping cleared the marks once the task row was recorded.
     expect(Object.hasOwn(await childRecord(r), 'child_provisional')).toBe(false);
     expect(Object.hasOwn((await r.child().state()).run as JsonObject, 'provisional')).toBe(false);
+    expect(Object.hasOwn(await r.child().state(), 'mode_provisional')).toBe(false);
+    expect(await r.child().mode()).toBe('work');
     const before = r.childRequests();
 
     await recordApproval(r.child(), approval, true);

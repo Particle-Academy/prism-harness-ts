@@ -126,7 +126,7 @@ export class SubagentRunner {
       // gate's reasons, the fixed stops below, and for anything else the
       // class name and harness code. Never an error's message, and never an
       // outcome a thrown object states.
-      if (error instanceof StartRefused) {
+      if (isStartRefused(error)) {
         const refusal = startRefusal(error);
         return refusal === null
           ? refused(subagent.name, runId, parentRunId, 'failed', `it failed (${failureName(error)})`)
@@ -248,3 +248,12 @@ function narrowedTo(turn: RunContext, host: RunContext): RunContext {
 
 /** True when `task` is empty or only blank codepoints (RunStarts' one set). */
 export { isBlankTask } from './run-starts.js';
+
+/** `instanceof StartRefused`, guarded (round 9): an object whose prototype read throws is not one. */
+function isStartRefused(error: unknown): error is StartRefused {
+  try {
+    return error instanceof StartRefused;
+  } catch {
+    return false;
+  }
+}

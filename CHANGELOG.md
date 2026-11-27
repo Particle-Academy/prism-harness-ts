@@ -40,8 +40,7 @@
   (the run cannot begin, the tool offer or a plan read throws) restores the
   child's records and mode as they were, only if nobody has written them
   since (otherwise only the start's own count hold is settled), and releases
-  its holds. A failed start no longer leaves the child re-bound, holding a
-  count, or with an approval answerable that was not.
+  its holds (see round 9: this is now housekeeping only).
 - That write also re-checks, under the child's lock, for an approval a person
   could answer that parked since the gate read the child: the start is then
   refused (`denied`, waiting on a person) with nothing written.
@@ -62,6 +61,43 @@
 - `RunBudget` (and `RunBudget.fromConfig`) refuses a cost or time limit that
   is `NaN`, infinite or negative (`TypeError`); `fromConfig` used to read such
   a value as no limit. A runner start counts a non-finite limit as spent.
+
+### Fixed: a runner start's child records are provisional until its task row (G-387 round 9)
+
+- Everything a runner start saves on its child (binding, depth, step ceiling
+  and count, run tree and plan references, mode) carries the start's run id
+  and reads as ABSENT until the start's task row, the user row recorded under
+  that run id, is in the child's thread. Until then a turn on the child the
+  runner did not start, a decision on its approvals (`recordApproval`,
+  `decide`, `streamDecision`), the start gate's answerability read and the
+  delegation step count all fail closed (`child_binding_missing`, no
+  allowance), and a binding on the child's paused row is not used either.
+  Confirmation is read from the task row, never from another write: a start
+  that fails before its task row leaves nothing answerable that was not, even
+  when the store also fails while it cleans up. The round-8 restore is now
+  housekeeping and its failure changes nothing; a count hold it could not
+  release expires after `lock_ttl`. Records with no mark (written before this
+  change) behave as before; a mark that is not a run id fails closed.
+- The child's run state and run history do the same: until the task row,
+  `session.run()` is the run the child had before the start (a parked or
+  finished run stays current after a failed start), and the attempted run has
+  no run tree entry.
+- A runner start acts on no recorded decision. Its task row ends every call
+  the child was still waiting on, recorded as not run in the same write,
+  whatever decision is recorded on it (one recorded while an earlier binding
+  was alive included).
+- A run's failure handler cleans up before it reads anything from the error,
+  reads it only guarded, and emits `run.failed` even when the failed-run write
+  itself fails. An error whose prototype or `code` cannot be read is framed as
+  a failure by class name.
+- Only the codes this package defines are reported as harness codes in a
+  framed failure, a run row or `run.failed`; a `HarnessError` built with any
+  other code is reported as `HarnessError error`.
+- Configured limits stay strict: a `max_cost_usd`, `max_seconds` or
+  `max_steps` that is present but not a finite non-negative number (`'NAN'`,
+  `'INF'`, `'-INF'`, `'0,50'`, a quoted number) is a `TypeError`, never "no
+  limit", in `RunBudget.fromConfig`, the runtime config, modes and plan
+  budgets (now pinned by tests).
 
 ### Changed: no exception text in run rows or `run.failed` (G-387 round 8)
 

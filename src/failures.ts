@@ -1,4 +1,5 @@
-import { HarnessError } from './errors.js';
+import { HARNESS_ERROR_CODES, HarnessError } from './errors.js';
+import { PLAN_REFUSALS } from './plans/refusal.js';
 
 /**
  * What the harness says of a failure it did not write (G-387 round 8): the
@@ -17,7 +18,9 @@ export function errorCode(error: unknown): string | null {
     if (!(error instanceof HarnessError)) return null;
     const code: unknown = error.code;
 
-    return typeof code === 'string' && ERROR_CODE.test(code) ? code : null;
+    // Only a code the harness itself defines (round 9): a code a host chose
+    // is not reported, whatever it looks like.
+    return typeof code === 'string' && HARNESS_CODES.has(code) ? code : null;
   } catch {
     return null;
   }
@@ -59,5 +62,5 @@ export function runFailure(error: unknown): string {
 /** What a reported class name may look like: an identifier, at most 64 characters. */
 const CLASS_NAME = /^[A-Za-z_$][A-Za-z0-9_$]{0,63}$/;
 
-/** What a reported harness error code may look like (`session_locked`, `plan.budget_context`). */
-const ERROR_CODE = /^[a-z][a-z0-9_.]{0,63}$/;
+/** The codes the harness defines (`session_locked`, `plan.budget_context`): the only ones a failure reports. */
+const HARNESS_CODES: ReadonlySet<string> = new Set<string>([...HARNESS_ERROR_CODES, ...Object.keys(PLAN_REFUSALS)]);

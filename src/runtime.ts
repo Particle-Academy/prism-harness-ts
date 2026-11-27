@@ -925,7 +925,10 @@ export class AgentRuntime {
     // A host context on a session that was never a child keeps the binding it
     // states for this turn; it is never saved. The rule is bindingRoute(),
     // the one the harness-plans corpus pins in every language.
-    const legacyBinding = tail?.binding == null ? null
+    // A child whose records a runner start left provisional (no task row,
+    // G-387 round 9) has NO binding: not its saved one, and not one its
+    // paused row carries, so it is refused below.
+    const legacyBinding = tail?.binding == null || await session.childStartUnconfirmed() ? null
       : { session: tail.binding.session, declared: tail.binding.declared, parentMode: tail.binding.parent_mode };
     const savedBinding = (await session.childBinding()) ?? legacyBinding;
     const route = bindingRoute(RunTrees.bindingContextKind(execution), execution?.binding != null, savedBinding !== null, (await session.childRefs()) !== null);
@@ -975,7 +978,8 @@ export class AgentRuntime {
     const unwatchPlan = steps !== undefined && stepping?.watchPlan === true ? await this.#watchPlan(session, steps) : () => {};
     try {
       // A runner start wrote the child's mode with its records (b).
-      await session.beginRun(runId, mode.name, provider, model, membership.tree, membership.depth);
+      // A runner start's run is provisional until its task row (round 9).
+      await session.beginRun(runId, mode.name, provider, model, membership.tree, membership.depth, started !== null);
     } catch (error) {
       // The run never began: a runner start is undone (its child records,
       // mode and holds), and it fails as before.
@@ -1128,8 +1132,15 @@ export class AgentRuntime {
         // call does not run after its tree was stopped or its time ran out
         // (the loop then stops the run before any model step), and the
         // decisions are left recorded for a later resume that can act.
+        //
+        // A RUNNER START acts on none of them (G-387 round 9): its gate only
+        // lets it start onto approvals nobody could answer, and a decision
+        // recorded on one since (or while an earlier binding was alive) is
+        // not this delegation's to act on. Its task row ends them: each
+        // pending call is recorded as not run, in the same write as the task.
         const outOfTime = turn.budget.maxSeconds !== null && turn.ledger.elapsedSeconds() >= turn.budget.maxSeconds;
-        if (!turn.ledger.cancelled && !outOfTime) offered = await this.#resolveApprovals(session, mode, offered, runId, called, scope?.legacy === true, steps, stepping?.locked === true);
+        const ended = started !== null ? await this.#endApprovals(session, mode, runId, steps) : [];
+        if (started === null && !turn.ledger.cancelled && !outOfTime) offered = await this.#resolveApprovals(session, mode, offered, runId, called, scope?.legacy === true, steps, stepping?.locked === true);
 
         if (prompt !== '') {
           // With attachments, the shape prism-ts's UserMessage.toObject() writes:
@@ -1140,9 +1151,19 @@ export class AgentRuntime {
               ? { type: 'user', content: prompt }
               : { type: 'user', content: prompt, additional_content: [...attachments, { text: prompt }], additional_attributes: {} };
 
-          await thread.record([message], runId);
+          await thread.record([...ended, message], runId);
         }
         taskRecorded = true;
+        // The task row CONFIRMS a runner start's records (round 9); clearing
+        // their provisional marks is housekeeping only, and its failure
+        // changes nothing.
+        if (started !== null) {
+          try {
+            await session.confirmChildStart(runId);
+          } catch {
+            // The task row is the authority; the marks read as confirmed.
+          }
+        }
 
         return this.#loop(session, mode, turn, runId, provider, model, offered, called, systemPrompt, schema, steps);
       });
@@ -1159,16 +1180,25 @@ export class AgentRuntime {
       // content-capture setting, so the run row, run state and event carry
       // a fixed description with the class name and harness code only; the
       // exception itself still reaches the caller.
+      //
+      // Cleanup FIRST, and nothing read from the error before it (round 9).
+      // A runner start that never recorded its task row is provisional: its
+      // records already read as absent, so the undo is housekeeping only and
+      // its failure changes nothing; its holds expire.
       if (started !== null && !taskRecorded) {
         try {
           await started.undo();
         } catch {
-          // The start's holds then expire; the failure below is the run's.
+          // Housekeeping only; the failure below is the run's.
         }
       }
       const failure = documentCode(error) ?? runFailure(error);
 
-      await session.failRun(runId, failure);
+      try {
+        await session.failRun(runId, failure);
+      } catch {
+        // The event is still emitted and the error still reaches the caller.
+      }
       this.#events?.emit({
         type: 'run.failed',
         runId,
@@ -1447,6 +1477,26 @@ export class AgentRuntime {
    * its decision says. The results are recorded as one tool result row holding
    * every result and decision for the turn, as the reference writes it.
    */
+  /**
+   * The rows a runner start's task row ends its child's pending calls with
+   * (G-387 round 9): each one NOT RUN, whatever decision is recorded on it.
+   * Nothing is invoked; the rows are written with the task row, in one write.
+   */
+  async #endApprovals(session: Session, mode: AgentMode, runId: string, steps?: RunStepTagger): Promise<JsonObject[]> {
+    const work = await this.#unresolved(session, mode);
+    if (work === null) return [];
+    const ended: ToolResultEntry[] = work.calls.map((call) => {
+      const input = { id: call.id, name: call.name, arguments: work.ambiguous.has(call.id) ? {} : call.arguments, resultId: call.result_id };
+      const entry = toolResultEntry(input, `Not run: ${call.name} was waiting on an approval when its delegation ended and a new task was given.`);
+      this.#toolDecision('tool_denied', session, runId, input, undefined, 'policy');
+      steps?.toolResult(call.id, entry.result, { ok: false, code: 'approval_denied', refused: true });
+
+      return entry;
+    });
+
+    return [toolResultRow([...work.results.values(), ...ended]) as unknown as JsonObject];
+  }
+
   async #resolveApprovals(
     session: Session,
     mode: AgentMode,
@@ -1867,7 +1917,9 @@ async function assertActionable(session: Session, rows: readonly JsonObject[], c
 async function actionability(session: Session, rows: readonly JsonObject[], context: RunContext | undefined, onlyDenials = false): Promise<{ reason: 'binding' | 'depth' | 'cancelled' | 'time'; depth: number } | null> {
   const execution = executionContext(context);
   const tail = RunTrees.contextKind(context) === 'runner' ? null : pausedRunState(rows);
-  const savedBinding = (await session.childBinding()) ?? tail?.binding ?? null;
+  // A provisional child record (G-387 round 9) has no binding, its paused
+  // row's included: a decision on it is refused.
+  const savedBinding = (await session.childBinding()) ?? (await session.childStartUnconfirmed() ? null : tail?.binding ?? null);
   const saved = await session.childRefs();
   const route = bindingRoute(RunTrees.bindingContextKind(execution), execution?.binding != null, savedBinding !== null, saved !== null);
   if (route.binding === 'refused') return { reason: 'binding', depth: 0 };
