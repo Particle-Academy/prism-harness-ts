@@ -129,8 +129,20 @@ export function toolResultRow(
  * calls a stopped step did run, the decisions, and the results written when the
  * run resumes. Rows are never rewritten, so all of them stay stored; shown to a
  * provider separately, a tool output would go twice. Folded, a result is keyed
- * by its tool call id and a decision by its approval id, and a later one
- * replaces an earlier one in the earlier one's position.
+ * by its call id, tool name and canonical arguments, occurrence by occurrence
+ * (G-403, the reference's fold), never by call id alone, and a decision by its
+ * approval id; a later one replaces an earlier one in the earlier one's
+ * position.
+ *
+ * EACH RESULT ONCE, IN ITS OWN SEGMENT (BRIEF-R14 item 5, the reference's
+ * rule, pinned by thr-0017): a step's segment is every row after it up to
+ * the next assistant row with tool calls, and its result rows need not be
+ * consecutive. A resolution recorded after a row of another kind (a host's
+ * system row) carries the step's earlier results again. A later run of the
+ * segment therefore leaves out every result (same key, same occurrence) and
+ * decision an earlier run of it already replayed; the first one stands where
+ * it was. A run left with nothing is not replayed at all (a run that was
+ * empty to begin with is replayed as before).
  *
  * This is the REPLAY view, pinned by the harness-thread-rows corpus. What a
  * decision means for running a call is read from the stored rows instead, by
@@ -138,22 +150,121 @@ export function toolResultRow(
  */
 export function threadView(rows: readonly JsonObject[]): JsonObject[] {
   const view: JsonObject[] = [];
+  // The consecutive tool result rows not yet replayed, and what the current
+  // segment has replayed: by result key, how many; by approval id.
+  let run: ToolResultRow[] = [];
+  let replayed = new Map<string, number>();
+  let decided = new Set<string>();
+  const flush = (): void => {
+    if (run.length === 0) return;
+    const merged = unreplayed(run.reduce((earlier, later) => fold(earlier, later)), replayed, decided);
+    if (merged !== null) view.push(merged);
+    run = [];
+  };
 
   for (const row of rows) {
     const normalised = normalise(row, view);
 
     if (normalised === null) continue;
 
-    const previous = view.at(-1);
-
-    if (normalised.type === 'tool_result' && previous?.type === 'tool_result') {
-      view[view.length - 1] = fold(previous as ToolResultRow, normalised as ToolResultRow);
-    } else {
-      view.push(normalised);
+    if (normalised.type === 'tool_result') {
+      run.push(normalised as ToolResultRow);
+      continue;
     }
+
+    flush();
+    if (normalised.type === 'assistant' && list(normalised.tool_calls).length > 0) {
+      // A new step: a new segment.
+      replayed = new Map();
+      decided = new Set();
+    }
+    view.push(normalised);
   }
+  flush();
 
   return view;
+}
+
+/**
+ * A later row's result replaces only the SAME result (resultKey), occurrence
+ * by occurrence: the k-th with a key in the later row replaces the k-th with
+ * that key so far, in its position; any other is added after (TS 0.11.x #83).
+ */
+function fold(earlier: ToolResultRow, later: ToolResultRow): ToolResultRow {
+  const results = [...earlier.tool_results];
+  const keys = results.map(resultKey);
+  const seen = new Map<string, number>();
+  for (const entry of later.tool_results) {
+    const key = resultKey(entry);
+    const occurrence = seen.get(key) ?? 0;
+    seen.set(key, occurrence + 1);
+    let at = -1;
+    for (let index = 0, found = 0; index < keys.length; index += 1) {
+      if (keys[index] !== key) continue;
+      if (found === occurrence) { at = index; break; }
+      found += 1;
+    }
+    if (at === -1) { results.push(entry); keys.push(key); } else results[at] = entry;
+  }
+  const decisions = new Map<string, ApprovalDecisionEntry>();
+  for (const entry of [...earlier.tool_approval_responses, ...later.tool_approval_responses]) decisions.set(entry.approval_id, entry);
+
+  return toolResultRow(results, [...decisions.values()]);
+}
+
+/**
+ * `row` without what its segment already replayed, or null when that leaves
+ * nothing of a row that held something. Records what it replays now.
+ */
+function unreplayed(row: ToolResultRow, replayed: Map<string, number>, decided: Set<string>): ToolResultRow | null {
+  if (row.tool_results.length === 0 && row.tool_approval_responses.length === 0) return row;
+  const seen = new Map<string, number>();
+  const results: ToolResultEntry[] = [];
+  for (const entry of row.tool_results) {
+    const key = resultKey(entry);
+    seen.set(key, (seen.get(key) ?? 0) + 1);
+    if (seen.get(key)! > (replayed.get(key) ?? 0)) results.push(entry);
+  }
+  for (const [key, count] of seen) replayed.set(key, Math.max(replayed.get(key) ?? 0, count));
+  const decisions: ApprovalDecisionEntry[] = [];
+  for (const entry of row.tool_approval_responses) {
+    if (decided.has(entry.approval_id)) continue;
+    decided.add(entry.approval_id);
+    decisions.push(entry);
+  }
+  if (results.length === row.tool_results.length && decisions.length === row.tool_approval_responses.length) return row;
+
+  return results.length === 0 && decisions.length === 0 ? null : toolResultRow(results, decisions);
+}
+
+/**
+ * Which result an entry is, for folding (G-403, as the reference and TS
+ * 0.11.x fold): its call id and tool name, each length-prefixed, and its
+ * arguments as canonical JSON. Two calls that share an id but not their tool
+ * or their arguments are two results.
+ */
+function resultKey(entry: ToolResultEntry): string {
+  const known = KEYS.get(entry);
+  if (known !== undefined) return known;
+  const key = `${entry.tool_call_id.length}:${entry.tool_call_id}${entry.tool_name.length}:${entry.tool_name}${sortedJson(entry.args)}`;
+  KEYS.set(entry, key);
+
+  return key;
+}
+
+/** Each entry's key, computed once: arguments can be large, and a fold asks more than once. */
+const KEYS = new WeakMap<ToolResultEntry, string>();
+
+/**
+ * JSON with every object's keys in sorted order (UTF-16 code units, as
+ * canonical JSON sorts them), by the engine's own serialiser: the same
+ * equality as canonical JSON for stored arguments, in one pass and without
+ * an intermediate string per element (a call's arguments may be very large).
+ */
+function sortedJson(value: unknown): string {
+  return JSON.stringify(value, (_key, item: unknown) => (typeof item === 'object' && item !== null && !Array.isArray(item)
+    ? Object.fromEntries(Object.keys(item).sort().map((key) => [key, (item as Record<string, unknown>)[key]]))
+    : item)) ?? 'null';
 }
 
 /**
@@ -237,13 +348,17 @@ export function approvalToolScope(rows: readonly JsonObject[]): { names: string[
  *
  * Read from the stored rows, newest first. A user turn, or an assistant step
  * that asked nothing, ends the scope: nothing before it is pending. An id
- * answered once is no longer pending.
+ * answered once is no longer pending, and neither is one a harness mark
+ * answered (a replaced step's denial, a start's ended row).
  */
 export function pendingApprovalIds(rows: readonly JsonObject[]): string[] {
   // The paused step (G-397); its answers are read from the rows after it.
   const step = pausedStepIndex(rows);
   if (step === null) return [];
-  const answered = new Set<string>();
+  // An approval a harness mark answered is not pending (G-404, BRIEF-R14):
+  // a replaced step's denial or a start's ended row, each read within its
+  // own request's turn, as every other reader reads them.
+  const answered = new Set<string>([...supersededApprovals(rows), ...endedByStart(rows)]);
   for (const later of rows.slice(step + 1)) {
     if (later.type !== 'tool_result') continue;
     for (const response of list(later.tool_approval_responses)) {
@@ -776,7 +891,7 @@ export function pairStepApprovals(
  * within one step, and an ungated call's result (or the immediate result of
  * a call with unusable arguments) must not make a gated call sharing its id
  * look finished. Read from EVERY result row after the step, up to the next
- * assistant row (G-399), as stored (the replay view folds results by id).
+ * assistant row (G-399), as stored (the replay view folds copies away).
  * Each result pairs with the first call without one that has its id, its
  * tool name and its arguments; then its id and name; then its id.
  *
@@ -786,6 +901,11 @@ export function stepResultsByPosition(rows: readonly JsonObject[], index: number
   const calls = list(rows[index]?.tool_calls);
   const has = calls.map(() => false);
   const args = calls.map((call) => JSON.stringify(usableArguments(call.arguments) ?? {}));
+  // A result an EARLIER row of the step already holds (a copy: the same id,
+  // tool, arguments and result) answers nothing new (TS I-1, as 0.11.x reads
+  // it): the resolution row carries the step's earlier results, and a copy
+  // must never claim another open call that shares its id.
+  const prints = new Set<string>();
   // EVERY tool_result row after the step, up to the next assistant row
   // (G-399): a row of another kind between them hides nothing.
   for (const row of rows.slice(index + 1)) {
@@ -795,14 +915,19 @@ export function stepResultsByPosition(rows: readonly JsonObject[], index: number
     if (row.type !== 'tool_result' || isReplacedStepRow(row)) continue;
     const entries = Array.isArray(row.tool_results) ? list(row.tool_results)
       : Object.hasOwn(row, 'tool_call_id') ? [{ tool_call_id: row.tool_call_id ?? null, tool_name: row.name ?? null }] : [];
+    const added: string[] = [];
     for (const entry of entries) {
       const id = text(entry.tool_call_id);
+      const print = sortedJson([id, text(entry.tool_name), isObject(entry.args) ? entry.args : {}, text(entry.result)]);
+      if (prints.has(print)) continue;
+      added.push(print);
       const open = (position: number): boolean => !has[position] && text(calls[position]!.id) === id;
       let at = calls.findIndex((call, position) => open(position) && call.name === entry.tool_name && args[position] === JSON.stringify(isObject(entry.args) ? entry.args : {}));
       if (at === -1) at = calls.findIndex((call, position) => open(position) && call.name === entry.tool_name);
       if (at === -1) at = calls.findIndex((_call, position) => open(position));
       if (at !== -1) has[at] = true;
     }
+    for (const print of added) prints.add(print);
   }
 
   return has;
@@ -945,16 +1070,6 @@ function normalise(row: JsonObject, view: JsonObject[]): JsonObject | null {
     default:
       return row;
   }
-}
-
-function fold(earlier: ToolResultRow, later: ToolResultRow): ToolResultRow {
-  const results = new Map<string, ToolResultEntry>();
-  const decisions = new Map<string, ApprovalDecisionEntry>();
-
-  for (const entry of [...earlier.tool_results, ...later.tool_results]) results.set(entry.tool_call_id, entry);
-  for (const entry of [...earlier.tool_approval_responses, ...later.tool_approval_responses]) decisions.set(entry.approval_id, entry);
-
-  return toolResultRow([...results.values()], [...decisions.values()]);
 }
 
 function decision(value: JsonObject): ApprovalDecisionEntry {

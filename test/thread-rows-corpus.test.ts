@@ -99,7 +99,7 @@ describe('harness-thread-rows corpus', () => {
   }
 
   it('is the whole suite, not a subset someone trimmed to green', () => {
-    expect(corpus.cases).toHaveLength(15);
+    expect(corpus.cases).toHaveLength(17);
   });
 
   it.each(corpus.cases.map((testCase) => [testCase.id, testCase] as const))('%s stores and replays the rows the corpus records for this port', (_id, testCase) => {

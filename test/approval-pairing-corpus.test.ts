@@ -33,7 +33,7 @@ interface PairingCase {
   calls: { id: string; name: string; args: JsonObject }[];
   rounds: [number, boolean][][];
   /** DECISION B (0.2.0): what supersedes the parked step, after the park and before the rounds. */
-  supersede?: 'assistant_tool_step' | 'assistant_text' | 'user' | 'user_owning_run_id' | 'new_message';
+  supersede?: 'assistant_tool_step' | 'assistant_text' | 'user' | 'user_owning_run_id' | 'new_message' | 'new_message_failed';
   /**
    * SEGMENT OWNERSHIP (0.2.0, round 13b): a later step a host records after
    * the park, each echo call asking its own approval (`apr_later_<k>`, k
@@ -78,6 +78,8 @@ async function record(row: PairingCase): Promise<unknown> {
   let step = 0;
   const client = async (): Promise<LlmResponse> => {
     step += 1;
+    // apr-0023 (0.3.0): the provider fails the new message's request.
+    if (step === 2 && row.supersede === 'new_message_failed') throw new Error('The provider is unavailable (scripted).');
     return step === 1
       ? { text: '', finishReason: 'tool_calls', toolCalls: row.calls.map((call) => ({ id: call.id, name: call.name, arguments: call.args })) }
       : { text: 'done', finishReason: 'stop' };
@@ -99,6 +101,8 @@ async function record(row: PairingCase): Promise<unknown> {
   // A caller passing the parked step's OWN run id: a run id a caller passes is always outside (UPDATE 3).
   if (row.supersede === 'user_owning_run_id') await session.thread().record([{ type: 'user', content: 'A later message.' }], parked.runId);
   if (row.supersede === 'new_message') await runtime.send(session, 'Something else.');
+  // A new message whose turn then FAILS (G-404): it still supersedes, its message and denials one write before the request.
+  if (row.supersede === 'new_message_failed') await runtime.send(session, 'Something else.').catch(() => undefined);
   const later = row.later;
   const laterIds: string[] = [];
   if (later !== undefined) {

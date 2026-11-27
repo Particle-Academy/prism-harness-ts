@@ -14,7 +14,8 @@ import {
   type RunStep,
   type Session,
 } from '../src/index.js';
-import { ARGUMENTS_AS_SENT, assistantRow, toolResultEntry, toolResultRow } from '../src/thread-rows.js';
+import { ARGUMENTS_AS_SENT, assistantRow, threadView, toolResultEntry, toolResultRow } from '../src/thread-rows.js';
+import { canonicalJson } from '../src/tool-policy.js';
 
 // G-392 QC: property tests for the approval pairing invariants.
 //
@@ -518,7 +519,14 @@ function rig(c: Case): Rig {
   const client = async (request: LlmRequest): Promise<LlmResponse> => {
     if (!served) {
       served = true;
-      return { text: '', finishReason: 'tool_calls', toolCalls: c.calls.map((call) => ({ id: call.id, name: call.tool, arguments: { n: call.token } })) };
+      // G-405: an ANTHROPIC-shaped step keeps the model's text beside its
+      // tool calls; on a structured turn that text is a bad-typed document
+      // (and a client that parsed it hands it over), which a parked
+      // structured response must never return.
+      const toolCalls = c.calls.map((call) => ({ id: call.id, name: call.tool, arguments: { n: call.token } }));
+      return request.schema === undefined
+        ? { text: '', finishReason: 'tool_calls', toolCalls }
+        : { text: '{"ok":"not a boolean"}', structured: { ok: 'not a boolean' }, finishReason: 'tool_calls', toolCalls };
     }
     if (failing) {
       failing = false;
@@ -617,6 +625,8 @@ async function runCase(c: Case): Promise<void> {
   if (c.source === 'model') {
     const parked = await turn(r, c.initial, 'go');
     check(parked.response.finishReason === 'awaiting_approval', 'the step parks for a person', parked.response.finishReason);
+    // G-405: a parked structured turn carries NO document, whatever the step's text held.
+    if (c.initial === 'structured') check((parked.response as { structured?: unknown }).structured === null, 'G-405: a parked structured response has no document', (parked.response as { structured?: unknown }).structured);
     // Invariant 6: what the runtime reports as pending is one approval per
     // gated call, in call order, each its own id, each naming its own call.
     const pending = parked.response.pendingApprovals;
@@ -772,6 +782,7 @@ async function runCase(c: Case): Promise<void> {
   }
 
   await settledOutcomes(r, c, oracle, '5');
+  await replayShowsEachResultOnce(r.session, '7');
 
   // Repeat resumes, with later decisions in between: nothing runs twice and
   // no outcome changes.
@@ -788,6 +799,49 @@ async function runCase(c: Case): Promise<void> {
   check(r.freeRan.length === c.calls.filter((call) => call.tool === 'free').length || c.source === 'stored', '3: an ungated call runs once', r.freeRan);
   if (c.source === 'stored') check(r.freeRan.length === 0, 'a stored ungated call with a result never runs', r.freeRan);
   await settledOutcomes(r, c, oracle, '5 (after repeat resumes)');
+  await replayShowsEachResultOnce(r.session, '7 (after repeat resumes)');
+}
+
+/**
+ * Invariant 7 on the replay the model is shown (G-403, BRIEF-R14 items 2 and
+ * 5): in each step's segment, every result the thread stores is in the
+ * replay view (by its id, tool name and canonical arguments, as often as it
+ * occurs in one stored row: TS 0.11.x #83's replayKeepsEveryResult), and
+ * NONE is emitted more often than that across the whole replay: a result
+ * stored in two non-consecutive rows of one segment (a carried copy after a
+ * row of another kind, a resolution row after a new message) is shown once,
+ * in its own segment.
+ */
+async function replayShowsEachResultOnce(session: Session, label: string): Promise<void> {
+  const stored = await rows(session);
+  const isStep = (row: JsonObject): boolean => row.type === 'assistant' && Array.isArray(row.tool_calls) && row.tool_calls.length > 0;
+  const segments = (list: JsonObject[], view: boolean): Map<string, number>[] => {
+    const out: Map<string, number>[] = [new Map()];
+    for (const row of list) {
+      if (isStep(row)) { out.push(new Map()); continue; }
+      if (row.type !== 'tool_result' || row.harness_replaced_step !== undefined) continue;
+      // Per stored row, the most often a result occurs in one row; per view row, as shown.
+      const here = new Map<string, number>();
+      for (const entry of (row.tool_results as JsonObject[] | undefined) ?? []) {
+        const key = canonicalJson([entry.tool_call_id, entry.tool_name, entry.args]);
+        here.set(key, (here.get(key) ?? 0) + 1);
+      }
+      const segment = out.at(-1)!;
+      for (const [key, count] of here) segment.set(key, view ? (segment.get(key) ?? 0) + count : Math.max(segment.get(key) ?? 0, count));
+    }
+    return out;
+  };
+  const want = segments(stored, false);
+  const got = segments(threadView(stored), true);
+  check(got.length === want.length, `${label}: the replay view keeps every step`, { stored: want.length, shown: got.length });
+  want.forEach((segment, at) => {
+    for (const [key, count] of segment) {
+      const shown = got[at]?.get(key) ?? 0;
+      check(shown >= count, `${label}: the replay view keeps every result of a step, by id, name and arguments`, { step: at, key, stored: count, shown });
+      check(shown <= count, `${label}: the replay view shows a result once, in its own segment`, { step: at, key, stored: count, shown });
+    }
+    for (const key of (got[at] ?? new Map<string, number>()).keys()) check(segment.has(key), `${label}: the replay view shows no result outside its own segment`, { step: at, key });
+  });
 }
 
 /** Invariants 5 and 6 on the thread rows: every call has exactly one outcome, the oracle's. */
@@ -919,7 +973,8 @@ describe('G-392 property: approval pairing invariants over generated steps', () 
   // property test), kept as fixed regression cases in every language:
   // (a) a gated call got no outcome, (b) a call got an extra repeated-id
   // denial, (c) a request paired with an ungated call.
-  it.each([2034523272, 232174035, 2060958372])('regression seed %i', async (seed) => {
+  // 2483776628: the round-13 TS review's replay seed (G-403: a result dropped from the replay).
+  it.each([2034523272, 232174035, 2060958372, 2483776628])('regression seed %i', async (seed) => {
     const why = await failure(generate(seed));
     expect(why).toBeNull();
   });
@@ -984,6 +1039,14 @@ describe('G-392 property: approval pairing invariants over generated steps', () 
       expect(has((c) => c.insert?.cross === true && c.insert.when === when && forgedTarget(c) === null), `cross-segment forged result answering nothing ${when}`).toBe(true);
     }
     expect(has((c) => c.insert?.cross === true && forgedTarget(c) !== null && c.later!.requests.some((q) => q.call === forgedTarget(c)!.index && q.verdict === 'approve')), 'cross-segment forged result answering an APPROVED later call').toBe(true);
+    // G-403: a step with repeated ids whose results carry different arguments (TS 0.11.x #83's coverage line).
+    expect(has((c) => c.calls.some((call, i) => c.calls.some((other, j) => j !== i && other.id === call.id && other.token !== call.token
+      && (call.tool === 'free' || c.prior.includes(i))))), 'repeated ids, results with different arguments').toBe(true);
+    // Item 5: a row of another kind between an ungated call's result and the resolution row that carries it.
+    expect(has((c) => c.source === 'model' && c.calls.some((call) => call.tool === 'free') && (c.insert?.kind === 'system' || c.insert?.kind === 'tool_empty')
+      && c.insert.when === 'after_decision' && expected(c).runs.size > 0), 'item 5: a carried copy after a row of another kind').toBe(true);
+    // G-405: a structured turn that parks (its step's text a bad-typed document).
+    expect(has((c) => c.source === 'model' && c.initial === 'structured'), 'G-405: a parked structured turn').toBe(true);
     // G-397: stored requests that repeat an APPROVAL id, with an approval recorded.
     expect(has((c) => c.requests.some((q) => q.approval !== undefined) && c.requests.some((q) => q.verdict === 'approve')), 'repeated approval id').toBe(true);
   });

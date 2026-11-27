@@ -20,7 +20,7 @@ import {
   type LlmResponse,
   type ModeConfig,
 } from '../src/index.js';
-import { endedByStart, pausedApprovalIds } from '../src/thread-rows.js';
+import { endedByStart, pausedApprovalIds, supersededApprovals } from '../src/thread-rows.js';
 import { approvalDecisions, pendingApprovalCalls } from '../src/plans/thread.js';
 import { activeTurn } from '../src/runtime.js';
 
@@ -218,6 +218,8 @@ class Rig {
   failChild = false;
   /** How many times `echo` ran. */
   echoed = 0;
+  /** Run once inside the echo tool, while the approved call runs (round 14). */
+  duringEcho: (() => Promise<void>) | null = null;
   #call = 0;
 
   constructor() {
@@ -231,7 +233,14 @@ class Rig {
         work: { system_prompt: 'Work.', tools: ['*'], max_steps: 8, requires_approval: ['echo', 'danger'], plans: true } as ModeConfig,
       },
     });
-    this.registry = new ToolRegistry().register({ name: 'echo', handle: () => { this.echoed += 1; return 'ok'; } });
+    this.registry = new ToolRegistry().register({ name: 'echo', handle: async () => {
+      this.echoed += 1;
+      // Round 14: an action taken WHILE the approved call runs (once).
+      const hook = this.duringEcho;
+      this.duringEcho = null;
+      if (hook !== null) await measuring.run(true, hook);
+      return 'ok';
+    } });
     // A host provider that offers `probe` to every child, and `danger` only
     // to a session whose mode is not the child's own (`work`): a reader that
     // reports the wrong mode shows in the offer.
@@ -813,3 +822,88 @@ describe('G-387 round 13: the matrix, extended (item 6) and the mixed repeated r
     expect((await endedRowOf(r))?.harness_ended_by_start).toEqual({ approval_ids: [parked] });
   });
 });
+
+/*
+ * Round 14 (BRIEF-R14 item 1, G-404): the CONCURRENT SUPERSEDE action. A
+ * person approved the child's parked call; a host resumes the child outside
+ * the runner; WHILE the approved call runs, from a fresh Session:
+ *   host_record  a host thread().record() of a superseding row (user, text,
+ *                or an assistant step with tool calls)
+ *   new_message  a new message (send with a prompt, no context): refused
+ *                `run_not_permitted` before it writes anything, because the
+ *                resumed turn holds the child's run tree; `waited+` would
+ *                prefix it had it reached its write and waited on the
+ *                resolution (the root case is review-r14's PR2)
+ *   approval     a decision on the same approval (it waits on the session
+ *                lock; its answer once the call has its result)
+ * Measured after: the call's outcomes (exactly one, its real result), how
+ * often it ran, and whether any reader takes it for replaced.
+ */
+export const EXPECTED_R14: Record<string, Record<string, string>> = {
+  user: { host_record: 'session_locked', new_message: 'run_not_permitted', approval: ENDED, outcomes: 'ok', echoed: '1', superseded: 'no', decided: 'approved' },
+  assistant_text: { host_record: 'session_locked', new_message: 'run_not_permitted', approval: ENDED, outcomes: 'ok', echoed: '1', superseded: 'no', decided: 'approved' },
+  assistant_tool_step: { host_record: 'session_locked', new_message: 'run_not_permitted', approval: ENDED, outcomes: 'ok', echoed: '1', superseded: 'no', decided: 'approved' },
+};
+
+describe('G-387 round 14: the matrix, extended with a concurrent supersede (G-404)', () => {
+  for (const kind of Object.keys(EXPECTED_R14)) {
+    it(`a host resumes an approved child; while its call runs: a host ${kind} row, a new message and a decision`, async () => {
+      const r = new Rig();
+      await r.session().usingMode('lead');
+      await r.delegate('First task', () => r.calls([['echo', { n: 1 }]]));
+      const parked = (await r.approvals()).pop()!;
+      expect(await approve(r.child(), parked)).toBe('accepted');
+
+      // Who asks for the session lock while it is held (it will wait), by actor.
+      const queued = new Set<string>();
+      let held = 0;
+      const lock = Session.prototype.lock;
+      vi.spyOn(Session.prototype, 'lock').mockImplementation(async function (this: Session, callback: never, ttl?: number, wait?: number) {
+        const who = acting.getStore();
+        if (who !== undefined && held > 0) { queued.add(who); for (const wake of wakers.splice(0)) wake(); }
+        return lock.call(this, (async (live: Session) => {
+          held += 1;
+          try { return await (callback as (session: Session) => Promise<unknown>)(live); } finally { held -= 1; }
+        }) as never, ttl, wait);
+      } as never);
+      const wakers: (() => void)[] = [];
+      const until = async (done: () => boolean): Promise<void> => { while (!done()) await new Promise<void>((resolve) => wakers.push(resolve)); };
+
+      const row: JsonObject = kind === 'user' ? { type: 'user', content: 'Host row.' }
+        : kind === 'assistant_text' ? { type: 'assistant', content: 'Host answer.', tool_calls: [], tool_approval_requests: [] }
+          : { type: 'assistant', content: '', tool_calls: [{ id: 'later', name: 'probe', arguments: {} }], tool_approval_requests: [] };
+      const got: Record<string, string> = {};
+      let message: Promise<string> | null = null;
+      let decision: Promise<string> | null = null;
+      let messageDone = false;
+      let decisionDone = false;
+      r.duringEcho = async () => {
+        got.host_record = await r.child().thread().record([row]).then(() => 'recorded', code);
+        message = acting.run('message', () => turn(r, r.child(), 'More work.'));
+        void message.then(() => { messageDone = true; for (const wake of wakers.splice(0)) wake(); });
+        await until(() => queued.has('message') || messageDone);
+        got.new_message = queued.has('message') ? 'waited+' : '';
+        decision = acting.run('decision', () => approve(r.child(), parked));
+        void decision.then(() => { decisionDone = true; for (const wake of wakers.splice(0)) wake(); });
+        await until(() => queued.has('decision') || decisionDone);
+      };
+      r.text('Resumed.');
+      await r.runtime.send(r.child(), '');
+      got.new_message = `${got.new_message}${await message!}`;
+      got.approval = await decision!;
+      vi.restoreAllMocks();
+
+      const rows = (await r.child().thread().messages()).map((entry) => entry.message);
+      const echo = rows.filter((candidate) => candidate.type === 'tool_result').flatMap((candidate) => candidate.tool_results as JsonObject[])
+        .filter((entry) => entry.tool_name === 'echo');
+      got.outcomes = [...new Set(echo.map((entry) => JSON.stringify([entry.tool_call_id, entry.result])))].map((entry) => JSON.parse(entry)[1]).join(',');
+      got.echoed = String(r.echoed);
+      got.superseded = supersededApprovals(rows).has(parked) || endedByStart(rows).has(parked) ? 'yes' : 'no';
+      got.decided = approvalDecisions(rows).get(parked) === true ? 'approved' : 'not approved';
+      expect(got).toEqual(EXPECTED_R14[kind]);
+    });
+  }
+});
+
+/** Who is acting, for the lock signals of the round-14 matrix rows. */
+const acting = new AsyncLocalStorage<string>();
