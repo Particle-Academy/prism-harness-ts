@@ -21,7 +21,7 @@ export interface RecordOptions {
    * pending check is one step with its write, whoever else writes the thread.
    */
   guard?: (rows: readonly JsonObject[]) => void;
-  /** The resolver's in-flight claim this write settles: cleared with it. */
+  /** The resolver's in-flight claim this write settles: cleared right after it. */
   settles?: string;
 }
 import type { AppendLogStore, SessionStore } from './stores/session-store.js';
@@ -127,18 +127,15 @@ export class Thread {
         const full = kept === false && opts.guard === undefined ? [] : (await store.readLog(this.key)) ?? [];
         opts.guard?.(full.map((entry) => this.#toMessage(entry).message));
         const tail = openTail(full).map((entry) => this.#toMessage(entry));
-        const appended = this.#entries(planned(tail, messages, inRun, forced, liveClaim(payload, this.key)), length, runId);
+        const appended = this.#entries(planned(tail, messages, inRun, forced, await this.#claimFor(tail, messages, inRun, forced)), length, runId);
         if (appended.length > 0) await store.appendLog(this.key, appended);
         // With nothing open before, an open step can only be one just appended.
         const next = openTail(kept === false ? appended : [...full, ...appended]);
         const open = next.length === 0 ? false : (next[0]!.position as number);
-        const settled = settlesClaim(payload, opts.settles);
-        if (kept !== open || settled) {
-          // The claim this write settles is cleared with the open-step fact.
-          const current = (await store.get(this.key)) ?? {};
-          const { [IN_FLIGHT_KEY]: _claim, ...rest } = current;
-          await store.put(this.key, { ...(settled ? rest : current), [OPEN_STEP_KEY]: { v: 1, open } });
+        if (kept !== open) {
+          await store.put(this.key, { ...((await store.get(this.key)) ?? {}), [OPEN_STEP_KEY]: { v: 1, open } });
         }
+        await this.#settle(opts.settles);
 
         return appended.map((entry) => this.#toMessage(entry));
       });
@@ -150,18 +147,36 @@ export class Thread {
       const rows = existing.map((entry) => this.#toMessage(entry));
       opts.guard?.(rows.map((entry) => entry.message));
 
-      const appended = this.#entries(planned(rows, messages, inRun, forced, liveClaim(stored, this.key)), existing.length, runId);
+      const appended = this.#entries(planned(rows, messages, inRun, forced, await this.#claimFor(rows, messages, inRun, forced)), existing.length, runId);
       if (appended.length === 0) return [];
 
-      // The claim this write settles goes in the SAME write as the results.
-      const { [IN_FLIGHT_KEY]: _claim, ...rest } = stored;
       await store.put(this.key, {
-        ...(settlesClaim(stored, opts.settles) ? rest : stored),
+        ...stored,
         messages: [...existing, ...appended] as unknown as JsonValue[],
       });
+      await this.#settle(opts.settles);
 
       return appended.map((entry) => this.#toMessage(entry));
     });
+  }
+
+  /** Where this thread's in-flight claim is kept: a key of its own, so claiming never rewrites the rows. */
+  #claimKey(): string {
+    return `${this.key}:in-flight`;
+  }
+
+  /** The live claim, read only when the batch would supersede the paused step (the only write it can refuse). */
+  async #claimFor(existing: readonly ThreadMessage[], messages: readonly JsonObject[], inRun: string | null, forced: boolean): Promise<Claim | null> {
+    if (supersedingAt(existing, messages, inRun, forced) === -1) return null;
+
+    return liveClaim(await this.store.get(this.#claimKey()), this.key);
+  }
+
+  /** Clear the claim `token` names, right after the write that records its results. */
+  async #settle(token: string | undefined): Promise<void> {
+    if (token === undefined) return;
+    const claim = await this.store.get(this.#claimKey());
+    if (claim !== null && claim.token === token) await this.store.forget(this.#claimKey());
   }
 
   /**
@@ -174,7 +189,8 @@ export class Thread {
    * or answered since it was read), and then nothing may run. The claim
    * expires after `ttlSeconds` (the session lock's own ttl), so a resolver
    * that died leaves nothing refusing for longer than its lock would have.
-   * Cleared by the write that records the results (`settles`), or by
+   * Kept under a key of its own (never rewriting the rows). Cleared right
+   * after the write that records the results (`settles`), or by
    * releaseInFlight().
    *
    * @internal Called by the runtime's resolver, holding the session lock.
@@ -184,12 +200,12 @@ export class Thread {
 
     return store.withLock(this.key, async () => {
       const log = supportsAppendLog(store) ? await store.readLog(this.key) : null;
-      const payload = (await store.get(this.key)) ?? {};
+      const payload = log === null ? (await store.get(this.key)) ?? {} : {};
       const entries = (log ?? (Array.isArray(payload.messages) ? payload.messages.filter(isJsonObject) : [])).map((entry) => this.#toMessage(entry));
       const rows = entries.map((entry) => entry.message);
       const step = pausedStepIndex(rows);
       if (step === null || entries[step]!.position !== position || supersededRow(rows) === null) return false;
-      await store.put(this.key, { ...payload, [IN_FLIGHT_KEY]: { v: 1, position, token, until: Date.now() + ttlSeconds * 1000 } });
+      await store.put(this.#claimKey(), { v: 1, position, token, until: Date.now() + ttlSeconds * 1000 }, Math.max(1, Math.ceil(ttlSeconds)));
 
       return true;
     });
@@ -197,13 +213,7 @@ export class Thread {
 
   /** Drop the claim `token` names, if it is still the one held. @internal */
   async releaseInFlight(token: string): Promise<void> {
-    const store = this.store;
-    await store.withLock(this.key, async () => {
-      const payload = await store.get(this.key);
-      if (payload === null || !settlesClaim(payload, token)) return;
-      const { [IN_FLIGHT_KEY]: _claim, ...rest } = payload;
-      await store.put(this.key, rest);
-    });
+    await this.store.withLock(this.key, async () => { await this.#settle(token); });
   }
 
   /**
@@ -231,6 +241,7 @@ export class Thread {
     const store = this.store;
 
     await store.withLock(this.key, async () => {
+      await store.forget(this.#claimKey());
       if (supportsAppendLog(store)) await store.clearLog(this.key);
       const stored = await store.get(this.key);
       if (stored !== null) {
@@ -322,19 +333,8 @@ export function recordingInRun<T>(runId: string, record: () => T): T {
  */
 function planned(existing: readonly ThreadMessage[], messages: readonly JsonObject[], inRun: string | null, forced: boolean, claim: Claim | null): JsonObject[] {
   const rows = existing.map((entry) => entry.message);
-  // The paused step, by the one selector (G-397), and the runs that own it:
-  // the run that recorded it and every run that recorded one of its results.
   const step = pausedStepIndex(rows);
-  const owners = new Set<string>();
-  if (step !== null) {
-    const own = existing[step]!.runId;
-    if (own !== null) owners.add(own);
-    for (const entry of existing.slice(step + 1)) {
-      if (entry.message.type === 'tool_result' && entry.runId !== null && Array.isArray(entry.message.tool_results) && entry.message.tool_results.length > 0) owners.add(entry.runId);
-    }
-  }
-  const outside = forced || inRun === null || !owners.has(inRun);
-  const at = messages.findIndex((message) => supersedes(message, outside));
+  const at = supersedingAt(existing, messages, inRun, forced);
   if (at === -1) return [...messages];
   // A resolution is running this step's approved calls (G-404): a write that
   // would supersede it is refused, and nothing of the batch is written.
@@ -347,27 +347,38 @@ function planned(existing: readonly ThreadMessage[], messages: readonly JsonObje
 }
 
 /**
- * Where a thread keeps a resolution's in-flight claim (G-404), beside its
- * rows: `{v: 1, position, token, until}`, the paused step a resolver is
- * running approved calls of, until when.
+ * The index in `messages` of the first row that supersedes the paused step
+ * of `existing`, or -1 (DECISION B, the rule planned() writes the denial by).
+ * The paused step, by the one selector (G-397), and the runs that own it:
+ * the run that recorded it and every run that recorded one of its results.
  */
-const IN_FLIGHT_KEY = 'harness_in_flight';
+function supersedingAt(existing: readonly ThreadMessage[], messages: readonly JsonObject[], inRun: string | null, forced: boolean): number {
+  const step = pausedStepIndex(existing.map((entry) => entry.message));
+  const owners = new Set<string>();
+  if (step !== null) {
+    const own = existing[step]!.runId;
+    if (own !== null) owners.add(own);
+    for (const entry of existing.slice(step + 1)) {
+      if (entry.message.type === 'tool_result' && entry.runId !== null && Array.isArray(entry.message.tool_results) && entry.message.tool_results.length > 0) owners.add(entry.runId);
+    }
+  }
+  const outside = forced || inRun === null || !owners.has(inRun);
 
-type Claim = { key: string; position: number };
-
-/** The live claim in a thread payload, or null (absent, malformed or expired). */
-function liveClaim(payload: JsonObject, key: string): Claim | null {
-  const claim = payload[IN_FLIGHT_KEY];
-  if (!isJsonObject(claim) || claim.v !== 1 || typeof claim.position !== 'number' || typeof claim.until !== 'number') return null;
-
-  return claim.until > Date.now() ? { key, position: claim.position } : null;
+  return messages.findIndex((message) => supersedes(message, outside));
 }
 
-/** Whether `token` names the claim the payload holds. */
-function settlesClaim(payload: JsonObject, token: string | undefined): boolean {
-  const claim = payload[IN_FLIGHT_KEY];
+/**
+ * A resolution's in-flight claim (G-404), kept under the thread's own
+ * `:in-flight` key: `{v: 1, position, token, until}`, the paused step a
+ * resolver is running approved calls of, until when.
+ */
+type Claim = { key: string; position: number };
 
-  return token !== undefined && isJsonObject(claim) && claim.token === token;
+/** The live claim, or null (absent, malformed or expired). */
+function liveClaim(claim: JsonObject | null, key: string): Claim | null {
+  if (claim === null || claim.v !== 1 || typeof claim.position !== 'number' || typeof claim.until !== 'number') return null;
+
+  return claim.until > Date.now() ? { key, position: claim.position } : null;
 }
 
 /** Where an append-log thread keeps whether its paused step has an open call (DECISION B): its position, or false. */

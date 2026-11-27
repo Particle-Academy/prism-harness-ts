@@ -341,9 +341,10 @@ describe('item 1: a supersede while an approved call is running (PR1, PR2)', () 
 });
 
 describe('item 1: new channels', () => {
-  /** The thread payload key of a session: the key a thread write puts its messages under. */
+  /** The thread payload key of a session: the key a thread write puts its messages under (its claim is `<key>:in-flight`). */
   async function threadKey(r: Rig): Promise<string> {
     for (const key of r.durable.keys) {
+      if (key.endsWith(':in-flight')) continue;
       const payload = await r.durable.get(key);
       if (payload !== null && Array.isArray(payload.messages) && payload.messages.length > 0) return key;
     }
@@ -355,7 +356,7 @@ describe('item 1: new channels', () => {
     const [id] = await r.parked();
     const key = await threadKey(r);
     const position = (await r.session().thread().messages()).find((entry) => entry.message.type === 'assistant')!.position;
-    await r.durable.put(key, { ...(await r.durable.get(key))!, harness_in_flight: { v: 1, position, token: 'dead', until: Date.now() - 1 } });
+    await r.durable.put(`${key}:in-flight`, { v: 1, position, token: 'dead', until: Date.now() - 1 });
     await r.session().thread().record([{ type: 'user', content: 'Host row.' }]);
     expect(supersededApprovals(await r.rows()).has(id!)).toBe(true);
   });
@@ -364,7 +365,7 @@ describe('item 1: new channels', () => {
     const r = new Rig();
     const [id] = await r.parked();
     const key = await threadKey(r);
-    await r.durable.put(key, { ...(await r.durable.get(key))!, harness_in_flight: { v: 1, position: 1, token: 'old', until: Date.now() + 60_000 } });
+    await r.durable.put(`${key}:in-flight`, { v: 1, position: 1, token: 'old', until: Date.now() + 60_000 });
     await r.session().thread().record([{ type: 'user', content: 'Host row.' }]);
     expect(supersededApprovals(await r.rows()).has(id!)).toBe(true);
   });
@@ -375,7 +376,7 @@ describe('item 1: new channels', () => {
     const key = await threadKey(r);
     const position = (await r.session().thread().messages()).find((entry) => entry.message.type === 'assistant')!.position;
     // A forged live claim: a host row is refused, nothing runs, the call stays open.
-    await r.durable.put(key, { ...(await r.durable.get(key))!, harness_in_flight: { v: 1, position, token: 'forged', until: Date.now() + 60_000 } });
+    await r.durable.put(`${key}:in-flight`, { v: 1, position, token: 'forged', until: Date.now() + 60_000 });
     expect(await r.session().thread().record([{ type: 'user', content: 'Host row.' }]).then(() => 'recorded', code)).toBe('session_locked');
     expect(r.echoed).toEqual([]);
     expect(pendingApprovalIds(await r.rows())).toEqual([id]);
@@ -383,7 +384,7 @@ describe('item 1: new channels', () => {
     await recordApproval(r.session(), id!, true);
     await r.runtime.send(r.session(), '');
     expect(r.echoed).toEqual([1]);
-    expect((await r.durable.get(key))!.harness_in_flight).toBeUndefined();
+    expect(await r.durable.get(`${key}:in-flight`)).toBeNull();
     expect(echoOutcomes(await r.rows(), 1)).toEqual(['ran:1']);
   });
 
@@ -394,7 +395,7 @@ describe('item 1: new channels', () => {
     r.durable.onWrite = { match: (message) => message.type === 'tool_result' && JSON.stringify(message).includes('ran:1'), run: async () => { throw new Error('STORE-SECRET write failed'); } };
     await expect(r.runtime.send(r.session(), '')).rejects.toThrow();
     const key = await threadKey(r);
-    expect((await r.durable.get(key))!.harness_in_flight).toBeUndefined();
+    expect(await r.durable.get(`${key}:in-flight`)).toBeNull();
   });
 
   it('a new message on a session with nothing open takes no session lock (a stream holding it does not block it)', async () => {
