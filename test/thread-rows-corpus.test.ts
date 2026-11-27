@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { assistantRow, threadView, toolResultRow, type JsonObject } from '../src/index.js';
-import { endedByStartRow, pairStepApprovals } from '../src/thread-rows.js';
+import { endedByStart, endedByStartRow, pairStepApprovals } from '../src/thread-rows.js';
 
 /**
  * The cross-language thread-rows corpus from `prism-parity`.
@@ -15,6 +15,10 @@ interface RowsCase {
   id: string;
   input?: JsonObject & { write: 'assistant' | 'tool_result' | 'ended_by_start' };
   fold?: JsonObject[];
+  /** A READ case (0.4.0): what the harness reads from `stored` rows for each id in `approvals`. */
+  read?: 'approval_states';
+  stored?: JsonObject[];
+  approvals?: string[];
   rows: { php: string; ts: string; py: string };
   agrees: boolean;
 }
@@ -26,6 +30,13 @@ const corpus = JSON.parse(readFileSync(new URL('./fixtures/harness-thread-rows.j
 /** The same conversion prism-parity's recorder makes. */
 function rowsFor(testCase: RowsCase): JsonObject[] {
   if (testCase.fold !== undefined) return threadView(testCase.fold);
+
+  if (testCase.read === 'approval_states') {
+    // Which approvals a runner start ended (G-387 round 13), by the harness's
+    // own reader over the rows as stored: one entry per id, in order.
+    const ended = endedByStart(testCase.stored ?? []);
+    return (testCase.approvals ?? []).map((id) => ({ approval_id: id, ended_by_start: ended.has(id) }));
+  }
 
   const input = testCase.input as unknown as Record<string, never>;
 
@@ -88,7 +99,7 @@ describe('harness-thread-rows corpus', () => {
   }
 
   it('is the whole suite, not a subset someone trimmed to green', () => {
-    expect(corpus.cases).toHaveLength(14);
+    expect(corpus.cases).toHaveLength(15);
   });
 
   it.each(corpus.cases.map((testCase) => [testCase.id, testCase] as const))('%s stores and replays the rows the corpus records for this port', (_id, testCase) => {

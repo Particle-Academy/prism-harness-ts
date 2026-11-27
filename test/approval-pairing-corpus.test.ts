@@ -21,6 +21,7 @@ import {
  * the text `done`. `echo` is gated by mode and `free` is not. Each round
  * decides the listed approvals with one recordDecisions() call, then resumes
  * once with an empty prompt; a decision the harness refuses is swallowed.
+ * `decided` (0.2.0) is the decision the thread recorded for each approval.
  */
 interface PairingCase {
   id: string;
@@ -80,10 +81,32 @@ async function record(row: PairingCase): Promise<unknown> {
     await runtime.send(session, '');
   }
 
-  return { approvals: pending.length, free, ran: [...ran].sort((a, b) => a - b) };
+  // The decision the thread RECORDED for each approval the first step issued,
+  // in issue order (0.2.0): the first answer, or null when none was recorded.
+  const recorded = new Map<string, boolean>();
+  for (const { message } of await session.thread().messages()) {
+    if (message.type !== 'tool_result') continue;
+    for (const answer of (message.tool_approval_responses ?? []) as JsonObject[]) {
+      if (typeof answer.approval_id === 'string' && !recorded.has(answer.approval_id)) recorded.set(answer.approval_id, answer.approved === true);
+    }
+  }
+
+  return { approvals: pending.length, free, ran: [...ran].sort((a, b) => a - b), decided: pending.map((approval) => recorded.get(approval.id) ?? null) };
 }
 
+/** Set to an absolute path to write what this port measures for every row (for the parity recorder). */
+const RECORD = process.env.HARNESS_APPROVAL_PAIRING_RECORD;
+
 describe('harness-approval-pairing corpus', () => {
+  if (RECORD !== undefined && RECORD !== '') {
+    it("records this port's outcomes", async () => {
+      const { writeFileSync } = await import('node:fs');
+      const out: Record<string, unknown> = {};
+      for (const row of corpus.cases) out[row.id] = await record(row);
+      writeFileSync(RECORD, JSON.stringify(out, null, 2));
+    });
+  }
+
   it('has rows', () => {
     expect(corpus.cases.length).toBeGreaterThan(0);
   });
