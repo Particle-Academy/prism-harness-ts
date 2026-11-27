@@ -199,6 +199,8 @@ export function approvalToolScope(rows: readonly JsonObject[]): { names: string[
     if (Array.isArray(scope) && scope.every((name): name is string => typeof name === 'string' && name !== '' && name !== '*')) {
       return {names: [...new Set(scope)], legacy: false};
     }
+    // A step that repeats a call id approves nothing (G-392).
+    if (pairStepApprovals(list(row.tool_calls), requests).repeated) return {names: [], legacy: true};
     const decisions = turnDecisions(rows);
     const approvedCalls = new Set(requests.filter(request => typeof request.approval_id === 'string' && decisions.get(request.approval_id)?.approved === true)
       .map(request => request.tool_call_id));
@@ -258,6 +260,16 @@ export function unresolvedApprovalIds(rows: readonly JsonObject[]): string[] {
     }
     if (row.type === 'user') return [];
     if (row.type !== 'assistant') continue;
+
+    // A step that repeats a call id: a result by id cannot say whose it is
+    // (G-392), so every request is unresolved until the step is settled.
+    if (pairStepApprovals(list(row.tool_calls), list(row.tool_approval_requests)).repeated) {
+      if (repeatedStepSettled(rows, index)) return [];
+
+      return [...new Set(list(row.tool_approval_requests)
+        .map((request) => request.approval_id)
+        .filter((id): id is string => typeof id === 'string' && id !== ''))];
+    }
 
     return [...new Set(list(row.tool_approval_requests)
       .filter((request) => typeof request.tool_call_id !== 'string' || !finished.has(request.tool_call_id))
@@ -490,6 +502,115 @@ export function ambiguousCalls(assistant: AssistantRow): Set<string> {
   return new Set(assistant.tool_calls
     .filter(call => unmarked.has(call.id) && Object.keys(call.arguments).length === 0)
     .map(call => call.id));
+}
+
+/**
+ * The result a call gets when its step repeats a tool call id (G-392): not
+ * run, whatever was decided. The harness recognises such an entry only by
+ * its mark (REPEATED_CALL_ID under ENDED_BY_START_KEY), never by this text.
+ *
+ * @internal
+ */
+export const REPEATED_CALL_ID_RESULT = 'Tool call was not run because another call in this step has the same id';
+/** @internal */
+export const REPEATED_CALL_ID = 'repeated_call_id';
+
+/**
+ * Each call of one assistant step paired with its OWN approval request, by
+ * position (G-392), and whether the step repeats a tool call id.
+ *
+ * Requests are written in call order, one per gated call, so the n-th request
+ * belongs to the next unpaired call it names. Never a map keyed by call id:
+ * providers repeat ids within one response (Gemini names a call by its
+ * function), and one key would let one approval decide two calls.
+ *
+ * `gated`, when given, says which calls needed approval: a request is paired
+ * with such a call first.
+ *
+ * `repeated` is true when a call id repeats among the step's calls (an empty
+ * id is an id like any other) or among its requests. Such a step cannot be
+ * paired safely, and none of its gated calls may run.
+ *
+ * @internal
+ */
+export function pairStepApprovals(
+  calls: readonly JsonObject[],
+  requests: readonly JsonObject[],
+  gated: (call: JsonObject) => boolean = () => true,
+): { approvalIds: (string | undefined)[]; repeated: boolean } {
+  const ids = calls.map((call) => text(call.id));
+  const asked = requests.map((request) => text(request.tool_call_id));
+  const approvalIds: (string | undefined)[] = ids.map(() => undefined);
+  let cursor = 0;
+  for (const [index, request] of requests.entries()) {
+    const want = asked[index]!;
+    // A call that needs approval first, so an ungated call sharing the id is
+    // not taken for the gated one; then any call that names it.
+    const free = (position: number, id: string): boolean => approvalIds[position] === undefined && id === want;
+    let at = ids.findIndex((id, position) => position >= cursor && free(position, id) && gated(calls[position]!));
+    if (at === -1) at = ids.findIndex((id, position) => free(position, id) && gated(calls[position]!));
+    if (at === -1) at = ids.findIndex((id, position) => position >= cursor && free(position, id));
+    if (at === -1) at = ids.findIndex((id, position) => free(position, id));
+    if (at === -1) continue;
+    approvalIds[at] = text(request.approval_id);
+    cursor = at + 1;
+  }
+
+  return { approvalIds, repeated: new Set(ids).size !== ids.length || new Set(asked).size !== asked.length };
+}
+
+/**
+ * True when the step at `index` (an assistant row of `rows`, as stored) that
+ * repeats a call id has had its gated calls answered: the harness wrote its
+ * not-run entries for them (G-392), a runner start ended them, or (a step a
+ * resolved before this check existed) every call already has a result.
+ *
+ * @internal
+ */
+export function repeatedStepSettled(rows: readonly JsonObject[], index: number): boolean {
+  const calls = list(rows[index]?.tool_calls).map((call) => text(call.id));
+  const counts = new Map<string, number>();
+  for (const row of rows.slice(index + 1)) {
+    if (row.type !== 'tool_result') continue;
+    const entries = list(row.tool_results);
+    if (entries.some((entry) => entry[ENDED_BY_START_KEY] === REPEATED_CALL_ID || entry[ENDED_BY_START_KEY] === ENDED_BY_START)) return true;
+    const here = new Map<string, number>();
+    for (const entry of entries) here.set(text(entry.tool_call_id), (here.get(text(entry.tool_call_id)) ?? 0) + 1);
+    for (const [id, count] of here) counts.set(id, Math.max(counts.get(id) ?? 0, count));
+  }
+  const needed = new Map<string, number>();
+  for (const id of calls) needed.set(id, (needed.get(id) ?? 0) + 1);
+
+  return calls.length > 0 && [...needed].every(([id, count]) => (counts.get(id) ?? 0) >= count);
+}
+
+/**
+ * The approval ids whose call the harness denied because its step repeats a
+ * tool call id (G-392): never approved work, whatever was decided. Only for
+ * the approval the mark names, asked for by a request row before it for the
+ * same call id, as for endedByStart().
+ *
+ * @internal
+ */
+export function repeatedIdDenials(rows: readonly JsonObject[]): Set<string> {
+  const asked = new Map<string, string>();
+  const denied = new Set<string>();
+  for (const row of rows) {
+    if (row.type === 'assistant') {
+      for (const request of list(row.tool_approval_requests)) {
+        if (typeof request.approval_id === 'string' && typeof request.tool_call_id === 'string' && !asked.has(request.approval_id)) asked.set(request.approval_id, request.tool_call_id);
+      }
+      continue;
+    }
+    if (row.type !== 'tool_result') continue;
+    for (const result of list(row.tool_results)) {
+      const approval = result.approval_id;
+      if (result[ENDED_BY_START_KEY] === REPEATED_CALL_ID && typeof approval === 'string'
+        && asked.has(approval) && asked.get(approval) === result.tool_call_id) denied.add(approval);
+    }
+  }
+
+  return denied;
 }
 
 function normalise(row: JsonObject, view: JsonObject[]): JsonObject | null {

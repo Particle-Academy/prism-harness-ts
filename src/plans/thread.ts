@@ -1,5 +1,5 @@
 import type { JsonObject, JsonValue } from '../json.js';
-import { endedByStart, pendingApprovalIds } from '../thread-rows.js';
+import { endedByStart, pairStepApprovals, pendingApprovalIds, repeatedIdDenials } from '../thread-rows.js';
 import { argsDigest } from '../tool-policy.js';
 import type { PendingCall } from './machine.js';
 
@@ -34,7 +34,9 @@ export function pendingApprovalCalls(rows: readonly JsonObject[]): PendingCall[]
       if (row.type !== 'assistant') continue;
       const request = list(row.tool_approval_requests).find((entry) => entry.approval_id === id);
       if (request === undefined) continue;
-      const call = list(row.tool_calls).find((entry) => entry.id === request.tool_call_id);
+      // The call this approval was asked for, paired by position (G-392).
+      const stepCalls = list(row.tool_calls);
+      const call = stepCalls[pairStepApprovals(stepCalls, list(row.tool_approval_requests)).approvalIds.indexOf(id)];
       if (call !== undefined && typeof call.name === 'string') calls.push({ id, name: call.name, digest: digestOf(call.arguments) });
       break;
     }
@@ -51,7 +53,9 @@ export function pendingApprovalCalls(rows: readonly JsonObject[]): PendingCall[]
  */
 export function approvalDecisions(rows: readonly JsonObject[]): Map<string, boolean> {
   const decided = new Map<string, boolean>();
-  const ended = endedByStart(rows);
+  // Calls denied because their step repeats a call id (G-392) were never
+  // acted on either: never approved work.
+  const ended = new Set([...endedByStart(rows), ...repeatedIdDenials(rows)]);
   for (const row of rows) {
     if (row.type !== 'tool_result') continue;
     for (const response of list(row.tool_approval_responses)) {
@@ -86,6 +90,8 @@ export function approvedCallsAwaitingResult(rows: readonly JsonObject[], name: s
       continue;
     }
     if (row.type !== 'assistant') return 0;
+    // A step that repeats a call id runs none of its gated calls (G-392).
+    if (pairStepApprovals(list(row.tool_calls), list(row.tool_approval_requests)).repeated) return 0;
 
     const approvedCalls = new Set(list(row.tool_approval_requests)
       .filter((request) => typeof request.approval_id === 'string' && decided.get(request.approval_id) === true && typeof request.tool_call_id === 'string')

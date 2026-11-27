@@ -20,6 +20,10 @@ import {
   ENDED_BY_START,
   ENDED_BY_START_KEY,
   endedByStartResult,
+  pairStepApprovals,
+  repeatedStepSettled,
+  REPEATED_CALL_ID,
+  REPEATED_CALL_ID_RESULT,
   ARGUMENTS_AS_SENT,
 } from './thread-rows.js';
 import { usableArguments } from './tool-arguments.js';
@@ -1516,12 +1520,13 @@ export class AgentRuntime {
     const work = await this.#unresolved(session, mode);
     if (work === null) return { rows: [], announce: () => {} };
     const inputs = work.calls.map((call) => ({ id: call.id, name: call.name, arguments: work.ambiguous.has(call.id) ? {} : call.arguments, resultId: call.result_id }));
+    // Each entry ends its OWN call's approval, paired by position (G-392).
     // Each entry carries the harness-only mark (round 11) and the approval
     // it ended: a tool controls only its `result` string, and the replay
     // view and every builder rebuild entries from their known keys, so no
     // tool result, argument or model output can produce either.
-    const ended: ToolResultEntry[] = inputs.map((input) => {
-      const approvalId = work.approvalIds.get(input.id);
+    const ended: ToolResultEntry[] = inputs.map((input, index) => {
+      const approvalId = work.approvalIds[index];
 
       return { ...toolResultEntry(input, endedByStartResult(input.name)), [ENDED_BY_START_KEY]: ENDED_BY_START, ...(approvalId === undefined ? {} : { approval_id: approvalId }) };
     });
@@ -1571,13 +1576,23 @@ export class AgentRuntime {
 
       const resolved: ToolResultEntry[] = [];
 
-      for (const call of work.calls) {
+      for (const [index, call] of work.calls.entries()) {
         const input = { id: call.id, name: call.name, arguments: call.arguments, resultId: call.result_id };
-        const approvalId = work.approvalIds.get(call.id);
+        // The call's OWN approval, paired by position (G-392).
+        const approvalId = work.approvalIds[index];
         const decision = approvalId === undefined ? undefined : work.decisions.get(approvalId);
 
         const declared = bounded.find((tool) => tool.name === call.name);
-        if (decision?.approved === true && work.unusable.has(call.id)) {
+        if (work.repeated) {
+          // The step repeats a call id, so no decision can be told apart from
+          // another (G-392): none of its gated calls runs, whatever was
+          // decided. Marked, so the step reads settled and no later decision
+          // or resume revives it, and the plan never reads it as approved.
+          this.#toolDecision('tool_denied', live, runId, input, declared, 'policy');
+          const entry = { ...toolResultEntry(input, REPEATED_CALL_ID_RESULT), [ENDED_BY_START_KEY]: REPEATED_CALL_ID, ...(approvalId === undefined ? {} : { approval_id: approvalId }) };
+          steps?.toolResult(call.id, entry.result, { ok: false, code: 'approval_denied', refused: true });
+          resolved.push(entry);
+        } else if (decision?.approved === true && work.unusable.has(call.id)) {
           const entry = toolResultEntry(input, `Not run: the arguments for ${call.name} are not a JSON object.`);
           steps?.toolResult(call.id, entry.result, { ok: false, code: 'tool_failed', refused: false });
           resolved.push(entry);
@@ -1626,7 +1641,10 @@ export class AgentRuntime {
     calls: AssistantRow['tool_calls'];
     results: Map<string, ToolResultEntry>;
     decisions: Map<string, ApprovalDecisionEntry>;
-    approvalIds: Map<string, string>;
+    /** Each call's own approval id, by position in `calls` (G-392). */
+    approvalIds: (string | undefined)[];
+    /** The step repeats a tool call id: none of its gated calls may run (G-392). */
+    repeated: boolean;
     scope: ReturnType<typeof approvalToolScope>;
     unusable: Set<string>;
     ambiguous: Set<string>;
@@ -1647,15 +1665,26 @@ export class AgentRuntime {
     // From the stored rows, not the replay view: the FIRST answer to an
     // approval is the answer, as the plan reads it too.
     const decisions = turnDecisions(rows);
-    const approvalIds = new Map(assistant.tool_approval_requests.map((request) => [request.tool_call_id, request.approval_id]));
+    // Each call paired with its OWN request by position, never by a map keyed
+    // by call id, where the last request for a repeated id would decide every
+    // call carrying it (G-392).
+    const pairing = pairStepApprovals(assistant.tool_calls, assistant.tool_approval_requests, (call) => typeof call.name === 'string' && mode.needsApproval(call.name));
+    // A step that repeats a call id: a result keyed by id cannot say whose it
+    // is, so its gated calls are open until the harness settled the step.
+    let stored = rows.length - 1;
+    while (stored >= 0 && !(rows[stored]!.type === 'assistant' && Array.isArray(rows[stored]!.tool_calls) && (rows[stored]!.tool_calls as JsonValue[]).length > 0)) stored -= 1;
+    const settled = pairing.repeated && repeatedStepSettled(rows, stored);
 
     // A call that has a result is DONE, whatever its decision says. A call that
     // needs nobody is not this method's to run.
-    const calls = assistant.tool_calls.filter(
-      (call) => !results.has(call.id) && (approvalIds.has(call.id) || mode.needsApproval(call.name)),
-    );
+    const open = assistant.tool_calls
+      .map((call, index) => ({ call, approvalId: pairing.approvalIds[index] }))
+      .filter(({ call, approvalId }) => (approvalId !== undefined || mode.needsApproval(call.name))
+        && (!pairing.repeated ? !results.has(call.id) : !settled && (approvalId !== undefined || !results.has(call.id))));
+    const calls = open.map(({ call }) => call);
+    const approvalIds = open.map(({ approvalId }) => approvalId);
 
-    return calls.length === 0 ? null : { calls, results, decisions, approvalIds, scope: approvalToolScope(rows), unusable: unusableStoredCalls(rows), ambiguous: ambiguousCalls(assistant) };
+    return calls.length === 0 ? null : { calls, results, decisions, approvalIds, repeated: pairing.repeated, scope: approvalToolScope(rows), unusable: unusableStoredCalls(rows), ambiguous: ambiguousCalls(assistant) };
   }
 
   /**
