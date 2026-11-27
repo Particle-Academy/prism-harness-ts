@@ -17,6 +17,9 @@ import {
 } from '../src/index.js';
 import { ARGUMENTS_AS_SENT, threadView, toolResultEntry, toolResultRow } from '../src/thread-rows.js';
 
+/** The outcome a call gets when it may have run and is never run again (G-410, G-412): the oracle's own copy. */
+const INTERRUPTED_RESULT = 'Tool call was interrupted, it may have run';
+
 // G-392 QC: property tests for the approval pairing invariants.
 //
 // Each example is a generated model step (1-6 tool calls, ids from a small
@@ -654,6 +657,8 @@ interface Rig {
   freeRan: number[];
   /** Every request the fake model received, across the whole case. */
   modelCalls: () => number;
+  /** What was sent: each request's messages, as received. */
+  sent: JsonObject[][];
 }
 
 function rig(c: Case): Rig {
@@ -670,8 +675,10 @@ function rig(c: Case): Rig {
   let served = c.source === 'stored';
   let failing = c.failOnce;
   let calls = 0;
+  const sent: JsonObject[][] = [];
   const client = async (request: LlmRequest): Promise<LlmResponse> => {
     calls += 1;
+    sent.push(JSON.parse(JSON.stringify(request.messages)) as JsonObject[]);
     if (!served) {
       served = true;
       return { text: '', finishReason: 'tool_calls', toolCalls: c.calls.map((call) => ({ id: call.id, name: call.tool, arguments: { n: call.token } })) };
@@ -685,7 +692,7 @@ function rig(c: Case): Rig {
       : { text: '{"ok":true}', finishReason: 'stop', structured: { ok: true } };
   };
 
-  return { session, agent: new AgentRuntime({ client, modes: c.spent ? spentModes : modes, tools }), ran, freeRan, modelCalls: () => calls };
+  return { session, agent: new AgentRuntime({ client, modes: c.spent ? spentModes : modes, tools }), ran, freeRan, modelCalls: () => calls, sent };
 }
 
 async function drain(stream: AsyncGenerator<RunStep, AgentResponse, undefined>): Promise<{ steps: RunStep[]; response: AgentResponse }> {
@@ -799,6 +806,7 @@ function storedRow(calls: { id: string; name: string; arguments: JsonObject }[],
 
 async function runCase(c: Case): Promise<void> {
   const oracle = expected(c);
+  const ended = hostCallsEnded(c);
   const r = rig(c);
   let approvalIds: string[];
   // The tool-call steps as recorded, in thread order, for attribution.
@@ -1060,10 +1068,10 @@ async function runCase(c: Case): Promise<void> {
     check(sameSet(ok, r.ran) && ok.length === r.ran.length, '6: the ok tool_result steps are the calls that ran', ok);
     // One step per open gated call of the step that is decided (none when
     // every step was superseded): no result of its own yet.
-    check(results.length === oracle.open.length, '6: one tool_result step per open gated call', { steps: results.length, open: oracle.open.length });
+    check(results.length === oracle.open.length + ended.size, '6: one tool_result step per open gated call, and per host ungated call it ends (G-412)', { steps: results.length, open: oracle.open.length, ended: ended.size });
   }
 
-  await settledOutcomes(r, recorded, oracle, '5');
+  await settledOutcomes(r, recorded, oracle, '5', ended);
   await replayKeepsEveryResult(r.session, '6');
 
   // Repeat resumes, with later decisions in between: nothing runs twice and
@@ -1084,13 +1092,51 @@ async function runCase(c: Case): Promise<void> {
   check(r.modelCalls() - callsAtTurn <= maxSteps, 'the step budget: model calls in a turn never exceed max_steps, across any number of empty resumes', { calls: r.modelCalls() - callsAtTurn, maxSteps });
   check(r.freeRan.length === c.calls.filter((call) => call.tool === 'free').length || c.source === 'stored', '3: an ungated call runs once', r.freeRan);
   if (c.source === 'stored') check(r.freeRan.length === 0, 'a stored ungated call with a result never runs', r.freeRan);
-  await settledOutcomes(r, recorded, oracle, '5 (after repeat resumes)');
+  await settledOutcomes(r, recorded, oracle, '5 (after repeat resumes)', ended);
   await replayKeepsEveryResult(r.session, '6 (after repeat resumes)');
+  sentRequestsAnswerEveryCall(r.sent);
+}
+
+/**
+ * Invariant 7, at the request seam (G-412): in EVERY request the model was
+ * sent, each tool call is answered by the tool result row directly after its
+ * step. A provider refuses a tool call with no result straight after it.
+ */
+function sentRequestsAnswerEveryCall(sent: JsonObject[][]): void {
+  sent.forEach((messages, request) => {
+    messages.forEach((row, at) => {
+      if (row.type !== 'assistant' || !Array.isArray(row.tool_calls) || row.tool_calls.length === 0) return;
+      const next = messages[at + 1];
+      const answered = new Set(next?.type === 'tool_result' ? (next.tool_results as JsonObject[]).map((entry) => entry.tool_call_id) : []);
+      const missing = (row.tool_calls as JsonObject[]).map((call) => call.id).filter((id) => !answered.has(id as string));
+      check(missing.length === 0, '7: every sent request answers every tool call directly after its step', { request, row: at, missing, next: next?.type ?? null });
+    });
+  });
+}
+
+/**
+ * The host's ungated calls (G-412) that the first resume answers as
+ * interrupted: those of the newest tool-call step when nothing supersedes it.
+ * The junk mixed row is recorded last, so its call (x1) is; the inserted call
+ * (x0) is when no later row follows its step: no junk row, and no later step
+ * recorded after it.
+ */
+function hostCallsEnded(c: Case): Set<string> {
+  if (c.junk?.kind === 'mixed') return new Set(['x1']);
+  if (c.insert?.kind === 'assistant_call' && c.junk === null && (c.later === null || c.insert.segment === 'later')) return new Set(['x0']);
+  return new Set();
 }
 
 /** Invariants 5 and 6 on the thread rows: every call has exactly one outcome, the oracle's. */
-async function settledOutcomes(r: Rig, recorded: RecordedStep[], oracle: Expected, label: string): Promise<void> {
+async function settledOutcomes(r: Rig, recorded: RecordedStep[], oracle: Expected, label: string, ended: ReadonlySet<string>): Promise<void> {
   const seen = await attributed(r.session, recorded);
+  // A host's ungated call with no result (G-412): answered once, as
+  // interrupted, when its step is the one the resume resolves; otherwise it
+  // has no stored outcome (the replay answers it for the provider only).
+  for (const key of [...seen.keys(), ...ended].filter((k, at, all) => k.startsWith('x') && all.indexOf(k) === at)) {
+    const got = [...(seen.get(key) ?? [])];
+    check(ended.has(key) ? got.length === 1 && got[0] === INTERRUPTED_RESULT : got.length === 0, `${label}: a host ungated call is ended exactly when its step is the one resolved (G-412)`, { key, got, ended: ended.has(key) });
+  }
   for (const [key, want] of oracle.outcome) {
     const got = [...(seen.get(key) ?? [])];
     check(got.length === 1, `${label}: every call gets exactly one recorded outcome`, { key, got });
