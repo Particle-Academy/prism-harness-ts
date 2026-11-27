@@ -9,12 +9,13 @@ import {
   recordDecisions,
   type AgentResponse,
   type JsonObject,
+  type JsonValue,
   type LlmRequest,
   type LlmResponse,
   type RunStep,
   type Session,
 } from '../src/index.js';
-import { ARGUMENTS_AS_SENT, assistantRow, toolResultEntry, toolResultRow } from '../src/thread-rows.js';
+import { ARGUMENTS_AS_SENT, toolResultEntry, toolResultRow } from '../src/thread-rows.js';
 
 // G-392 QC: property tests for the approval pairing invariants.
 //
@@ -184,6 +185,20 @@ interface Case {
   spent: boolean;
   /** A later tool-call step after the park: it is the step decided, and the parked one is replaced. */
   later: LaterStep | null;
+  /**
+   * G-397: stored arguments in the form another writer may keep them: true
+   * for a call whose arguments are stored as a JSON string (as the PHP
+   * reference stores them), by call position. Stored rows only: the parked
+   * step of a stored case, and a later step.
+   */
+  stringArgs: { parked: boolean[]; later: boolean[] };
+  /**
+   * G-397: an earlier answered step before the parked one, reusing its call
+   * ids: each call names a parked call whose id it reuses, with that call's
+   * own arguments (`same`) or other ones. Its calls ran; its results are not
+   * outcomes of the parked step.
+   */
+  history: { call: number; same: boolean; string: boolean }[] | null;
 }
 
 type InsertKind = 'assistant_text' | 'assistant_call' | 'user' | 'system' | 'tool_empty' | 'tool_result';
@@ -316,7 +331,18 @@ function generate(seed: number): Case {
     failOnce,
     spent,
     later,
+    ...storage(seed, calls.length, later?.calls.length ?? 0),
   };
+}
+
+/** G-397: argument storage forms and an earlier step reusing ids, from a generator of their own. */
+function storage(seed: number, parked: number, later: number): Pick<Case, 'stringArgs' | 'history'> {
+  const rng = new Rng((seed ^ 0x3a6f121) >>> 0);
+  const stringArgs = { parked: Array.from({ length: parked }, () => rng.chance(0.4)), later: Array.from({ length: later }, () => rng.chance(0.4)) };
+  const history = rng.chance(0.35)
+    ? Array.from({ length: rng.int(1, Math.min(3, parked)) }, () => ({ call: rng.int(0, parked - 1), same: rng.chance(0.6), string: rng.chance(0.4) }))
+    : null;
+  return { stringArgs, history };
 }
 
 // ---------------------------------------------------------------------------
@@ -486,9 +512,14 @@ async function rows(session: Session): Promise<JsonObject[]> {
 }
 
 /** Every stored result entry after the step's assistant row, as [token, result]. */
-async function outcomes(session: Session): Promise<[number, string][]> {
+async function outcomes(session: Session, skip = 0): Promise<[number, string][]> {
   const all = await rows(session);
-  const step = all.findIndex((row) => row.type === 'assistant' && Array.isArray(row.tool_calls) && row.tool_calls.length > 0);
+  // The parked step: after `skip` earlier answered steps.
+  let step = -1;
+  for (let seen = -1; seen < skip;) {
+    step += 1;
+    if (all[step]!.type === 'assistant' && Array.isArray(all[step]!.tool_calls) && (all[step]!.tool_calls as JsonValue[]).length > 0) seen += 1;
+  }
   return all.slice(step + 1).filter((row) => row.type === 'tool_result')
     .flatMap((row) => (row.tool_results as JsonObject[]))
     // A result for no call of the step (an interposed row) is not an outcome of it.
@@ -511,11 +542,45 @@ function sameSet(a: Iterable<number>, b: Iterable<number>): boolean {
   return JSON.stringify(x) === JSON.stringify(y);
 }
 
+/**
+ * An assistant row as another writer stores it, arguments kept exactly as
+ * given: a JSON string stays a string (assistantRow() would not keep one).
+ */
+function storedRow(calls: { id: string; name: string; arguments: JsonObject }[], requests: JsonObject[]): JsonObject {
+  return {
+    type: 'assistant',
+    content: '',
+    tool_calls: calls.map((call) => ({ id: call.id, name: call.name, arguments: call.arguments, result_id: null, reasoning_id: null, reasoning_summary: null })),
+    additional_content: {},
+    tool_approval_requests: requests,
+  };
+}
+
 async function runCase(c: Case): Promise<void> {
   const oracle = expected(c);
   const r = rig(c);
   let approvalIds: string[];
 
+  if (c.history !== null) {
+    // An earlier step that reused the parked step's call ids, answered and
+    // run before it: every call approved, each with its result.
+    const history = c.history.map((h, index) => {
+      const call = c.calls[h.call]!;
+      const args: JsonObject = { n: h.same ? call.token : 300 + index };
+      return { id: call.id, args, stored: h.string ? JSON.stringify(args) : args };
+    });
+    await r.session.thread().record([
+      { type: 'user', content: 'earlier' },
+      {
+        type: 'assistant', content: '', additional_content: {}, harness_tool_names: ['echo', 'free'],
+        tool_calls: history.map((h) => ({ id: h.id, name: 'echo', arguments: h.stored, result_id: null, reasoning_id: null, reasoning_summary: null })),
+        tool_approval_requests: history.map((h, index) => ({ approval_id: `apr_hist_${c.seed}_${index}`, tool_call_id: h.id, arguments_format: ARGUMENTS_AS_SENT })),
+      },
+      toolResultRow(history.map((h) => toolResultEntry({ id: h.id, name: 'echo', arguments: h.args }, `old:${String(h.args.n)}`)),
+        history.map((_h, index) => ({ approval_id: `apr_hist_${c.seed}_${index}`, approved: true, reason: null }))),
+      { type: 'assistant', content: 'ok', tool_calls: [], tool_approval_requests: [] },
+    ], 'run_history');
+  }
   if (c.source === 'model') {
     const parked = await turn(r, c.initial, 'go');
     check(parked.response.finishReason === 'awaiting_approval', 'the step parks for a person', parked.response.finishReason);
@@ -527,7 +592,7 @@ async function runCase(c: Case): Promise<void> {
     check(new Set(pending.map((p) => p.id)).size === pending.length, '6: pending approval ids are distinct');
     pending.forEach((p, i) => check(p.toolCallId === gated[i]!.id && Number(p.arguments.n) === gated[i]!.token && p.tool === 'echo',
       '6: pending approval names its own call', { p, call: gated[i] }));
-    const stored = (await rows(r.session)).find((row) => row.type === 'assistant' && Array.isArray(row.tool_calls) && row.tool_calls.length > 0)!;
+    const stored = [...await rows(r.session)].reverse().find((row) => row.type === 'assistant' && Array.isArray(row.tool_calls) && row.tool_calls.length > 0)!;
     check(JSON.stringify((stored.tool_approval_requests as JsonObject[]).map((q) => q.approval_id)) === JSON.stringify(pending.map((p) => p.id)),
       '6: the stored requests are the reported approvals');
     // Ungated calls ran at once, each exactly once.
@@ -537,11 +602,11 @@ async function runCase(c: Case): Promise<void> {
     approvalIds = pending.map((p) => p.id);
   } else {
     approvalIds = c.requests.map((request, index) => `apr_${c.seed}_${request.approval ?? index}`);
-    const calls = c.calls.map((call) => ({ id: call.id, name: call.tool, arguments: { n: call.token } }));
+    const calls = c.calls.map((call, index) => ({ id: call.id, name: call.tool, arguments: (c.stringArgs.parked[index] ? JSON.stringify({ n: call.token }) : { n: call.token }) as unknown as JsonObject }));
     await r.session.thread().record([
       { type: 'user', content: 'go' },
       {
-        ...assistantRow('', calls, {}, c.requests.map((request, index) => ({
+        ...storedRow(calls, c.requests.map((request, index) => ({
           approval_id: approvalIds[index]!, tool_call_id: c.calls[request.call]!.id, arguments_format: ARGUMENTS_AS_SENT,
         }))),
         harness_tool_names: ['echo', 'free'],
@@ -568,10 +633,10 @@ async function runCase(c: Case): Promise<void> {
   const recordLater = async (): Promise<void> => {
     // The later step, as another writer could record it after the park.
     const later = c.later!;
-    const laterCalls = later.calls.map((call) => ({ id: call.id, name: call.tool, arguments: { n: call.token } }));
+    const laterCalls = later.calls.map((call, index) => ({ id: call.id, name: call.tool, arguments: (c.stringArgs.later[index] ? JSON.stringify({ n: call.token }) : { n: call.token }) as unknown as JsonObject }));
     await r.session.thread().record([
       {
-        ...assistantRow('', laterCalls, {}, later.requests.map((request, index) => ({
+        ...storedRow(laterCalls, later.requests.map((request, index) => ({
           approval_id: `apr_later_${c.seed}_${index}`, tool_call_id: later.calls[request.call]!.id, arguments_format: ARGUMENTS_AS_SENT,
         }))),
         harness_tool_names: ['echo', 'free'],
@@ -708,7 +773,7 @@ async function runCase(c: Case): Promise<void> {
 /** Invariants 5 and 6 on the thread rows: every call has exactly one outcome, the oracle's. */
 async function settledOutcomes(r: Rig, _c: Case, oracle: Expected, label: string): Promise<void> {
   const seen = new Map<number, Set<string>>();
-  for (const [token, result] of await outcomes(r.session)) {
+  for (const [token, result] of await outcomes(r.session, _c.history === null ? 0 : 1)) {
     if (!seen.has(token)) seen.set(token, new Set());
     seen.get(token)!.add(result);
   }
@@ -738,6 +803,11 @@ function withoutCall(c: Case, drop: number): Case | null {
     calls,
     requests,
     prior: c.prior.filter((index) => index !== drop).map(remap),
+    stringArgs: { ...c.stringArgs, parked: c.stringArgs.parked.filter((_v, index) => index !== drop) },
+    history: c.history === null ? null : (() => {
+      const kept = c.history.filter((h) => h.call !== drop).map((h) => ({ ...h, call: remap(h.call) }));
+      return kept.length === 0 ? null : kept;
+    })(),
     insert: c.insert === null || c.insert.step === 'later' ? c.insert
       : c.insert.call === drop ? null : { ...c.insert, call: remap(c.insert.call) },
     order: c.order.filter((index) => position.has(index)).map((index) => position.get(index)!),
@@ -758,6 +828,7 @@ function smaller(c: Case): Case[] {
   const out: Case[] = [];
   if (c.again.length > (c.failOnce ? 1 : 0)) out.push({ ...c, again: c.again.slice(0, -1) });
   if (c.insert !== null) out.push({ ...c, insert: null });
+  if (c.history !== null) out.push({ ...c, history: null });
   if (c.failOnce) out.push({ ...c, failOnce: false });
   if (c.spent) out.push({ ...c, spent: false });
   if (c.later !== null) out.push({ ...c, later: null });
@@ -882,6 +953,13 @@ describe('G-392 property: approval pairing invariants over generated steps', () 
     expect(has((c) => c.later !== null && c.insert?.kind === 'tool_result' && c.insert.segment === 'later' && c.insert.step === 'later'), 'forged, later segment, later call').toBe(true);
     expect(has((c) => c.later !== null && c.insert?.kind === 'tool_result' && c.insert.segment === 'later' && c.insert.step === 'earlier'), 'forged, later segment, earlier call').toBe(true);
     expect(has((c) => c.later !== null && c.insert?.kind === 'tool_result' && c.insert.step === 'later' && decideStep(c.later.calls, c.later.requests, []).repeated), 'forged in a later step that repeats ids').toBe(true);
+    // G-397: arguments stored as JSON strings, and an earlier answered step reusing the parked step's ids.
+    expect(has((c) => c.source === 'stored' && c.stringArgs.parked.some((v, i) => v && c.calls[i]!.tool === 'echo') && c.requests.some((q) => q.verdict === 'approve')), 'string-stored arguments, approved').toBe(true);
+    expect(has((c) => c.later !== null && c.stringArgs.later.some((v, i) => v && c.later!.calls[i]!.tool === 'echo')), 'string-stored arguments in a later step').toBe(true);
+    expect(has((c) => c.history !== null && c.history.some((h) => h.same) && expected(c).runs.size > 0), 'earlier step, same id and arguments, an approved call').toBe(true);
+    expect(has((c) => c.history !== null && c.history.some((h) => !h.same)), 'earlier step, same id, other arguments').toBe(true);
+    expect(has((c) => c.history !== null && c.source === 'stored' && c.history.some((h) => h.same && c.stringArgs.parked[h.call] && c.requests.some((q) => q.call === h.call && q.verdict === 'approve'))
+      && (c.spent || c.failOnce)), 'the parked call stored as a string, an earlier step with its id and arguments, no assistant row after the resolution').toBe(true);
     // G-397: a later tool-call step replaces the parked one, with approvals for both.
     expect(has((c) => c.later !== null && c.requests.some((q) => q.verdict === 'approve') && c.later.requests.some((q) => q.verdict === 'approve')), 'later step').toBe(true);
     expect(has((c) => c.later !== null && decideStep(c.later.calls, c.later.requests, []).repeated), 'later step repeating ids').toBe(true);

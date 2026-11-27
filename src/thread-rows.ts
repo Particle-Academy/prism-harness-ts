@@ -419,10 +419,12 @@ export function supersededAt(rows: readonly StoredRow[], index: number): number 
  * in it). One owner per result, so every call has at most one outcome:
  *
  * - a result belongs to the call with its id AND the arguments it records
- *   (the harness copies a call's arguments into its result), in the step
- *   whose segment holds the row (after it, before the next tool-call step)
- *   or, failing that, an earlier step, the latest first. A copy of a result
- *   belongs to the same call again; it never answers a second one;
+ *   (the harness copies a call's parsed arguments into its result; both are
+ *   compared parsed), in the step whose segment holds the row (after it,
+ *   before the next tool-call step) or, failing that, an earlier step's call
+ *   that has no result yet, the latest first. A copy of a result of the
+ *   segment's step belongs to the same call again; it never answers a
+ *   second one;
  * - a result whose arguments match no call with its id belongs to the last
  *   call with its id, of the step whose segment holds it, still without one.
  *
@@ -434,7 +436,10 @@ export function supersededAt(rows: readonly StoredRow[], index: number): number 
 export function resultOwners(rows: readonly JsonObject[]): Map<number, Set<number>> {
   const owned = new Map<number, Set<number>>();
   const steps: number[] = [];
-  const args = (value: JsonValue | undefined): string => JSON.stringify(isObject(value) ? value : {});
+  // Both sides in the form the harness uses a call's arguments, parsed
+  // (usableArguments), whatever form a writer stored them in: a JSON string
+  // (as the PHP reference stores them) and the same object compare equal.
+  const args = (value: JsonValue | undefined): string => canonicalJson(usableArguments(value) ?? {});
   for (const [index, row] of rows.entries()) {
     if (row.type === 'assistant' && list(row.tool_calls).length > 0) {
       steps.push(index);
@@ -448,17 +453,20 @@ export function resultOwners(rows: readonly JsonObject[]): Map<number, Set<numbe
     for (const entry of entries) {
       const id = text(entry.tool_call_id);
       let owner: [number, number] | undefined;
-      let copy: [number, number] | undefined;
+      let copy = false;
       for (const step of [...steps].reverse()) {
         const calls = list(rows[step]!.tool_calls);
         for (const [at, call] of calls.entries()) {
           if (text(call.id) !== id || args(call.arguments) !== args(entry.args)) continue;
           if (!owned.get(step)!.has(at)) { owner = [step, at]; break; }
-          copy ??= [step, at];
+          // A copy of a result of the segment's own step answers nothing new.
+          // An exact match on an EARLIER call that already has its result is
+          // not a copy of it: the result stays in this segment (below).
+          if (step === steps.at(-1)) copy = true;
         }
-        if (owner !== undefined) break;
+        if (owner !== undefined || copy) break;
       }
-      if (owner === undefined && copy === undefined) {
+      if (owner === undefined && !copy) {
         const segment = steps.at(-1)!;
         const calls = list(rows[segment]!.tool_calls);
         const at = calls.map((call, position) => ({ call, position }))
@@ -515,6 +523,13 @@ export function approvalSuperseded(messages: readonly StoredRow[], approvalId: s
   return messages.some(({ message }, index) => message.type === 'assistant'
     && list(message.tool_approval_requests).some((request) => request.approval_id === approvalId)
     && supersededAt(messages, index) !== -1);
+}
+
+/** JSON with object keys sorted, so equal values compare equal. */
+function canonicalJson(value: JsonValue): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (isObject(value)) return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key]!)}`).join(',')}}`;
+  return JSON.stringify(value);
 }
 
 function list(value: JsonValue | undefined): JsonObject[] {
