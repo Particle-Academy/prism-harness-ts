@@ -17,9 +17,8 @@ import {
   repeatsCallIds,
   REPEATED_CALL_ID_RESULT,
   replacedStepCalls,
-  isReplacedStepRow,
   supersededAt,
-  answeredCalls,
+  resultOwners,
   approvalSuperseded,
   REPLACED_STEP_KEY,
   REPLACED_STEP_RESULT,
@@ -971,11 +970,10 @@ export class AgentRuntime {
     // Counted on the rows as stored: the replay view folds results by id.
     let stored = rows.length - 1;
     while (stored >= 0 && !(rows[stored]!.type === 'assistant' && Array.isArray(rows[stored]!.tool_calls) && (rows[stored]!.tool_calls as JsonValue[]).length > 0)) stored -= 1;
-    const storedResults = rows.slice(stored + 1).filter((row) => row.type === 'tool_result' && !isReplacedStepRow(row))
-      .flatMap((row) => (Array.isArray(row.tool_results) ? row.tool_results : []) as JsonObject[]);
-    // In a step that repeats an id, a result is matched to its call by id and
-    // the arguments it records, never by id alone (G-392, G-397).
-    const done = answeredCalls(assistant.tool_calls as unknown as JsonObject[], storedResults);
+    // Which of its calls already has an outcome: each result belongs to one
+    // call, matched by id and the arguments it records, in the segment it sits
+    // in or an earlier step's, never by id alone (G-392, G-397).
+    const done = stored >= 0 ? resultOwners(rows).get(stored) ?? new Set<number>() : new Set<number>();
     // A superseded step is never resolved here: it is answered as replaced
     // (G-397), and nothing of it runs.
     const calls = stored >= 0 && supersededAt(messages, stored) !== -1
@@ -983,7 +981,7 @@ export class AgentRuntime {
       : repeated
         ? assistant.tool_calls.filter((call, at) => mode.needsApproval(call.name) && !done.has(at))
         : assistant.tool_calls.filter(
-          (call) => !results.has(call.id) && (approvalIds.has(call.id) || mode.needsApproval(call.name)),
+          (call, at) => !done.has(at) && (approvalIds.has(call.id) || mode.needsApproval(call.name)),
         );
 
     return calls.length === 0 && replaced.length === 0 ? null : { calls, results, decisions, approvalIds, repeated, replaced, scope: approvalToolScope(rows), unusable: unusableStoredCalls(rows), ambiguous: ambiguousCalls(assistant) };
