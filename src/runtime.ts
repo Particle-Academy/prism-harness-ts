@@ -23,6 +23,7 @@ import {
   REPLACED_STEP_KEY,
   answeringStep,
   isToolCallStep,
+  turnStepsSoFar,
   REPLACED_STEP_RESULT,
   ARGUMENTS_AS_SENT,
 } from './thread-rows.js';
@@ -579,12 +580,17 @@ export class AgentRuntime {
         const resolved = await this.#tools.resolve(toolNames ?? mode.tools, session);
         offered = this.#authorizer ? await this.#authorizer.allowed(session, resolved) : [...resolved.values()];
       } else offered = (await this.#offer(session, mode, toolNames)).tools;
-      const stored = (await thread.messages()).map(entry => entry.message);
+      const storedMessages = await thread.messages();
+      const stored = storedMessages.map(entry => entry.message);
       const scope = approvalToolScope(stored);
       // A resume continues the paused run's step count; it never opens a new
       // allowance. Only for a root run: a child's steps are already on the
       // tree ledger its caller hands back in.
-      if (prompt === '' && execution == null) run.ledger.recordSteps(approvalRunSteps(stored) ?? 0);
+      // An empty send continues the turn at the tail: it starts from the steps
+      // that turn has taken, paused or not, so no number of empty sends takes
+      // a turn past its step budget. (Capped at the budget: a host's own
+      // tool-call steps count against it, never above it.)
+      if (prompt === '' && execution == null) run.ledger.recordSteps(Math.min(turnStepsSoFar(storedMessages), run.budget.maxSteps));
       if (scope !== null) {
         if (scope.legacy) console.warn('Pending approval has no valid stored tool scope; offering approved requests only.');
         offered = offered.filter(tool => scope.names.includes(tool.name)
