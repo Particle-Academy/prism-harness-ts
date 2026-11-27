@@ -378,8 +378,14 @@ every step directly after that step: its results (wherever they were stored,
 for example after a message sent while the call ran) come first, and any
 user, assistant or system row written in between follows them, so every
 request a provider is sent answers every call in that step's own result
-run. A resume answers a paused step's calls that need nobody and still have
-no outcome (a host's own step) as interrupted. The harness's marks (started,
+run; each call is answered once, and each result is sent with its call's
+ids (a stored result that answers no call of its step is not sent). A
+resume answers a paused step's calls that need nobody and still have no
+outcome (a host's own step) as interrupted. A step with no stored tool list
+the runtime wrote is offered the tools of the calls its approval requests
+were issued for, approved or not; a call still runs only on its own
+approval. A call whose start a denial refused reads "Not run: this call was
+denied before it started." The harness's marks (started,
 answers-step, ended, superseded, replaced, the repeated-id mark and a
 request's binding) and the run state a paused run carries (its model
 binding, tool list, run tree, plan ledger and agent spend) are read only on
