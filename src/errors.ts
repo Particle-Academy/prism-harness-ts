@@ -103,6 +103,30 @@ export type HarnessErrorCode =
   /** Plans are off for this session: the host config or the mode does not turn them on (G-360). */
   | 'plan.disabled';
 
+/**
+ * Every code the harness itself defines, as a value (G-387 round 9): a
+ * failure is reported with its code only when the code is one of these, so
+ * a HarnessError a host or a store built with a code of its own choosing
+ * never puts that text in a tool result, a run row or an event. Plan
+ * refusal codes are added where they are defined (failures.ts).
+ */
+export const HARNESS_ERROR_CODES = [
+  'session_locked', 'unsafe_state_configuration', 'unknown_store_driver', 'tool_not_available', 'run_not_permitted',
+  'child_binding_missing', 'plan_budget_exhausted', 'model_step_failed', 'unmappable_content', 'no_agent_runtime',
+  'mode_not_configured', 'mode_malformed', 'unsafe_authorization_configuration', 'call_not_authorized',
+  'tool_policy_refused', 'skill_path_refused', 'approval_not_pending', 'duplicate_task_id', 'task_identifier_blank',
+  'task_lease_invalid', 'task_not_found', 'task_already_terminal', 'task_lease_not_held', 'task_outcome_invalid',
+  'attachment_by_reference', 'attachment_not_media', 'attachment_empty', 'attachment_without_prompt',
+  'structured_unreadable', 'structured_schema_violation', 'budget_unpriced', 'agent_spend_ceiling_exceeded',
+  'plan.disabled',
+] as const satisfies readonly HarnessErrorCode[];
+
+// Every non-plan code in the type is in the list: a code added to the type
+// and not here fails the typecheck.
+type ListedCode = (typeof HARNESS_ERROR_CODES)[number] | import('./plans/refusal.js').PlanRefusalCode;
+const _everyCodeListed: Exclude<HarnessErrorCode, ListedCode> extends never ? true : never = true;
+void _everyCodeListed;
+
 export interface HarnessErrorOptions {
   cause?: unknown;
   finishReason?: 'error' | 'unknown';

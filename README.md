@@ -317,17 +317,25 @@ gate read them, so a step spent on a shared context after that read is
 counted against the child. Saving the child's records re-checks, under the
 child's lock, both a turn still running on it and an approval a person could
 answer that parked since the read; either refuses the start with nothing
-written. The child's mode is saved in that same write. A start that fails
-after that write and before its task row is recorded (its run cannot begin,
-a tool registry or plan read throws) puts the child's records and mode back
+written. The child's mode is saved in that same write. Everything that write saves
+is PROVISIONAL until the start's task row (the child's user row recorded
+under the start's run id) is in the child's thread: until then every reader
+treats it as absent, so a turn on the child the runner did not start, a
+decision on its approvals and its step count all fail closed (no binding:
+`child_binding_missing`), and the child's run state and run history still
+name the run it had before. Confirmation is read from the task row, never
+from another write, so a start that fails before its task row leaves nothing
+answerable that was not, even when the store fails again while it cleans up.
+It does clean up, as housekeeping: it puts the child's records and mode back
 as they were, provided nobody else has written them since, and releases its
-holds: a refused or failed start never leaves an approval answerable that
-was not. Whether an approval on the child could be answered is decided by
+holds; a count hold it could not release expires after `lock_ttl`. A runner
+start acts on no recorded decision: its task row ends every call the child
+was still waiting on, recorded as not run. Whether an approval on the child could be answered is decided by
 the known reasons only (no binding, too deep); a store read that fails
 there fails the start rather than counting the approval unanswerable.
 Any failure while it starts or runs the child comes back as a framed
-`failed` result naming the error's class (and a harness error's code), never
-its message. Everything the parent's model reads of a child is chosen by the
+`failed` result naming the error's class (and the code of a harness error,
+when the code is one this package defines), never its message. Everything the parent's model reads of a child is chosen by the
 harness: a fixed reason for each refusal, a fixed reason for each stop (a
 host's cancel reason is never repeated to a model, nor to the provider on a
 later turn; `AgentResponse.stoppedBecause` still carries it for the host), and
