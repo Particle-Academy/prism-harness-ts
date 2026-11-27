@@ -1,0 +1,47 @@
+name: Property tests (long set)
+
+# The long run of the approval pairing property tests (G-392 QC). The fast,
+# fixed-seed set runs in Tests on every push and pull request; this runs only
+# the property files, with many more examples and a seed taken from the run,
+# so each run explores new cases and logs the seed to replay them.
+#
+# This is the release line's copy, dispatch only: `schedule` fires only from
+# the default branch, and main's copy runs this line nightly as a matrix ref.
+
+on:
+  workflow_dispatch:
+    inputs:
+      examples:
+        description: Examples per property
+        required: false
+        default: '5000'
+
+permissions:
+  contents: read
+
+jobs:
+  property:
+    name: property / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Property tests
+        shell: bash
+        env:
+          PRISM_PROPERTY_EXAMPLES: ${{ inputs.examples || '5000' }}
+          PRISM_PROPERTY_BASE_SEED: ${{ github.run_id }}
+        run: |
+          echo "PRISM_PROPERTY_BASE_SEED=$PRISM_PROPERTY_BASE_SEED PRISM_PROPERTY_EXAMPLES=$PRISM_PROPERTY_EXAMPLES"
+          npx vitest run test/approval-pairing-property.test.ts --reporter=verbose
