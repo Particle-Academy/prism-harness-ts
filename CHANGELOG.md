@@ -19,9 +19,15 @@
   gives it that one result.
 - The harness's marks (started, answers-step, ended, replaced) are read only
   on rows the harness itself wrote.
-- An assistant row is a tool-call step only when its `tool_calls` is a
-  non-empty list of objects, for every reader; and an approval belongs only
-  to the step that first asked for it.
+- An assistant row is a tool-call step only when its `tool_calls` is a list
+  holding at least one object (its calls are those objects), for every
+  reader; and an approval belongs only to the step that first asked for it.
+- Every stored approval request is bound to the call it was asked for
+  (`harness_call: {tool_name, args_digest}`): a call runs only when its
+  request's binding matches it, and is otherwise denied with one outcome. A
+  request stored before bindings existed binds to its own step's call.
+- A result row the runtime writes holds only results its step does not hold
+  yet, so every call has exactly one stored outcome.
 - A denial recorded after an approval, before the call starts, is the
   answer; nothing overrides a denial.
 - A lock refusal inside a tool reaches the model as its code only.

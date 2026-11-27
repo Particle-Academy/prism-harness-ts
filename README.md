@@ -363,8 +363,13 @@ running it again takes a new call and a new approval. The harness's marks are
 read only on rows the harness itself wrote; on a host row they are ignored. A
 denial recorded after an approval, before the call starts, revokes it; nothing
 overrides a denial. An assistant row is a tool-call step only when its
-`tool_calls` is a non-empty list of objects, and an approval belongs only to
-the step that first asked for it. A decision applies only to the step whose approvals were requested, taken
+`tool_calls` is a list holding at least one object (its calls are those
+objects), and an approval belongs only to the step that first asked for it.
+Every stored approval request is bound to the call it was asked for
+(`harness_call: {tool_name, args_digest}`, the sha256 of the call's canonical
+arguments): a call runs only when its request's binding matches it, and is
+otherwise denied. A request stored before bindings existed binds to its own
+step's call. A decision applies only to the step whose approvals were requested, taken
 by one selector everywhere (the last assistant row, unless a user row follows
 it); and that step's results are read from every result row after it, up to
 the next assistant row, so no other row can hide one. A result counts
