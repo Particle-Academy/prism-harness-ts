@@ -33,7 +33,7 @@ interface PairingCase {
   calls: { id: string; name: string; args: JsonObject }[];
   rounds: [number, boolean][][];
   /** DECISION B (0.2.0): what supersedes the parked step, after the park and before the rounds. */
-  supersede?: 'assistant_tool_step' | 'assistant_text' | 'user' | 'user_owning_run_id' | 'new_message' | 'new_message_failed';
+  supersede?: 'assistant_tool_step' | 'assistant_text' | 'user' | 'user_owning_run_id' | 'new_message' | 'new_message_failed' | 'altered_copy' | 'altered_copy_after_approval';
   /**
    * SEGMENT OWNERSHIP (0.2.0, round 13b): a later step a host records after
    * the park, each echo call asking its own approval (`apr_later_<k>`, k
@@ -103,6 +103,18 @@ async function record(row: PairingCase): Promise<unknown> {
   if (row.supersede === 'new_message') await runtime.send(session, 'Something else.');
   // A new message whose turn then FAILS (G-404): it still supersedes, its message and denials one write before the request.
   if (row.supersede === 'new_message_failed') await runtime.send(session, 'Something else.').catch(() => undefined);
+  // 0.4.0 (round 15): a host's copy of the step, each call's `n` + 100, the
+  // SAME approval requests; after the park, or after every pending approval
+  // was recorded approved (then one resume).
+  if (row.supersede === 'altered_copy' || row.supersede === 'altered_copy_after_approval') {
+    if (row.supersede === 'altered_copy_after_approval') await recordDecisions(session, pending.map((approval) => ({ approvalId: approval.id, approved: true })));
+    await session.thread().record([{
+      ...assistantRow('', row.calls.map((call) => ({ id: call.id, name: call.name, arguments: { ...call.args, n: Number(call.args.n) + 100 } })), {},
+        pending.map((approval) => ({ approval_id: approval.id, tool_call_id: approval.toolCallId, arguments_format: ARGUMENTS_AS_SENT }))),
+      harness_tool_names: ['echo', 'free'],
+    }]);
+    if (row.supersede === 'altered_copy_after_approval') await runtime.send(session, '');
+  }
   const later = row.later;
   const laterIds: string[] = [];
   if (later !== undefined) {

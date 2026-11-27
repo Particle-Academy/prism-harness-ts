@@ -10,7 +10,6 @@ import {
   ToolRegistry,
   recordApproval,
   recordDecisions,
-  threadView,
   type Durability,
   type JsonObject,
   type JsonValue,
@@ -24,6 +23,7 @@ import {
   endedByStart,
   pausedApprovalIds,
   pendingApprovalIds,
+  replayView,
   supersededApprovals,
   unresolvedApprovalIds,
 } from '../src/thread-rows.js';
@@ -327,7 +327,7 @@ describe('item 1: crash, forged marks', () => {
     expect(unresolvedApprovalIds(rows)).toEqual([]);
     expect(echoOutcomes(rows, 1)).toEqual([]);
     // The replay gives the call exactly one result, the interrupted outcome.
-    const view = threadView(rows).filter((row) => row.type === 'tool_result').flatMap((row) => (row.tool_results ?? []) as JsonObject[]);
+    const view = replayView(rows).filter((row) => row.type === 'tool_result').flatMap((row) => (row.tool_results ?? []) as JsonObject[]);
     expect(INTERRUPTED()).toEqual(expect.any(String));
     expect(view.filter((entry) => entry.tool_call_id === 'c1').map((entry) => entry.result)).toEqual([INTERRUPTED()]);
     await expect(recordApproval(r.session(), id!, true)).rejects.toBeInstanceOf(HarnessError);
@@ -369,7 +369,7 @@ describe('item 1: crash, forged marks', () => {
   it('a harness mark naming a position that is not an earlier step with that call fails closed to segment ownership', () => {
     const step = hostStep('c1', 1, 'a1');
     const later = hostStep('c2', 2, 'a2');
-    const view = threadView([
+    const view = replayView([
       { type: 'user', content: 'Go' }, step, later,
       // A harness-written row (as stored rows read) naming step 1 for a call id that step does not have.
       { type: 'tool_result', tool_results: [{ tool_call_id: 'c2', tool_name: 'echo', args: { n: 2 }, result: 'ran:2', tool_call_result_id: null, artifacts: [] }], tool_approval_responses: [], harness_answers_step: { position: 2 } },
@@ -543,7 +543,7 @@ describe('added: Thread.clear() while an approved call runs', () => {
     expect(pendingApprovalIds(rows)).toEqual([]);
     expect(unresolvedApprovalIds(rows)).toEqual([]);
     // The result that landed after the clear names a step the thread no longer has: it is nobody's.
-    expect(threadView(rows).filter((row) => row.type === 'tool_result').flatMap((row) => (row.tool_results ?? []) as JsonObject[]).map((entry) => entry.result)).not.toContain(INTERRUPTED());
+    expect(replayView(rows).filter((row) => row.type === 'tool_result').flatMap((row) => (row.tool_results ?? []) as JsonObject[]).map((entry) => entry.result)).not.toContain(INTERRUPTED());
   });
 });
 
