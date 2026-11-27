@@ -279,7 +279,7 @@ export function unresolvedApprovalIds(rows: readonly JsonObject[]): string[] {
 
   const finished = new Set<string>();
   for (const later of rows.slice(step + 1)) {
-    if (later.type !== 'tool_result') continue;
+    if (later.type !== 'tool_result' || isReplacedStepRow(later)) continue;
     for (const result of list(later.tool_results)) {
       if (typeof result.tool_call_id === 'string') finished.add(result.tool_call_id);
     }
@@ -403,6 +403,80 @@ export function supersededRow(rows: readonly JsonObject[], alsoResults: readonly
     })),
     [SUPERSEDED_KEY]: { approval_ids: approvals },
   };
+}
+
+/**
+ * The key of the mark the 0.11.x release line puts on the row that answers
+ * a REPLACED step's calls: `{position}`, the thread position of the step it
+ * answers, stored AFTER the later step. Main writes its own rows with
+ * SUPERSEDED_KEY, before the superseding row; it READS both, so a thread a
+ * 0.11.x harness wrote resumes with every call answered once. It also writes
+ * this shape for an older step a 0.11.x thread left superseded and
+ * unanswered (answerReplacedSteps), where only an after-the-fact row fits.
+ *
+ * @internal
+ */
+export const REPLACED_STEP_KEY = 'harness_replaced_step';
+
+/** Whether a stored row answers a replaced step (the 0.11.x shape). @internal */
+export function isReplacedStepRow(row: JsonObject): boolean {
+  const mark = row[REPLACED_STEP_KEY];
+  return row.type === 'tool_result' && isObject(mark) && typeof mark.position === 'number';
+}
+
+/** A stored row with its thread position and the run that recorded it. @internal */
+export type PositionedRow = { position: number; message: JsonObject; runId: string | null };
+
+/**
+ * Every tool-call step BEFORE the paused one that a later row superseded
+ * (by the same rule as Thread.record: a later assistant row with tool calls,
+ * or an assistant or user row outside the runs that own it) and that still
+ * has a gated call with no answer: no result of its own before the
+ * superseding row, no harness_superseded denial, no replaced-step answer
+ * naming its position. Such a step exists only in a thread an older
+ * harness wrote; each is answered once, with one replaced-step row.
+ *
+ * @internal
+ */
+export function unansweredReplacedSteps(rows: readonly PositionedRow[], gated: (name: string) => boolean): { position: number; calls: JsonObject[] }[] {
+  const messages = rows.map((row) => row.message);
+  const paused = pausedStepIndex(messages);
+  const answeredAt = new Set(messages.filter((row) => isReplacedStepRow(row)).map((row) => (row[REPLACED_STEP_KEY] as JsonObject).position as number));
+  const out: { position: number; calls: JsonObject[] }[] = [];
+  for (const [index, step] of messages.entries()) {
+    if (index === paused || step.type !== 'assistant' || list(step.tool_calls).length === 0) continue;
+    if (answeredAt.has(rows[index]!.position)) continue;
+    const owners = new Set<string>();
+    if (rows[index]!.runId !== null) owners.add(rows[index]!.runId!);
+    let end = -1;
+    for (let at = index + 1; at < rows.length; at += 1) {
+      const { message, runId } = rows[at]!;
+      if (message.type === 'assistant' && list(message.tool_calls).length > 0) { end = at; break; }
+      if (message.type === 'tool_result' && runId !== null && list(message.tool_results).length > 0) owners.add(runId);
+      if ((message.type === 'user' || message.type === 'assistant') && (runId === null || !owners.has(runId))) { end = at; break; }
+    }
+    if (end === -1) continue;
+    const own = messages.slice(index, end);
+    const answered = stepResultsByPosition(own, 0);
+    const calls = list(step.tool_calls);
+    const open = calls.filter((call, at) => !answered[at] && gated(text(call.name)));
+    if (open.length > 0) out.push({ position: rows[index]!.position, calls: open });
+  }
+
+  return out;
+}
+
+/** The 0.11.x replaced-step answer row, byte for byte as that line writes it. @internal */
+export function replacedStepRow(position: number, calls: readonly JsonObject[]): JsonObject {
+  return {
+    ...toolResultRow(calls.map((call) => toolResultEntry({
+      id: typeof call.id === 'string' ? call.id : '',
+      name: typeof call.name === 'string' ? call.name : '',
+      arguments: isObject(call.arguments) ? call.arguments : {},
+      resultId: typeof call.result_id === 'string' ? call.result_id : null,
+    }, SUPERSEDED_RESULT))),
+    [REPLACED_STEP_KEY]: { position },
+  } as JsonObject;
 }
 
 /**
@@ -716,7 +790,9 @@ export function stepResultsByPosition(rows: readonly JsonObject[], index: number
   // (G-399): a row of another kind between them hides nothing.
   for (const row of rows.slice(index + 1)) {
     if (row.type === 'assistant') break;
-    if (row.type !== 'tool_result') continue;
+    // A 0.11.x replaced-step answer is an EARLIER step's (it names that
+    // step's position): never this step's results.
+    if (row.type !== 'tool_result' || isReplacedStepRow(row)) continue;
     const entries = Array.isArray(row.tool_results) ? list(row.tool_results)
       : Object.hasOwn(row, 'tool_call_id') ? [{ tool_call_id: row.tool_call_id ?? null, tool_name: row.name ?? null }] : [];
     for (const entry of entries) {
@@ -758,7 +834,7 @@ export function repeatedStepSettled(rows: readonly JsonObject[], index: number):
   const calls = list(rows[index]?.tool_calls).map((call) => text(call.id));
   const counts = new Map<string, number>();
   for (const row of rows.slice(index + 1)) {
-    if (row.type !== 'tool_result') continue;
+    if (row.type !== 'tool_result' || isReplacedStepRow(row)) continue;
     const entries = list(row.tool_results);
     if (isObject(row[ENDED_BY_START_KEY]) || isObject(row[SUPERSEDED_KEY]) || entries.some((entry) => entry[NOT_RUN_KEY] === REPEATED_CALL_ID)) return true;
     const here = new Map<string, number>();
@@ -822,6 +898,9 @@ function normalise(row: JsonObject, view: JsonObject[]): JsonObject | null {
       );
 
     case 'tool_result':
+      // A 0.11.x replaced-step answer is stored after the step that replaced
+      // the step it answers: never shown as that later step's results.
+      if (isReplacedStepRow(row)) return null;
       if (Array.isArray(row.tool_results) || Array.isArray(row.tool_approval_responses)) {
         return toolResultRow(
           list(row.tool_results).map((entry) => ({

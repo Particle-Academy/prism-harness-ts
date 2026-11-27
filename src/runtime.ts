@@ -24,6 +24,8 @@ import {
   stepResultsByPosition,
   pausedStepRepeatsCallIds,
   pausedStepIndex,
+  replacedStepRow,
+  unansweredReplacedSteps,
   REPEATED_CALL_ID,
   NOT_RUN_KEY,
   REPEATED_CALL_ID_RESULT,
@@ -1204,6 +1206,9 @@ export class AgentRuntime {
         // first, whatever was decided on it, so nothing from it runs and no
         // later decision is accepted for it. Only a resume (an empty prompt)
         // acts on recorded decisions.
+        // A thread an older harness wrote may hold an earlier step it left
+        // superseded and unanswered: answered once, first (0.11.x shape).
+        if (started === null) await this.#answerReplacedSteps(session, mode, runId, stepping?.locked === true);
         if (started === null && prompt !== '') await thread.supersedePausedStep();
         else if (started === null && !turn.ledger.cancelled && !outOfTime) offered = await this.#resolveApprovals(session, mode, offered, runId, called, scope?.legacy === true, steps, stepping?.locked === true);
 
@@ -1676,6 +1681,26 @@ export class AgentRuntime {
       this.#setting(session, 'lock_ttl') ?? RESOLUTION_LOCK_SECONDS,
       this.#setting(session, 'lock_wait') ?? RESOLUTION_WAIT_SECONDS,
     );
+  }
+
+  /**
+   * Answer, once, every earlier step a thread written by an older harness
+   * left superseded with a gated call unanswered (unansweredReplacedSteps):
+   * one replaced-step row each, in the 0.11.x shape, read again under the
+   * session lock so two turns never answer one step twice.
+   */
+  async #answerReplacedSteps(session: Session, mode: AgentMode, runId: string, alreadyLocked: boolean): Promise<void> {
+    const pending = async (live: Session): Promise<JsonObject[]> => unansweredReplacedSteps(
+      (await live.thread().messages()).map((entry) => ({ position: entry.position, message: entry.message, runId: entry.runId })),
+      (name) => mode.needsApproval(name),
+    ).map(({ position, calls }) => replacedStepRow(position, calls));
+    if ((await pending(session)).length === 0) return;
+    const answer = async (live: Session): Promise<void> => {
+      const rows = await pending(live);
+      if (rows.length > 0) await recordingInRun(runId, () => live.thread().record(rows, runId));
+    };
+    if (alreadyLocked) return await answer(session);
+    await session.lock(answer, this.#setting(session, 'lock_ttl') ?? RESOLUTION_LOCK_SECONDS, this.#setting(session, 'lock_wait') ?? RESOLUTION_WAIT_SECONDS);
   }
 
   /**

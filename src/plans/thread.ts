@@ -1,5 +1,5 @@
 import type { JsonObject, JsonValue } from '../json.js';
-import { endedByStart, pairStepApprovals, pausedStepIndex, pendingApprovalIds, repeatedIdDenials, stepResultsByPosition, supersededApprovals } from '../thread-rows.js';
+import { endedByStart, pairStepApprovals, pausedStepIndex, pendingApprovalIds, repeatedIdDenials, stepResultsByPosition, supersededApprovals, isReplacedStepRow } from '../thread-rows.js';
 import { argsDigest } from '../tool-policy.js';
 import type { PendingCall } from './machine.js';
 
@@ -86,7 +86,7 @@ export function approvedCallsAwaitingResult(rows: readonly JsonObject[], name: s
   const decided = new Map<string, boolean>();
   const finished = new Set<string>();
   for (const later of rows.slice(step + 1)) {
-    if (later.type !== 'tool_result') continue;
+    if (later.type !== 'tool_result' || isReplacedStepRow(later)) continue;
     for (const result of list(later.tool_results)) {
       if (typeof result.tool_call_id === 'string') finished.add(result.tool_call_id);
     }

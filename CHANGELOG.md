@@ -51,6 +51,11 @@
   one that repeats a call id. **Behaviour change:** a new message no longer acts on approvals
   recorded for the paused step first; resume with an empty prompt to act on
   them. The same in every language (harness-approval-pairing apr-0016..0019).
+- A thread written by the 0.11.x line resumes correctly: its answer to a
+  replaced step (`harness_replaced_step: {position}`, stored after the later
+  step) is read as that earlier step's, never as the later step's results
+  or replayed to a provider, and an earlier step that line left superseded
+  but unanswered is answered once, in the same shape.
 - A step's results are read from every result row after it, up to the next
   assistant row, so a row of another kind between them (a system row, an
   empty result row, a host's own row) can no longer hide a call's result and
