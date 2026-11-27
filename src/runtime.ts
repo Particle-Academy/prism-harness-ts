@@ -1647,7 +1647,6 @@ export class AgentRuntime {
       if (!(await live.thread().claimInFlight(work.position, claim, ttl))) return offered;
       let settled = false;
       try {
-
         const resolved: ToolResultEntry[] = [];
 
         for (const [index, call] of work.calls.entries()) {
