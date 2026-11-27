@@ -142,6 +142,11 @@ interface Request {
    * id (G-397). A request that repeats another's id records no decision.
    */
   approval?: number;
+  /**
+   * G-401: a SECOND decision for the same approval, in the same batch or
+   * recorded after it. The first decision stands; the second records nothing.
+   */
+  second?: { verdict: 'approve' | 'deny'; reason: string | null; same: boolean };
 }
 
 /** A later tool-call step another writer recorded after the park (G-397). */
@@ -384,13 +389,13 @@ function generate(seed: number): Case {
     insert: insertion(seed, calls, prior, later),
     failOnce,
     spent,
-    later,
+    later: later === null ? null : { ...later, requests: seconds(seed ^ 0x4010, later.requests) },
     ...storage(seed, calls.length, later?.calls.length ?? 0),
     lossy: [],
     junk: null,
     copy: null,
   };
-  return sharing(c);
+  return sharing({ ...c, requests: seconds(seed, c.requests) });
 }
 
 /**
@@ -431,6 +436,22 @@ function sharing(c: Case): Case {
     return { ...c, calls, later, lossy, junk, copy, requests, order: [...c.order, requests.length - 1], stringArgs: { ...c.stringArgs, parked: [...c.stringArgs.parked, false] } };
   }
   return { ...c, calls, later, lossy, junk, copy };
+}
+
+/**
+ * G-401: give some decided requests a second decision for the same approval,
+ * drawn from a generator of its own so every other draw of the seed is
+ * unchanged. Never for a request that carries another's approval id.
+ */
+function seconds(seed: number, requests: Request[]): Request[] {
+  const rng = new Rng((seed ^ 0x401401) >>> 0);
+  return requests.map((request) => {
+    const draw = rng.next();
+    const verdict = rng.chance(0.5) ? 'approve' : 'deny';
+    const same = rng.chance(0.5);
+    if (request.verdict === 'none' || request.approval !== undefined || draw >= 0.2) return request;
+    return { ...request, second: { verdict, reason: verdict === 'deny' ? 'second-no' : null, same } };
+  });
 }
 
 /** G-397: argument storage forms and an earlier step reusing ids, from a generator of their own. */
@@ -823,17 +844,30 @@ async function runCase(c: Case): Promise<void> {
   }
 
   // The decisions, in a shuffled order: the parked step's, then a later step's.
-  const oldDecisions = c.order.filter((index) => c.requests[index]!.verdict !== 'none').map((index) => ({
+  type Decision = { approvalId: string; approved: boolean; reason: string | null };
+  const oldDecisions: Decision[] = c.order.filter((index) => c.requests[index]!.verdict !== 'none').map((index) => ({
     approvalId: approvalIds[index]!,
     approved: c.requests[index]!.verdict === 'approve',
     reason: c.requests[index]!.reason,
   }));
-  const newDecisions: { approvalId: string; approved: boolean; reason: string | null }[] = [];
+  const newDecisions: Decision[] = [];
   c.later?.requests.forEach((request, index) => {
     const id = `apr_later_${c.seed}_${index}`;
     approvalIds.push(id);
     if (request.verdict !== 'none') newDecisions.push({ approvalId: id, approved: request.verdict === 'approve', reason: request.reason });
   });
+  // G-401: second decisions, in the same batch (after the batch's own) or recorded just after it.
+  const secondOf = (requests: Request[], ids: (index: number) => string, same: boolean): Decision[] => requests.flatMap((request, index) => (
+    request.second !== undefined && request.second.same === same
+      ? [{ approvalId: ids(index), approved: request.second.verdict === 'approve', reason: request.second.reason }] : []));
+  const oldId = (index: number): string => approvalIds[index]!;
+  const newId = (index: number): string => `apr_later_${c.seed}_${index}`;
+  oldDecisions.push(...secondOf(c.requests, oldId, true));
+  newDecisions.push(...secondOf(c.later?.requests ?? [], newId, true));
+  const afterBatch = { old: secondOf(c.requests, oldId, false), new: secondOf(c.later?.requests ?? [], newId, false) };
+  // The decision that stands for each approval: the first one accepted.
+  const standing = new Map<string, Decision>();
+  const accepted = (batch: Decision[]): void => { for (const d of batch) if (!standing.has(d.approvalId)) standing.set(d.approvalId, d); };
   const recordLater = async (): Promise<void> => {
     // The later step, as another writer could record it after the park.
     const later = c.later!;
@@ -905,6 +939,7 @@ async function runCase(c: Case): Promise<void> {
       continue;
     }
     const batch = action === 'old' ? oldDecisions : newDecisions;
+    const later = action === 'old' ? afterBatch.old : afterBatch.new;
     if (batch.length === 0) continue;
     const expectRefused = action === 'old' ? oldSuperseded : newSuperseded;
     // A stream records and resumes at once, so it is used only for the last
@@ -925,18 +960,32 @@ async function runCase(c: Case): Promise<void> {
       if (!no) {
         resumedYet = true;
         if (run !== null) {
+          // One decision_recorded step per decision given, reporting the
+          // decision that stands for its approval (G-401).
+          const stands = new Map(standing);
+          for (const d of batch) if (!stands.has(d.approvalId)) stands.set(d.approvalId, d);
           const recorded = (run as Turn).steps!.filter((step) => step.type === 'decision_recorded');
-          check(JSON.stringify(recorded.map((step) => [step.approvalId, step.verdict])) === JSON.stringify(batch.map((d) => [d.approvalId, d.approved ? 'approved' : 'denied'])),
-            '6: one decision_recorded step per decision, as given');
+          check(JSON.stringify(recorded.map((step) => [step.approvalId, step.verdict])) === JSON.stringify(batch.map((d) => [d.approvalId, stands.get(d.approvalId)!.approved ? 'approved' : 'denied'])),
+            '6: one decision_recorded step per decision, reporting the one that stands');
         }
+        accepted(batch);
       }
     } else if (c.recorder === 'recordDecisions') {
       const no = await refused(() => recordDecisions(r.session, batch));
       check(no === expectRefused, 'G-397: a decision is refused exactly when its step was superseded first', { action, no, expectRefused });
+      if (!no) accepted(batch);
     } else {
       for (const d of batch) {
         const no = await refused(() => recordApproval(r.session, d.approvalId, d.approved, d.reason));
         check(no === expectRefused, 'G-397: a decision is refused exactly when its step was superseded first', { action, no, expectRefused });
+        if (!no) accepted([d]);
+      }
+    }
+    // G-401: a second decision recorded after the batch (before any resume) records nothing.
+    if (!resumedYet) {
+      for (const d of later) {
+        const no = await refused(() => recordApproval(r.session, d.approvalId, d.approved, d.reason));
+        check(no === expectRefused, 'G-397: a decision is refused exactly when its step was superseded first', { action, no, expectRefused, second: true });
       }
     }
   }
@@ -1207,6 +1256,15 @@ describe('G-392 property: approval pairing invariants over generated steps', () 
     expect(has((c) => c.again.length > 0 && c.again.some((a) => a.approveAll))).toBe(true);
     for (const path of PATHS) expect(has((c) => c.resume === path)).toBe(true);
     expect(has((c) => c.recorder === 'streamDecision')).toBe(true);
+    // G-401: a second decision for the same approval, in the same batch and after it, on every recorder, both orders.
+    for (const same of [true, false]) {
+      for (const recorder of ['recordApproval', 'recordDecisions', 'streamDecision'] as const) {
+        expect(has((c) => c.recorder === recorder && c.requests.some((q) => q.second?.same === same && q.verdict === 'deny' && q.second.verdict === 'approve')), `deny then approve, same ${same}, ${recorder}`).toBe(true);
+      }
+      expect(has((c) => c.requests.some((q) => q.second?.same === same && q.verdict === 'approve' && q.second.verdict === 'deny')), `approve then deny, same ${same}`).toBe(true);
+    }
+    expect(has((c) => c.failOnce && c.requests.some((q) => q.second !== undefined && q.verdict === 'deny')), 'second decision, then a resume whose model call fails').toBe(true);
+    expect(has((c) => c.later !== null && c.later.requests.some((q) => q.second !== undefined)), 'second decision on a later step').toBe(true);
     // G-397 / G-399: every inserted row kind, before and after the decision (main's shape check).
     for (const kind of INSERT_KINDS) {
       for (const when of ['before_decision', 'after_decision'] as const) expect(has((c) => c.insert?.kind === kind && c.insert.when === when), `${kind} ${when}`).toBe(true);
