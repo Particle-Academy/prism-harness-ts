@@ -132,3 +132,59 @@ describe('two identical gated calls in one step', () => {
     expect((resolution[0]!.tool_results as JsonObject[]).map((entry) => entry.result)).toEqual([REPEATED, REPEATED]);
   });
 });
+
+describe('an approved call that outlives the lock TTL', () => {
+  it('the clock passes the TTL mid-call while the host records a tool-call step reusing its id, and another worker resumes: the lock is not taken over, the call runs once, keeps its one outcome, and the later call is decided by its own approval', async () => {
+    const { mkdtemp } = await import('node:fs/promises');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { FileSessionStore } = await import('../src/index.js');
+    // Two workers sharing their stores, as two processes do: the session lock
+    // lives in the ephemeral slot, here a file store with a real TTL.
+    const directory = await mkdtemp(join(tmpdir(), 'prism-harness-ttl-'));
+    const locks = await mkdtemp(join(tmpdir(), 'prism-harness-ttl-locks-'));
+    const build = (): { session: Session; agent: AgentRuntime } => {
+      const harness = new PrismHarness({
+        drivers: { shared: () => new FileSessionStore(locks), file: () => new FileSessionStore(directory) },
+        stores: { ephemeral: 'shared', durable: 'file' },
+      });
+      return {
+        session: harness.for({ type: 'User', id: 1 }).session('ttl'),
+        agent: undefined as unknown as AgentRuntime,
+      };
+    };
+    const ran: number[] = [];
+    let during: (() => Promise<void>) | null = null;
+    let model = 0;
+    const runtime = (): AgentRuntime => new AgentRuntime({
+      config: { lock_ttl: 1, lock_wait: 0 },
+      modes: new ModeRegistry({ default: 'guarded', modes: { guarded: { system_prompt: 'Careful.', tools: ['echo'], max_steps: 6, requires_approval: ['echo'] } } }),
+      tools: new ToolRegistry().register({ name: 'echo', handle: async (args: JsonObject) => { ran.push(Number(args.n)); const d = during; during = null; if (d !== null) await d(); return `ran:${String(args.n)}`; } }),
+      client: async (): Promise<LlmResponse> => (++model === 1 ? { text: '', finishReason: 'tool_calls', toolCalls: [{ id: 'c1', name: 'echo', arguments: { n: 1 } }] } : { text: 'done', finishReason: 'stop' }),
+    });
+    const one = build(), other = build();
+    const agent = runtime(), worker = runtime();
+    const [pending] = (await agent.send(one.session, 'go')).pendingApprovals;
+    await recordApproval(one.session, pending!.id, true);
+    let stolen: unknown = 'not tried';
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      during = async () => {
+        // Well past the 1 s TTL, without waiting.
+        vi.setSystemTime(Date.now() + 60_000);
+        await one.session.thread().record([hostStep([['c1', 3, 'apr_later']])]);
+        stolen = await worker.send(other.session, '').then(() => 'resumed', (error: unknown) => (error as { code?: string }).code);
+      };
+      await agent.send(one.session, '');
+    } finally {
+      vi.useRealTimers();
+    }
+    await recordApproval(one.session, 'apr_later', false, 'not this');
+    for (let i = 0; i < 2; i += 1) await agent.send(one.session, '');
+
+    expect(stolen).toBe('session_locked');
+    expect(ran).toEqual([1]);
+    expect([...new Set(await results(one.session, 1))]).toEqual(['ran:1']);
+    expect([...new Set(await results(one.session, 3))]).toEqual(['not this']);
+  });
+});

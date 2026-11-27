@@ -163,7 +163,7 @@ function onceEach(view: JsonObject[]): JsonObject[] {
   let shown = new Map<string, { row: number; entry: number }[]>();
   const removed = new Set<string>();
   view.forEach((row, at) => {
-    if (row.type === 'assistant' && list(row.tool_calls).length > 0) { shown = new Map(); return; }
+    if (isToolCallStep(row)) { shown = new Map(); return; }
     if (row.type !== 'tool_result') return;
     const results = (row as ToolResultRow).tool_results;
     const here = new Map<string, number>();
@@ -474,6 +474,18 @@ export function isReplacedStepRow(row: JsonObject): boolean {
   return row.type === 'tool_result' && isObject(mark) && typeof mark.position === 'number';
 }
 
+/**
+ * THE rule for which rows are tool-call steps, for every reader (G-408): an
+ * assistant row with at least one tool call that is an object. A row whose
+ * tool_calls hold no objects (strings, numbers, null, arrays) is an assistant
+ * row without tool calls.
+ *
+ * @internal
+ */
+export function isToolCallStep(row: JsonObject | undefined): boolean {
+  return row !== undefined && row.type === 'assistant' && list(row.tool_calls).length > 0;
+}
+
 /** A stored thread row and the run that recorded it. @internal */
 export type StoredRow = { position: number; message: JsonObject; runId: string | null; harness?: true };
 
@@ -506,7 +518,7 @@ export function supersededAt(rows: readonly StoredRow[], index: number): number 
     const row = rows[at]!;
     const { message } = row;
     const run = inside(row);
-    if (message.type === 'assistant' && list(message.tool_calls).length > 0) return at;
+    if (isToolCallStep(message)) return at;
     if (message.type === 'tool_result' && run !== null && list(message.tool_results).length > 0) owners.add(run);
     if ((message.type === 'user' || message.type === 'assistant') && (run === null || !owners.has(run))) return at;
   }
@@ -535,7 +547,7 @@ export function resultOwners(messages: readonly StoredRow[]): Map<number, Set<nu
   let segment = -1;
   const args = (value: JsonValue | undefined): string => canonicalJson(usableArguments(value) ?? {});
   for (const [index, { position, message: row, harness }] of messages.entries()) {
-    if (row.type === 'assistant' && list(row.tool_calls).length > 0) {
+    if (isToolCallStep(row)) {
       segment = index;
       owned.set(index, new Set());
       seen.set(index, new Set());
@@ -597,7 +609,7 @@ export function replacedStepCalls(
   const owners = resultOwners(messages);
   const replaced: { position: number; calls: JsonObject[] }[] = [];
   for (const [index, step] of rows.entries()) {
-    if (step.type !== 'assistant' || list(step.tool_calls).length === 0) continue;
+    if (!isToolCallStep(step)) continue;
     if (supersededAt(messages, index) === -1) continue;
     const done = owners.get(index)!;
     const calls = list(step.tool_calls);

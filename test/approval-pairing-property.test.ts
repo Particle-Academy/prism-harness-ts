@@ -205,6 +205,30 @@ interface Case {
    * arguments would keep them. They still answer their own call.
    */
   lossy: number[];
+  /**
+   * G-408: after every decision, the host records an assistant row whose
+   * tool_calls hold no objects (a string, a number, null, strings, or a
+   * string that is not an array), keeping or dropping the requests; or a
+   * MIXED array, whose one object (an ungated call) makes it a tool-call step.
+   */
+  junk: { kind: 'string' | 'number' | 'null' | 'strings' | 'scalar' | 'mixed'; requests: boolean } | null;
+}
+
+/** An assistant row's tool_calls in the junk shape: never an object, except one ungated call in a mixed array. */
+function junkCalls(kind: NonNullable<Case['junk']>['kind'], id: string): JsonValue {
+  switch (kind) {
+    case 'string': return ['x'];
+    case 'number': return [7];
+    case 'null': return [null];
+    case 'strings': return [[id, 'echo'], JSON.stringify({ id, name: 'echo', arguments: {} })];
+    case 'scalar': return JSON.stringify({ id });
+    case 'mixed': return ['x', { id, name: 'free', arguments: { n: 901 }, result_id: null, reasoning_id: null, reasoning_summary: null }, null, 3];
+  }
+}
+
+/** Whether a stored row is a tool-call step: an assistant row with at least one tool call that is an object. */
+function isStepRow(row: JsonObject): boolean {
+  return row.type === 'assistant' && Array.isArray(row.tool_calls) && row.tool_calls.some((call) => typeof call === 'object' && call !== null && !Array.isArray(call));
 }
 
 type InsertKind = 'assistant_text' | 'assistant_call' | 'user' | 'system' | 'tool_empty' | 'tool_result';
@@ -339,6 +363,7 @@ function generate(seed: number): Case {
     later,
     ...storage(seed, calls.length, later?.calls.length ?? 0),
     lossy: [],
+    junk: null,
   };
   return sharing(c);
 }
@@ -368,6 +393,7 @@ function sharing(c: Case): Case {
     })(),
   };
   const lossy = c.prior.filter((index) => c.calls[index]!.tool === 'echo' && rng.chance(0.5));
+  const junk = rng.chance(0.15) ? { kind: rng.pick(['string', 'number', 'null', 'strings', 'scalar', 'mixed'] as const), requests: rng.chance(0.5) } : null;
   // Two IDENTICAL gated calls in one step (same id, tool and arguments): the
   // clone gets its own request, as the runtime would issue one.
   const source = gated[0];
@@ -375,9 +401,9 @@ function sharing(c: Case): Case {
     const index = calls.length;
     calls.push({ ...calls[c.calls.indexOf(source)]!, token: source.token });
     const requests = [...c.requests, { call: index, verdict: rng.pick<Verdict>(['approve', 'deny', 'none']), reason: null }];
-    return { ...c, calls, later, lossy, requests, order: [...c.order, requests.length - 1], stringArgs: { ...c.stringArgs, parked: [...c.stringArgs.parked, false] } };
+    return { ...c, calls, later, lossy, junk, requests, order: [...c.order, requests.length - 1], stringArgs: { ...c.stringArgs, parked: [...c.stringArgs.parked, false] } };
   }
-  return { ...c, calls, later, lossy };
+  return { ...c, calls, later, lossy, junk };
 }
 
 /** G-397: argument storage forms and an earlier step reusing ids, from a generator of their own. */
@@ -416,6 +442,10 @@ function expected(c: Case): Expected {
   const supersedes = insert !== null && SUPERSEDES.includes(insert.kind);
   const steps = [{ key: 'p', calls: c.calls, requests: c.requests, prior: c.prior, superseded: c.later !== null || supersedes }];
   if (c.later !== null) steps.push({ key: 'l', calls: c.later.calls, requests: c.later.requests, prior: [], superseded: supersedes && insert!.segment === 'later' });
+  // G-408: the host's junk row, recorded after every decision, is an
+  // assistant row outside the run (or, mixed, a tool-call step): it
+  // supersedes whichever step was still being decided.
+  if (c.junk !== null) steps.at(-1)!.superseded = true;
   // The call a forged result answers: in its own segment's step.
   let forged: { step: number; call: number; text: string } | null = null;
   if (insert?.kind === 'tool_result') {
@@ -609,7 +639,7 @@ async function attributed(session: Session, steps: RecordedStep[]): Promise<Map<
   const at = new Map<number, number>();
   let step = -1;
   for (const { position, message } of await session.thread().messages()) {
-    if (message.type === 'assistant' && Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
+    if (isStepRow(message)) {
       step += 1;
       at.set(position, step);
       continue;
@@ -813,7 +843,7 @@ async function runCase(c: Case): Promise<void> {
     // A stream records and resumes at once, so it is used only for the last
     // thing the case does before its resume.
     const last = plan.slice(at + 1).every((next) => (next === 'old' ? oldDecisions : next === 'new' ? newDecisions : [1]).length === 0);
-    if (c.recorder === 'streamDecision' && last && !resumedYet) {
+    if (c.recorder === 'streamDecision' && last && !resumedYet && c.junk === null) {
       let run: Turn | null = null;
       // A refused stream fails before it records or resumes anything, so it is
       // not the resume a scripted model failure is expected on.
@@ -842,6 +872,15 @@ async function runCase(c: Case): Promise<void> {
         check(no === expectRefused, 'G-397: a decision is refused exactly when its step was superseded first', { action, no, expectRefused });
       }
     }
+  }
+  if (c.junk !== null && !resumedYet) {
+    const named = c.later?.calls[0]?.id ?? c.calls[0]!.id;
+    const requests = c.junk.requests
+      ? (c.later === null ? c.requests.map((q, index) => ({ approval_id: approvalIds[index]!, tool_call_id: c.calls[q.call]!.id, arguments_format: ARGUMENTS_AS_SENT }))
+        : c.later.requests.map((q, index) => ({ approval_id: `apr_later_${c.seed}_${index}`, tool_call_id: c.later!.calls[q.call]!.id, arguments_format: ARGUMENTS_AS_SENT })))
+      : [];
+    await r.session.thread().record([{ type: 'assistant', content: '', tool_calls: junkCalls(c.junk.kind, named), additional_content: {}, tool_approval_requests: requests, harness_tool_names: ['echo', 'free'] }]);
+    if (c.junk.kind === 'mixed') recorded.push({ calls: [{ key: 'x1', id: named, name: 'free', args: { n: 901 } }] });
   }
   if (!resumedYet) first = await resumed(async () => await turn(r, c.resume, ''));
 
@@ -915,7 +954,7 @@ async function settledOutcomes(r: Rig, recorded: RecordedStep[], oracle: Expecte
  */
 async function replayKeepsEveryResult(session: Session, label: string): Promise<void> {
   const stored = await rows(session);
-  const isStep = (row: JsonObject): boolean => row.type === 'assistant' && Array.isArray(row.tool_calls) && row.tool_calls.length > 0;
+  const isStep = isStepRow;
   const segments = (list: JsonObject[], view: boolean): Map<string, number>[] => {
     const out: Map<string, number>[] = [];
     for (const row of list) {
@@ -994,6 +1033,7 @@ function smaller(c: Case): Case[] {
   if (c.again.length > (c.failOnce ? 1 : 0)) out.push({ ...c, again: c.again.slice(0, -1) });
   if (c.insert !== null) out.push({ ...c, insert: null });
   if (c.history !== null) out.push({ ...c, history: null });
+  if (c.junk !== null) out.push({ ...c, junk: null });
   if (c.failOnce) out.push({ ...c, failOnce: false });
   if (c.spent) out.push({ ...c, spent: false });
   if (c.later !== null) out.push({ ...c, later: null });
@@ -1118,6 +1158,13 @@ describe('G-392 property: approval pairing invariants over generated steps', () 
     expect(has((c) => c.later !== null && c.insert?.kind === 'tool_result' && c.insert.segment === 'later' && c.insert.step === 'later'), 'forged, later segment, later call').toBe(true);
     expect(has((c) => c.later !== null && c.insert?.kind === 'tool_result' && c.insert.segment === 'later' && c.insert.step === 'earlier'), 'forged, later segment, earlier call').toBe(true);
     expect(has((c) => c.later !== null && c.insert?.kind === 'tool_result' && c.insert.step === 'later' && decideStep('l', c.later.calls, c.later.requests, []).repeated), 'forged in a later step that repeats ids').toBe(true);
+    // G-408: rows whose tool_calls hold no objects, each shape, with and without requests, after an approval.
+    for (const kind of ['string', 'number', 'null', 'strings', 'scalar', 'mixed'] as const) {
+      for (const requests of [true, false]) {
+        expect(has((c) => c.junk?.kind === kind && c.junk.requests === requests && expected(c).outcome.size > 0), `junk ${kind} requests ${requests}`).toBe(true);
+      }
+    }
+    expect(has((c) => c.junk !== null && c.junk.requests && c.spent && c.requests.some((q) => q.verdict === 'approve')), 'junk with requests on a spent run after an approve').toBe(true);
     // Two identical gated calls (same id, tool and arguments) in one step, with an approval, and on a spent run.
     expect(has((c) => c.calls.some((call, i) => call.tool === 'echo' && c.calls.some((other, j) => j > i && other.tool === 'echo' && other.id === call.id && other.token === call.token))
       && c.requests.some((q) => q.verdict === 'approve')), 'identical gated calls').toBe(true);
