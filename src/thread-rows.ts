@@ -641,12 +641,33 @@ export function replayRows(messages: readonly StoredRow[]): JsonObject[] {
  * items; Anthropic thinking, thinking_signature, thinking_blocks, or
  * thinking and redacted_thinking blocks), which cannot be checked. Otherwise
  * all of those keys are dropped and the client maps the row from `content`
- * and `tool_calls`. Every other key is
+ * and `tool_calls`. A host row's tool calls are always sent without a
+ * reasoning id or summary, for the same reason. Every other key is
  * kept, rows the harness wrote are returned as they are, and the stored row is
  * unchanged.
  */
 function withoutHostToolItems(row: JsonObject, harness: true | undefined): JsonObject {
-  if (harness === true || row.type !== 'assistant' || !isObject(row.additional_content)) return row;
+  if (harness === true || row.type !== 'assistant') return row;
+  return withoutCallReasoning(withoutForeignContent(row));
+}
+
+/**
+ * A host row's tool calls without a reasoning id or summary (G-415). A client
+ * rebuilds a reasoning item from those fields when a row carries no provider
+ * content, and reasoning on a host row cannot be checked. Every other field of
+ * a call is kept; entries that are not objects are left as they are.
+ */
+function withoutCallReasoning(row: JsonObject): JsonObject {
+  if (!Array.isArray(row.tool_calls)) return row;
+  const carries = (call: JsonValue): boolean => isObject(call)
+    && ((call.reasoning_id !== undefined && call.reasoning_id !== null) || (call.reasoning_summary !== undefined && call.reasoning_summary !== null));
+  if (!row.tool_calls.some(carries)) return row;
+  return { ...row, tool_calls: row.tool_calls.map((call) => (carries(call) ? { ...(call as JsonObject), reasoning_id: null, reasoning_summary: null } : call)) };
+}
+
+/** A host row without provider content that is not its own (see `withoutHostToolItems`). */
+function withoutForeignContent(row: JsonObject): JsonObject {
+  if (!isObject(row.additional_content)) return row;
   const additional = row.additional_content;
   const own = callPrints(list(row.tool_calls).map((call) => [text(call.id), text(call.name)]));
   const content = typeof row.content === 'string' ? row.content : '';
