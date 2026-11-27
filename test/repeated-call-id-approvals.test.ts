@@ -314,10 +314,11 @@ describe('G-392: ended entries carry their own approval id', () => {
       .flatMap((row) => (row.harness_ended_by_start as { approval_ids: string[] }).approval_ids);
     expect(ended).toEqual(ids);
     const step = await r.step();
-    for (const id of ids) {
-      expect(step.approvedIds).not.toContain(id);
-      expect(step.supersededApprovalIds).toContain(id);
-    }
+    // Round 13: both decisions were RECORDED as the repeated-id denial (as
+    // the PHP reference records them), so the step never counted them
+    // approved, before the start or after it.
+    for (const id of ids) expect(step.approvedIds).not.toContain(id);
+    expect(storedDecisionsOf(await r.rows(), ids)).toEqual(ids.map(() => [false, 'Tool call was not run because another call in this step has the same id']));
   });
 
   it('unique ids in a step a start ends: each ended entry names its own approval (control)', async () => {
@@ -342,3 +343,9 @@ describe('G-392: ended entries carry their own approval id', () => {
     for (const id of ids) expect(step.approvedIds).not.toContain(id);
   });
 });
+
+/** The first stored decision for each id, as [approved, reason]. */
+function storedDecisionsOf(rows: JsonObject[], ids: string[]): [unknown, unknown][] {
+  const answers = rows.filter((row) => row.type === 'tool_result').flatMap((row) => (row.tool_approval_responses ?? []) as JsonObject[]);
+  return ids.map((id) => { const answer = answers.find((entry) => entry.approval_id === id); return [answer?.approved, answer?.reason]; });
+}

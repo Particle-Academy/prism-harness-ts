@@ -20,7 +20,9 @@ import {
   type LlmResponse,
   type ModeConfig,
 } from '../src/index.js';
-import { pausedApprovalIds } from '../src/thread-rows.js';
+import { endedByStart, pausedApprovalIds } from '../src/thread-rows.js';
+import { approvalDecisions, pendingApprovalCalls } from '../src/plans/thread.js';
+import { activeTurn } from '../src/runtime.js';
 
 /*
  * G-387 round 11 item 7, extended in round 12 (items 3 and 8): THE INVARIANT
@@ -212,6 +214,10 @@ class Rig {
   onResolve: ((view: Session) => Promise<void>) | null = null;
   /** A measurement a listener started: the run waits for it at its next tool resolution or model request. */
   pending: Promise<void> | null = null;
+  /** Every child model request (not a measurement's) throws: a start that fails AFTER its task row (round 13). */
+  failChild = false;
+  /** How many times `echo` ran. */
+  echoed = 0;
   #call = 0;
 
   constructor() {
@@ -225,7 +231,7 @@ class Rig {
         work: { system_prompt: 'Work.', tools: ['*'], max_steps: 8, requires_approval: ['echo', 'danger'], plans: true } as ModeConfig,
       },
     });
-    this.registry = new ToolRegistry().register({ name: 'echo', handle: () => 'ok' });
+    this.registry = new ToolRegistry().register({ name: 'echo', handle: () => { this.echoed += 1; return 'ok'; } });
     // A host provider that offers `probe` to every child, and `danger` only
     // to a session whose mode is not the child's own (`work`): a reader that
     // reports the wrong mode shows in the offer.
@@ -255,6 +261,7 @@ class Rig {
           }
         }
         this.requests.push(request);
+        if (this.failChild && measuring.getStore() !== true && request.systemPrompt.startsWith('Work.')) throw new Error('MODEL-SECRET');
         // A measurement never takes the scripted answers (if it reaches the
         // model at all, the request count shows it).
         if (measuring.getStore() === true) return { text: 'Measured.', finishReason: 'stop' };
@@ -290,8 +297,8 @@ class Rig {
     return this.session('chat::sub::a');
   }
 
-  calls(calls: [string, JsonObject][]): void {
-    this.queue.push({ text: '', finishReason: 'tool_calls', toolCalls: calls.map(([name, args]) => ({ id: `call_${++this.#call}`, name, arguments: args })) });
+  calls(calls: [string, JsonObject, string?][]): void {
+    this.queue.push({ text: '', finishReason: 'tool_calls', toolCalls: calls.map(([name, args, id]) => ({ id: id ?? `call_${++this.#call}`, name, arguments: args })) });
   }
 
   text(text: string): void {
@@ -393,11 +400,13 @@ function cells(values: Values, prior: Values, next: Values | null, start: string
  * parked on an echo approval, then left too deep to answer, with a mode the
  * host set (`lead`). Every reader's PRIOR value differs from the start's NEW one.
  */
-async function prepared(): Promise<{ r: Rig; parked: string; prior: Values }> {
+async function prepared(step: [string, JsonObject, string?][] = [['echo', { n: 1 }]], decide = false): Promise<{ r: Rig; parked: string; prior: Values }> {
   const r = new Rig();
   await r.session().usingMode('lead');
-  await r.delegate('First task', () => r.calls([['echo', { n: 1 }]]));
+  await r.delegate('First task', () => r.calls(step));
   const parked = (await r.approvals()).pop()!;
+  // A person decides while the approval is answerable (round 13 scenarios).
+  if (decide) expect(await approve(r.child(), parked)).toBe('accepted');
   const key = `${r.child().key()}:durable`;
   await r.durable.put(key, { ...((await r.durable.get(key)) ?? {}), child_depth: 1_000 });
   await r.child().usingMode('lead');
@@ -408,7 +417,7 @@ async function prepared(): Promise<{ r: Rig; parked: string; prior: Values }> {
   expect(prior.run).not.toBeNull();
   expect(prior.resumed_tree).not.toBeNull();
   expect(prior.paused).toBe(true);
-  expect(await approve(r.child(), parked)).toBe(TOO_DEEP);
+  expect(await approve(r.child(), parked)).toBe(decide ? ENDED : TOO_DEEP);
 
   return { r, parked, prior };
 }
@@ -558,4 +567,249 @@ describe('G-387 rounds 11-12: the child-state invariant matrix', () => {
       expect({ during, after }).toEqual({ during: EXPECTED[`${phase}_during`], after: EXPECTED[phase] });
     });
   }
+});
+
+/*
+ * Round 13 (BRIEF-R13 items 1, 3 and 6): the matrix's new scenarios, phase
+ * and checks, permanent. Every failure scenario before this round failed
+ * BEFORE the task row; these fail after it, are cancelled, repeat call ids,
+ * and keep running after a completed start.
+ *
+ * Tokens as above, plus:
+ *   LATER  the current run is a turn that ran after the start (completes+)
+ * Actions (outside, on a fresh Session): approval / approval1 (recordApproval
+ * on the first / second parked approval), host_turn (a new message under a
+ * context the host supplies), second_start (a later delegation:
+ * `completed+wrote` is a start that ran and wrote its records).
+ *
+ * Not a column in TS: `cancel S`. A run here is cancelled through the
+ * ledger of the context it runs under (RunContext.ledger.cancel), which
+ * reads and writes no child state and is not addressed by run id; TS has no
+ * durable tree cancel (G-285). The `cancelled` scenario covers it: a cancel
+ * inside the start's run, before its first model step.
+ */
+
+/** A start's records once its task row is written and its run has ended, for every reader. */
+const RECORDED: Cells = {
+  mode: 'NEW', binding: 'BOUND', refs: 'NEW', depth: 'NEW', ceiling: 'NEW', run: 'NEW', offer: 'NEW',
+  provisional: 'no', plans: 'yes', plan_run: 'NONE', paused: 'no', busy: 'no', resumed_tree: 'ABSENT', policy: 'NEW',
+};
+type R13Side = { inside?: Record<string, string>; outside: Record<string, string> };
+
+export const EXPECTED_R13: Record<string, Record<string, R13Side>> = {
+  // Phase at RunFinished(S), inside a run.finished listener: the start
+  // stands, its run is completed and its holds are already released
+  // (round 13: released BEFORE run.finished, as before run.failed).
+  completes: {
+    at_run_finished: { inside: { ...RECORDED, decision_same: ENDED }, outside: { ...RECORDED, approval: ENDED } },
+    after: { outside: { ...RECORDED, approval: ENDED, second_start: 'completed+wrote' } },
+  },
+  // A completed start followed by more turns on the child: nothing about the
+  // start is undone by them, or by any cleanup on the success path (item 5).
+  'completes+': {
+    after_more: { outside: { ...RECORDED, run: 'LATER', approval: ENDED, host_turn: 'ran', second_start: 'completed+wrote' } },
+  },
+  // The child's model request fails AFTER the task row: the start stands
+  // (it is never undone once its task row exists), measured during the
+  // failure (run.failed) and after it.
+  fails_after_task: {
+    failed_kept_during: { inside: { ...RECORDED, decision_same: ENDED }, outside: { ...RECORDED, approval: ENDED } },
+    failed_kept: { outside: { ...RECORDED, approval: ENDED, host_turn: 'ran', second_start: 'completed+wrote' } },
+  },
+  // Cancelled inside its run, before its first model step: the task row is
+  // still recorded (a stop never refuses a committed start), it takes no
+  // model step, and its parked call is ended. No durable tree cancel in TS
+  // (G-285): a later host turn under its own context runs.
+  cancelled: {
+    after: { outside: { ...RECORDED, approval: ENDED, host_turn: 'ran' } },
+  },
+  // Two gated calls under one id (G-392 composed with the start): both
+  // approvals end, in call order, in one mark.
+  repeated_ids: {
+    after: { outside: { ...RECORDED, approval: ENDED, approval1: ENDED } },
+  },
+  // Round 13 item 1 (TS F1): a gated call and an UNGATED call share an id;
+  // the ungated one ran; a person decided the gated one while it was
+  // answerable. Expected: ended / not run / not offered again.
+  mixed_repeated: {
+    after: { outside: { ...RECORDED, approval: ENDED } },
+  },
+};
+
+function cells13(values: Values, prior: Values, next: Values, start: string): Record<string, string> {
+  const out: Record<string, string> = cells(values, prior, next, start);
+  if (out.run?.startsWith('?') === true && typeof values.run === 'string') out.run = 'LATER';
+  return out;
+}
+
+async function hostTurn(r: Rig, session: Session): Promise<string> {
+  return r.runtime.send(session, 'More work.', undefined, RunContext.root(`host_${Math.random()}`, new RunBudget(8))).then(() => 'ran', code);
+}
+
+/** Capture the start's run id and its own Session object from commit (b). */
+function captureStart(): { start: () => string | null; own: () => Session | null } {
+  let start: string | null = null;
+  let own: Session | null = null;
+  const original = Session.prototype.rememberChildStart;
+  vi.spyOn(Session.prototype, 'rememberChildStart').mockImplementation(async function (this: Session, ...args: Parameters<Session['rememberChildStart']>) {
+    const result = await original.apply(this, args);
+    if (start === null && measuring.getStore() !== true) { own = this; start = args[3].runId; }
+    return result;
+  });
+
+  return { start: () => start, own: () => own };
+}
+
+/** The start under test from a parent turn under `context`, without asserting the parent's answer. */
+async function secondUnder(r: Rig, child: () => void, context?: RunContext): Promise<void> {
+  await r.session().usingMode('short');
+  r.calls([['a', { task: 'Second task' }]]);
+  child();
+  r.text('Parent done.');
+  await r.runtime.send(r.session(), 'Delegate', undefined, context);
+}
+
+/** The raw row the start's task row was written with (the row before the user row 'Second task'). */
+async function endedRowOf(r: Rig): Promise<JsonObject | undefined> {
+  const rows = (await r.child().thread().messages()).map((entry) => entry.message);
+  const index = rows.findIndex((row) => row.type === 'user' && row.content === 'Second task');
+  return index > 0 ? rows[index - 1] : undefined;
+}
+
+type Listened = { inside: Values; outside: Values; decision: string; approval: string };
+
+/** Measure inside and outside from a listener of `type` for the start's run. */
+function measureAt(r: Rig, type: 'run.finished' | 'run.failed', started: () => string | null, own: () => Session | null, parked: string): () => Promise<Listened> | null {
+  let measured: Promise<Listened> | null = null;
+  r.events.listen((event: HarnessEvent) => {
+    if (event.type !== type || event.runId !== started()) return;
+    measured = measuring.run(true, async () => ({
+      inside: await read(r, own()!), outside: await read(r, r.child()),
+      decision: await approve(own()!, parked), approval: await approve(r.child(), parked),
+    }));
+  });
+
+  return () => measured;
+}
+
+describe('G-387 round 13: the matrix, extended (item 6) and the mixed repeated row (item 1)', () => {
+  it('completes: at RunFinished(S) and after; and the RAW ended-mark payload, byte for byte', async () => {
+    const { r, parked, prior } = await prepared();
+    const callId = ((await r.child().thread().messages()).map((entry) => entry.message)
+      .find((row) => row.type === 'assistant' && Array.isArray(row.tool_calls) && (row.tool_calls as JsonObject[]).length > 0)!.tool_calls as JsonObject[])[0]!.id as string;
+    const s = captureStart();
+    const at = measureAt(r, 'run.finished', s.start, s.own, parked);
+
+    await second(r, () => r.text('Child done.'));
+    vi.restoreAllMocks();
+    const next = await read(r, r.child());
+    expect(at()).not.toBeNull();
+    const got = (await at())!;
+
+    const measured = {
+      at_run_finished: {
+        inside: { ...cells13(got.inside, prior, next, s.start()!), decision_same: got.decision },
+        outside: { ...cells13(got.outside, prior, next, s.start()!), approval: got.approval },
+      },
+      after: { outside: { ...cells13(await read(r, r.child()), prior, next, s.start()!), approval: await approve(r.child(), parked), second_start: await secondStart(r) } },
+    };
+    expect(measured).toEqual(EXPECTED_R13.completes);
+
+    // The RAW stored mark: the exact bytes, not only its reading.
+    const expected = '{"type":"tool_result","tool_results":[{"tool_call_id":' + JSON.stringify(callId)
+      + ',"tool_name":"echo","args":{"n":1},"result":"Not run: the delegation this call was proposed under ended.","tool_call_result_id":null,"artifacts":[]}],'
+      + '"tool_approval_responses":[],"harness_ended_by_start":{"approval_ids":[' + JSON.stringify(parked) + ']}}';
+    expect(JSON.stringify(await endedRowOf(r))).toBe(expected);
+  });
+
+  it('completes+: a completed start followed by more turns', async () => {
+    const { r, parked, prior } = await prepared();
+    const s = captureStart();
+    await second(r, () => r.text('Child done.'));
+    vi.restoreAllMocks();
+    const next = await read(r, r.child());
+    const host_turn = await hostTurn(r, r.child());
+    const measured = { after_more: { outside: { ...cells13(await read(r, r.child()), prior, next, s.start()!), approval: await approve(r.child(), parked), host_turn, second_start: await secondStart(r) } } };
+    expect(measured).toEqual(EXPECTED_R13['completes+']);
+  });
+
+  it('fails AFTER the task row: the child model fails; measured during the failure (run.failed) and after', async () => {
+    const { r, parked, prior } = await prepared();
+    r.failChild = true;
+    const s = captureStart();
+    const during = measureAt(r, 'run.failed', s.start, s.own, parked);
+    await secondUnder(r, () => {});
+    vi.restoreAllMocks();
+    r.failChild = false;
+    const next = await read(r, r.child());
+    expect((await r.child().run())?.status).toBe('failed');
+    expect((await endedRowOf(r))?.harness_ended_by_start).toEqual({ approval_ids: [parked] });
+    expect(during()).not.toBeNull();
+    const got = (await during())!;
+
+    const after = { ...cells13(await read(r, r.child()), prior, next, s.start()!), approval: await approve(r.child(), parked) };
+    const measured = {
+      failed_kept_during: {
+        inside: { ...cells13(got.inside, prior, next, s.start()!), decision_same: got.decision },
+        outside: { ...cells13(got.outside, prior, next, s.start()!), approval: got.approval },
+      },
+      failed_kept: { outside: { ...after, host_turn: await hostTurn(r, r.child()), second_start: await secondStart(r) } },
+    };
+    expect(measured).toEqual(EXPECTED_R13.fails_after_task);
+  });
+
+  it("cancelled: a cancel inside the start's run, before its first model step", async () => {
+    const { r, parked, prior } = await prepared();
+    const before = r.childRequests();
+    const s = captureStart();
+    // The ledger the start runs on is its parent turn's (the runner's context
+    // is nested within it): cancelled from the start's run.started, which is
+    // emitted inside the parent's tool call.
+    r.events.listen((event: HarnessEvent) => {
+      if (event.type === 'run.started' && event.runId === s.start()) activeTurn(r.session().key())!.run.ledger.cancel('SECRET operator note');
+    });
+    await secondUnder(r, () => r.text('Child done.'));
+    vi.restoreAllMocks();
+    const next = await read(r, r.child());
+    // No model step, and the task row is recorded.
+    expect(r.childRequests()).toBe(before);
+    const rows = (await r.child().thread().messages()).map((entry) => entry.message);
+    expect(rows.some((row) => row.type === 'user' && row.content === 'Second task')).toBe(true);
+    expect(JSON.stringify(rows)).not.toContain('SECRET');
+
+    const measured = { after: { outside: { ...cells13(await read(r, r.child()), prior, next, s.start()!), approval: await approve(r.child(), parked), host_turn: await hostTurn(r, r.child()) } } };
+    expect(measured).toEqual(EXPECTED_R13.cancelled);
+  });
+
+  it('repeated ids: two gated calls under one id; the start ends both, in call order, in one mark', async () => {
+    const { r, prior } = await prepared([['echo', { n: 1 }, 'dup'], ['echo', { n: 2 }, 'dup']]);
+    const [a0, a1] = await r.approvals();
+    const s = captureStart();
+    await second(r, () => r.text('Child done.'));
+    vi.restoreAllMocks();
+    const next = await read(r, r.child());
+
+    const measured = { after: { outside: { ...cells13(await read(r, r.child()), prior, next, s.start()!), approval: await approve(r.child(), a0!), approval1: await approve(r.child(), a1!) } } };
+    expect(measured).toEqual(EXPECTED_R13.repeated_ids);
+    expect((await endedRowOf(r))?.harness_ended_by_start).toEqual({ approval_ids: [a0, a1] });
+    expect(r.echoed).toBe(0);
+  });
+
+  it('mixed repeated: a gated and an ungated call share an id; the person decided while answerable; then a start: ended / not run / not offered again', async () => {
+    const { r, parked, prior } = await prepared([['echo', { n: 1 }, 'w'], ['probe', {}, 'w']], true);
+    const s = captureStart();
+    await second(r, () => r.text('Child done.'));
+    vi.restoreAllMocks();
+    const next = await read(r, r.child());
+    const rows = (await r.child().thread().messages()).map((entry) => entry.message);
+
+    const measured = { after: { outside: { ...cells13(await read(r, r.child()), prior, next, s.start()!), approval: await approve(r.child(), parked) } } };
+    expect(measured).toEqual(EXPECTED_R13.mixed_repeated);
+    // Ended, never approved work, not run, not offered again.
+    expect([...endedByStart(rows)]).toContain(parked);
+    expect(approvalDecisions(rows).has(parked)).toBe(false);
+    expect(pendingApprovalCalls(rows)).toEqual([]);
+    expect(r.echoed).toBe(0);
+    expect((await endedRowOf(r))?.harness_ended_by_start).toEqual({ approval_ids: [parked] });
+  });
 });
