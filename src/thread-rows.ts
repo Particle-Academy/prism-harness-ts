@@ -174,6 +174,8 @@ export function approvalToolScope(rows: readonly JsonObject[]): { names: string[
     if (Array.isArray(scope) && scope.every((name): name is string => typeof name === 'string' && name !== '' && name !== '*')) {
       return {names: [...new Set(scope)], legacy: false};
     }
+    // A step that repeats a call id approves nothing (G-392).
+    if (repeatsCallIds(list(row.tool_calls), requests)) return {names: [], legacy: true};
     const approvedCalls = new Set(requests.filter(request => typeof request.approval_id === 'string' && decisions.get(request.approval_id) === true)
       .map(request => request.tool_call_id));
     const names = list(row.tool_calls).filter(call => approvedCalls.has(call.id) && typeof call.name === 'string' && call.name !== '' && call.name !== '*')
@@ -322,6 +324,29 @@ function fold(earlier: ToolResultRow, later: ToolResultRow): ToolResultRow {
 
 function decision(value: JsonObject): ApprovalDecisionEntry {
   return { approval_id: text(value.approval_id), approved: value.approved === true, reason: nullableText(value.reason) };
+}
+
+/**
+ * The result a gated call gets when its step repeats a tool call id (G-392):
+ * not run, whatever was decided.
+ *
+ * @internal
+ */
+export const REPEATED_CALL_ID_RESULT = 'Tool call was not run because another call in this step has the same id';
+
+/**
+ * Whether one assistant step repeats a tool call id, among its calls (an
+ * empty id is an id like any other) or among its approval requests. A decision
+ * reaches a call through the call id its request names, so such a step cannot
+ * say which call a decision belongs to (G-392).
+ *
+ * @internal
+ */
+export function repeatsCallIds(calls: readonly JsonObject[], requests: readonly JsonObject[]): boolean {
+  const ids = calls.map((call) => text(call.id));
+  const asked = requests.map((request) => text(request.tool_call_id));
+
+  return new Set(ids).size !== ids.length || new Set(asked).size !== asked.length;
 }
 
 function list(value: JsonValue | undefined): JsonObject[] {
