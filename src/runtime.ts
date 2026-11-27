@@ -43,6 +43,10 @@ import {
   revocableApprovalIds,
   stepResultsByPosition as answeredCalls,
   startedRow,
+  UNSTARTED_RESULT,
+  START_DENIED_RESULT,
+  unansweredUngatedCalls,
+  interruptedEntry,
 } from './thread-rows.js';
 import { usableArguments } from './tool-arguments.js';
 import { admitAttachments } from './attachments.js';
@@ -1206,7 +1210,7 @@ export class AgentRuntime {
       // A new message supersedes the paused step (below): its approved scope
       // does not narrow the new turn's tools.
       if (scope !== null && !(started === null && prompt !== '')) {
-        if (scope.legacy) console.warn('Pending approval has no valid stored tool scope; offering approved requests only.');
+        if (scope.legacy) console.warn('Pending approval has no valid stored tool scope; offering the requested tools only.');
         offered = offered.filter(tool => scope.names.includes(tool.name)
           && (mode.tools.includes('*') || mode.tools.includes(tool.name) || planApprovalGate(tool) !== null));
       }
@@ -1540,7 +1544,10 @@ export class AgentRuntime {
 
       // The calls that need nobody run now, as in the reference, and their
       // results are recorded even when the step then stops for a person.
-      const results: ToolResultEntry[] = [];
+      // Each with its position among the step's calls.
+      const results: { entry: ToolResultEntry; at: number; started: boolean }[] = [];
+      const positionOf = (call: LlmToolCall): number => toolCalls.indexOf(call);
+      const stepIndex = recordedStep === undefined ? -1 : recordedStep.position - 1;
 
       for (const call of toolCalls) steps?.toolCall(call.id, call.name, call.arguments);
 
@@ -1552,18 +1559,54 @@ export class AgentRuntime {
       // then fails leaves each reading interrupted ("it may have run"):
       // never "not run", never run again, and a superseding write answers it
       // as in progress.
+      //
+      // GUARDED (round 17, Py run21 F2): built inside the thread lock, only
+      // for the calls still OPEN on their step. A row a listener or a host
+      // wrote since the step (a user row, a text row) replaced the step and
+      // denied its open calls: such a call keeps that ONE outcome and never
+      // runs. And when the write fails (TS run20 F3b), nothing of the batch
+      // has run: each call is answered "not run" (best effort), so it never
+      // reads as a call with no outcome.
       const ungated = toolCalls.filter((candidate) => !gated.includes(candidate) && !unusable.has(candidate));
+      let runnable = new Set<LlmToolCall>(ungated);
       if (ungated.length > 0 && recordedStep !== undefined) {
-        await recordingInRun(runId, () => thread.record(ungated.map((call) => startedRow(call, null, recordedStep.position)), runId));
+        const open: LlmToolCall[] = [];
+        try {
+          await recordingInRun(runId, () => thread.record([toolResultRow([])], runId, {
+            build: (rows) => {
+              const answered = answeredCalls(rows, stepIndex);
+              open.length = 0;
+              for (const call of ungated) if (answered[positionOf(call)] === false) open.push(call);
+              return open.map((call) => startedRow(call, null, recordedStep.position));
+            },
+          }));
+        } catch (error) {
+          try {
+            await recordingInRun(runId, () => thread.record([toolResultRow([])], runId, {
+              build: (rows) => {
+                const answered = answeredCalls(rows, stepIndex);
+                const entries = ungated.filter((call) => answered[positionOf(call)] === false).map((call) => toolResultEntry(call, UNSTARTED_RESULT));
+                return entries.length === 0 ? [] : [forStep(toolResultRow(entries))];
+              },
+            }));
+          } catch {
+            // The store is failing: the first failure is the run's.
+          }
+          throw error;
+        }
+        runnable = new Set(open);
       }
 
       for (const call of toolCalls.filter((candidate) => !gated.includes(candidate))) {
+        const at = positionOf(call);
         if (unusable.has(call)) {
           const entry = toolResultEntry(call, `Not run: the arguments for ${call.name} are not a JSON object.`);
           steps?.toolResult(call.id, entry.result, { ok: false, code: 'tool_failed', refused: false });
-          results.push(entry);
+          results.push({ entry, at, started: false });
           continue;
         }
+        // Answered since the step (replaced): its one outcome stands, and it never runs.
+        if (!runnable.has(call)) continue;
         if (autoAllowed.has(call)) {
           // Checked again at the moment it would run: a revoke since the step
           // began refuses it rather than letting the old answer stand.
@@ -1572,7 +1615,7 @@ export class AgentRuntime {
             this.#toolDecision('tool_denied', session, runId, call, tool, 'policy');
             const entry = toolResultEntry(call, 'Not run: this call needs approval, and the tool policy no longer allows it.');
             steps?.toolResult(call.id, entry.result, REFUSED_CALL);
-            results.push(entry);
+            results.push({ entry, at, started: true });
             continue;
           }
           this.#toolDecision('tool_auto_allowed', session, runId, call, tool, 'policy');
@@ -1580,17 +1623,43 @@ export class AgentRuntime {
         called.push(call.name);
         const invoked = await this.#invoke(offered, call);
         steps?.toolResult(call.id, invoked.entry.result, invoked.outcome);
-        results.push(invoked.entry);
+        results.push({ entry: invoked.entry, at, started: true });
       }
 
       if (results.length > 0) {
-        await recordingInRun(runId, () => thread.record([forStep(toolResultRow(results))], runId));
+        // Built in the thread lock: a started call's result always, any
+        // other call's outcome only while it still has none (a superseding
+        // write may have denied it since), so every call keeps exactly one.
+        await recordingInRun(runId, () => thread.record([toolResultRow([])], runId, {
+          build: (rows) => {
+            const answered = stepIndex === -1 ? [] : answeredCalls(rows, stepIndex);
+            const own = results.filter(({ at, started }) => started || answered[at] !== true).map(({ entry }) => entry);
+            return own.length === 0 ? [] : [forStep(toolResultRow(own))];
+          },
+        }));
       }
 
       // After the results, as core yields them: the calls that ran, then the
       // ones waiting on a person.
       for (const request of requests) steps?.approvalRequest(request.approval_id, request.tool_call_id);
       steps?.stepFinish(response.text);
+
+      // What is STILL pending, read again after the batch (round 17, TS
+      // run20 F3a, Py run21 F2): a tool's own send may have parked a NEWER
+      // step (then this run stops, parked_elsewhere, as at the top of the
+      // loop: the newer step is never replaced), and a row written since the
+      // step may have replaced it (its approvals are no longer pending, so
+      // they are never listed; the run still stops here, as the reference's
+      // parked response does, and takes no model step on a row it did not
+      // ask for). Never an approval that is no longer pending.
+      let waiting = requests;
+      if (requests.length > 0) {
+        const after = await thread.readerRows();
+        const pausedAt = pausedStepIndex(after);
+        if (pausedAt !== null && pausedAt > stepIndex && isToolStep(after[pausedAt]) && pendingApprovalIds(after).length > 0) throw HarnessError.parkedElsewhere();
+        const pending = new Set(pausedAt === stepIndex ? pendingApprovalIds(after) : []);
+        waiting = requests.filter((request) => pending.has(request.approval_id));
+      }
 
       if (requests.length > 0) {
         // G-360: the run stops here for a person; a plan binds the approvals
@@ -1605,12 +1674,12 @@ export class AgentRuntime {
           steps: run.ledger.steps,
           toolCalls: called,
           finishReason: 'awaiting_approval',
-          pendingApprovals: gated.map((call, index) => ({
+          pendingApprovals: gated.flatMap((call, index) => (waiting.includes(requests[index]!) ? [{
             id: requests[index]!.approval_id,
             toolCallId: call.id,
             tool: call.name,
             arguments: call.arguments,
-          })),
+          }] : [])),
           stoppedBecause: null,
         };
       }
@@ -1676,7 +1745,8 @@ export class AgentRuntime {
   ): Promise<HarnessTool[]> {
     // A read without the lock first: nearly every send() has nothing to resolve
     // and should not wait on the session lock to find that out.
-    if ((await this.#unresolved(session, mode)) === null) return offered;
+    const ungatedOpen = async (live: Session): Promise<boolean> => unansweredUngatedCalls(await live.thread().readerRows(), (name) => mode.needsApproval(name)).length > 0;
+    if ((await this.#unresolved(session, mode)) === null && !(await ungatedOpen(session))) return offered;
 
     // Then under the session lock, reading again inside it. Two workers resuming
     // the same session at once would otherwise both find the approved call with
@@ -1687,11 +1757,16 @@ export class AgentRuntime {
     const resolve = async (live: Session): Promise<HarnessTool[]> => {
       const work = await this.#unresolved(live, mode);
 
-      if (work === null) return offered;
+      if (work === null) {
+        // Nothing gated to resolve, but the paused step has an UNGATED call
+        // with no outcome (round 17): answered interrupted, once.
+        await recordingInRun(runId, () => live.thread().record([toolResultRow([])], runId, { build: (rows) => ungatedAnswers(rows, mode) }));
+        return offered;
+      }
 
       // Work can change while waiting. Its calls, decisions AND scope must
       // come from the same locked snapshot, and bound the continuation too.
-      if (work.scope?.legacy && !legacyDiagnosticEmitted) console.warn('Pending approval has no valid stored tool scope; offering approved requests only.');
+      if (work.scope?.legacy && !legacyDiagnosticEmitted) console.warn('Pending approval has no valid stored tool scope; offering the requested tools only.');
       const bounded = offered.filter(tool => work.scope?.names.includes(tool.name) === true);
 
       // WRITE-AHEAD (G-387 round 15, option (i)): each approved call gets its
@@ -1750,10 +1825,12 @@ export class AgentRuntime {
           const start = await this.#start(thread, runId, work.position, at, input, approvalId);
           if (start === 'answered') continue;
           if (start !== true) {
-            // Revoked before it started (a denial recorded since the read):
-            // not run, and that denial is its one outcome.
+            // Revoked before it started (a denial recorded since the read,
+            // G-401: denial wins): not run, and that denial is its one
+            // outcome, said precisely (round 17, Py run21 I3; the
+            // reference's START_DENIED text).
             this.#toolDecision('tool_denied', live, runId, input, declared, 'person');
-            const entry = toolResultEntry(input, start.reason ?? 'User denied tool execution');
+            const entry = toolResultEntry(input, START_DENIED_RESULT);
             steps?.toolResult(call.id, entry.result, { ok: false, code: 'approval_denied', refused: true });
             resolved.push({ entry, at, started: false });
             continue;
@@ -1786,7 +1863,12 @@ export class AgentRuntime {
           // The step's results so far come first, so an outcome sharing a
           // key with one of them (an identical duplicate call) is counted
           // beyond it, occurrence by occurrence, as the fold counts.
-          const own = newResults(rows, stepIndex, [...work.results, ...resolved.filter(({ at, started }) => started || !answered[at]).map(({ entry }) => entry)]);
+          // And the paused step's UNGATED calls with no outcome (round 17,
+          // the reference's rule): nothing here ran them, and a host may run
+          // its own: each is answered interrupted, so the next request
+          // answers every call.
+          const ungatedOwn = pausedStepIndex(rows) !== stepIndex ? [] : unansweredUngatedCalls(rows, (name) => mode.needsApproval(name)).map((at) => interruptedEntry(stepCalls(rows[stepIndex])[at]!));
+          const own = newResults(rows, stepIndex, [...work.results, ...resolved.filter(({ at, started }) => started || !answered[at]).map(({ entry }) => entry), ...ungatedOwn]);
           // The decisions as they STAND now (round 16), never a copy read
           // before a revocation landed.
           const decisions = turnDecisions(rows);
@@ -2198,7 +2280,7 @@ async function writeDecisions(session: Session, decisions: readonly ApprovalDeci
 /**
  * Every decision names a pending approval, each once, or the whole batch is
  * refused `approval_not_pending`. A DENIAL may also revoke an approval whose
- * call has not started (G-401's recommended option, revocableApprovalIds);
+ * call has not started (G-401, decided: denial wins; revocableApprovalIds);
  * an approval never overrides a decision.
  */
 function assertPending(rows: readonly JsonObject[], given: readonly ApprovalDecision[]): void {
@@ -2448,4 +2530,18 @@ async function rememberSeq(session: Session, runId: string, steps: RunStepTagger
 
 function list(value: JsonValue | undefined): JsonObject[] {
   return Array.isArray(value) ? value.filter((entry): entry is JsonObject => typeof entry === 'object' && entry !== null && !Array.isArray(entry)) : [];
+}
+
+/**
+ * The row answering the paused step's UNGATED calls that have no outcome
+ * (round 17): each interrupted, the row naming its step; none when there are
+ * none.
+ */
+function ungatedAnswers(rows: readonly JsonObject[], mode: AgentMode): JsonObject[] {
+  const step = pausedStepIndex(rows);
+  if (step === null) return [];
+  const open = unansweredUngatedCalls(rows, (name) => mode.needsApproval(name));
+  if (open.length === 0) return [];
+  const calls = stepCalls(rows[step]);
+  return [answeringStep(toolResultRow(open.map((at) => interruptedEntry(calls[at]!))) as unknown as JsonObject, step + 1)];
 }

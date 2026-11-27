@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+### Fixed: every request a provider is sent answers every call, in its own step (G-387 round 17)
+
+- The replay places each step's results directly after that step, past any
+  message, assistant text or system row written while its call ran (by a
+  person, a host, or the tool itself). Before, a message sent while a call ran
+  could leave every later request on the session with a call whose result came
+  too late, which providers refuse.
+- The run state a paused run carries (model binding, tool list, run tree, plan
+  ledger, agent spend) is read only from rows the runtime itself wrote; a step
+  recorded through `thread().record()` resumes on the session's own binding
+  and tree, offered the tools of the calls its approval requests were issued
+  for (approved or not); a call still runs only on its own approval.
+- The replay answers each call of a step once and sends each result with its
+  call's ids; a stored result that answers no call of its step is not sent.
+- A call whose start a denial refused (a denial recorded after the approval,
+  before the call started) reads "Not run: this call was denied before it
+  started."
+- A call that needs nobody runs only while its step is still open: one that a
+  row written meanwhile replaced keeps that one outcome and never runs. When its
+  `started` row cannot be stored, nothing of the batch runs, and each call reads
+  "not run".
+- A run whose tool parked a newer step, or whose step was replaced while its
+  calls ran, never reports an approval that is no longer pending: it fails
+  `parked_elsewhere` for a newer step, as a resume does.
+- A resume answers a paused step's calls that need nobody and have no outcome
+  (a host's own step) as interrupted, so the next request answers them.
+- The readers' one-pass index lives for one reader call, so a caller's rows
+  array edited between two calls is always read afresh.
+
 ### Fixed: what ran and what the thread says was decided always agree (G-387 round 16)
 
 - A decision counts only while its call has no outcome (no started row, no

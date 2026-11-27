@@ -20,7 +20,7 @@ import {
   type LlmResponse,
   type ModeConfig,
 } from '../src/index.js';
-import { endedByStart, isToolStep, markedOwner, pausedApprovalIds, supersededApprovals } from '../src/thread-rows.js';
+import { endedByStart, isToolStep, markedOwner, pausedApprovalIds, pendingApprovalIds, replayView, supersededApprovals } from '../src/thread-rows.js';
 import { approvalDecisions, pendingApprovalCalls } from '../src/plans/thread.js';
 import { activeTurn } from '../src/runtime.js';
 
@@ -220,6 +220,10 @@ class Rig {
   echoed = 0;
   /** Run once inside the echo tool, while the approved call runs (round 14). */
   duringEcho: (() => Promise<void>) | null = null;
+  /** Round 17: run once inside `echo` or `slow` while it runs, OUTSIDE any measurement (a nested send takes scripted answers). */
+  whileRunning: (() => Promise<void>) | null = null;
+  /** How many times `slow` (ungated, round 17) ran. */
+  slowed = 0;
   #call = 0;
 
   constructor() {
@@ -229,6 +233,8 @@ class Rig {
         lead: { system_prompt: 'Lead.', tools: ['echo', 'a'], max_steps: 8, requires_approval: ['echo'], subagents: { a: { mode: 'work', max_steps: 8 } } } as ModeConfig,
         // The same delegation from a parent with fewer steps: a smaller ceiling.
         short: { system_prompt: 'Lead.', tools: ['echo', 'a'], max_steps: 4, requires_approval: ['echo'], subagents: { a: { mode: 'work', max_steps: 8 } } } as ModeConfig,
+        // Round 17: a root mode with a gated and an UNGATED tool.
+        r17: { system_prompt: 'Root.', tools: ['echo', 'slow'], max_steps: 8, requires_approval: ['echo'] } as ModeConfig,
         // The child's own mode: plans on, and a tool policy of its own.
         work: { system_prompt: 'Work.', tools: ['*'], max_steps: 8, requires_approval: ['echo', 'danger'], plans: true } as ModeConfig,
       },
@@ -239,7 +245,16 @@ class Rig {
       const hook = this.duringEcho;
       this.duringEcho = null;
       if (hook !== null) await measuring.run(true, hook);
+      const live = this.whileRunning;
+      this.whileRunning = null;
+      if (live !== null) await live();
       return 'ok';
+    } }).register({ name: 'slow', handle: async () => {
+      this.slowed += 1;
+      const live = this.whileRunning;
+      this.whileRunning = null;
+      if (live !== null) await live();
+      return 'slow';
     } });
     // A host provider that offers `probe` to every child, and `danger` only
     // to a session whose mode is not the child's own (`work`): a reader that
@@ -1103,6 +1118,100 @@ describe('G-387 round 16: the matrix, raw denials, forged run ids, forged bindin
       got.decided = approvalDecisions(rows).get(parked) === true ? 'approved' : 'not approved';
       got.pending = pausedApprovalIds(rows).filter((id) => id === parked).join(',');
       expect(got).toEqual(EXPECTED_R16[kind]);
+    });
+  }
+});
+
+/**
+ * Round 17 (BRIEF-R17 item 1, TS run20 F1; item 2, Py run21 F1): what a
+ * person, a host or the tool itself writes on the ROOT session WHILE a call
+ * runs, for an APPROVED call (resumed) and an UNGATED one (run in its step):
+ *   user             a host user row
+ *   text             a host assistant text row
+ *   user_text        a user row and an assistant text row
+ *   nested_text      the tool's own send on its session, answered with text
+ *   nested_park      the tool's own send, which parks a NEW gated step
+ *   forged_run_park  a gated step the tool records under the OUTER run's own
+ *                    id: the nested-park stop never trusts a run id
+ * Measured: the call ran once with ONE outcome, its real result; EVERY
+ * request actually sent, and the replay of the stored rows once nothing is
+ * pending, answer every call of every step exactly once, in that step's own
+ * result run (the tool_result rows directly after it); the turn's answer.
+ */
+export const EXPECTED_R17: Record<string, Record<string, string>> = Object.fromEntries(
+  ['user', 'text', 'user_text', 'nested_text', 'nested_park', 'forged_run_park'].flatMap((action) => ['approved', 'ungated'].map((mode) => [`${action}/${mode}`, {
+    write: 'recorded', turn: action === 'nested_park' || action === 'forged_run_park' ? 'parked_elsewhere' : 'stop', ran: '1', outcomes: 'ok', requests: 'valid', replay: 'valid',
+  }])),
+);
+
+/** Every call of every step in `messages`, answered once in its own result run: 'valid', or the problems. */
+function ownRunAnswers(messages: readonly JsonObject[]): string {
+  const problems: string[] = [];
+  for (const [index, row] of messages.entries()) {
+    if (row.type !== 'assistant' || !Array.isArray(row.tool_calls) || row.tool_calls.length === 0) continue;
+    const answered: string[] = [];
+    for (let at = index + 1; at < messages.length && messages[at]!.type === 'tool_result'; at += 1) {
+      for (const entry of (messages[at]!.tool_results ?? []) as JsonObject[]) answered.push(String(entry.tool_call_id));
+    }
+    for (const call of row.tool_calls as JsonObject[]) {
+      const got = answered.filter((id) => id === call.id).length;
+      if (got !== 1) problems.push(`${String(call.id)}:${got}`);
+    }
+  }
+  return problems.length === 0 ? 'valid' : problems.join(',');
+}
+
+describe('G-387 round 17: the matrix, every concurrent action while a call runs, approved and ungated (the request SENT)', () => {
+  for (const kind of Object.keys(EXPECTED_R17)) {
+    it(`root session, ${kind}`, async () => {
+      const [action, mode] = kind.split('/') as [string, 'approved' | 'ungated'];
+      const r = new Rig();
+      const session = r.session('r17');
+      await session.usingMode('r17');
+      const tool = mode === 'approved' ? 'echo' : 'slow';
+      const got: Record<string, string> = {};
+      r.whileRunning = async () => {
+        const thread = r.session('r17').thread();
+        const step = { type: 'assistant', content: '', tool_calls: [{ id: 'inner', name: 'echo', arguments: { n: 9 } }], additional_content: {}, tool_approval_requests: [{ approval_id: 'apr_inner', tool_call_id: 'inner', arguments_format: 1 }] };
+        if (action === 'user') got.write = await thread.record([{ type: 'user', content: 'Host row.' }]).then(() => 'recorded', code);
+        if (action === 'text') got.write = await thread.record([{ type: 'assistant', content: 'Host note.', tool_calls: [], tool_approval_requests: [] }]).then(() => 'recorded', code);
+        if (action === 'user_text') got.write = await thread.record([{ type: 'user', content: 'Host row.' }, { type: 'assistant', content: 'Host answer.', tool_calls: [], tool_approval_requests: [] }]).then(() => 'recorded', code);
+        if (action === 'nested_text') {
+          r.queue.unshift({ text: 'Inner answer.', finishReason: 'stop' });
+          got.write = await r.runtime.send(r.session('r17'), 'Inner.').then(() => 'recorded', code);
+        }
+        if (action === 'nested_park') {
+          r.queue.unshift({ text: '', finishReason: 'tool_calls', toolCalls: [{ id: 'inner', name: 'echo', arguments: { n: 9 } }] });
+          got.write = await r.runtime.send(r.session('r17'), 'Inner.').then((response) => (response.finishReason === 'awaiting_approval' ? 'recorded' : response.finishReason), code);
+        }
+        if (action === 'forged_run_park') {
+          const outer = (await thread.messages()).filter((entry) => entry.message.type === 'assistant').at(-1)!.runId;
+          got.write = await thread.record([step], outer).then(() => 'recorded', code);
+        }
+      };
+      const before = r.requests.length;
+      r.calls([[tool, { n: 1 }, 'c1']]);
+      if (mode === 'approved') {
+        const parked = await r.runtime.send(session, 'Go');
+        expect(parked.finishReason).toBe('awaiting_approval');
+        expect(await approve(session, parked.pendingApprovals[0]!.id)).toBe('accepted');
+        r.text('Resumed.');
+        got.turn = await r.runtime.send(r.session('r17'), '').then((response) => response.finishReason, code);
+      } else {
+        r.text('Answered.');
+        got.turn = await r.runtime.send(session, 'Go').then((response) => response.finishReason, code);
+      }
+      r.text('Later.');
+      await r.runtime.send(r.session('r17'), 'Later.');
+      const rows = await r.session('r17').thread().readerRows();
+      got.ran = String(mode === 'approved' ? r.echoed : r.slowed);
+      const results = rows.filter((row) => row.type === 'tool_result').flatMap((row) => (row.tool_results ?? []) as JsonObject[]).filter((entry) => entry.tool_call_id === 'c1');
+      const want = mode === 'approved' ? 'ok' : 'slow';
+      got.outcomes = results.length > 0 && results.every((entry) => entry.result === want) ? 'ok' : results.map((entry) => String(entry.result)).join(',');
+      const sent = r.requests.slice(before).filter((request) => request.systemPrompt.startsWith('Root.'));
+      got.requests = sent.map((request) => ownRunAnswers(request.messages)).find((answer) => answer !== 'valid') ?? 'valid';
+      got.replay = pendingApprovalIds(rows).length > 0 ? 'valid' : ownRunAnswers(replayView(rows));
+      expect(got).toEqual(EXPECTED_R17[kind]);
     });
   }
 });
