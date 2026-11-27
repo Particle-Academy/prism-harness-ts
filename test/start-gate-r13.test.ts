@@ -1055,7 +1055,8 @@ describe('upgrade: a thread the 0.11.x line wrote', () => {
     // The 0.11.x rows as stored: written straight to the store (positions 1..n), bypassing main's record().
     const store = (thread as unknown as { store: MemorySessionStore }).store;
     const threadKey = (thread as unknown as { key: string }).key;
-    await store.put(threadKey, { messages: rows.map(([message, runId], index) => ({ position: index + 1, message, run_id: runId, recorded_at: '2026-11-01T00:00:00.000Z' })) as never });
+    // 0.11.x's entry shape: a row its harness recorded carries `harness: true` (its replaced-step answer does).
+    await store.put(threadKey, { messages: rows.map(([message, runId], index) => ({ position: index + 1, message, run_id: runId, recorded_at: '2026-11-01T00:00:00.000Z', ...(Object.hasOwn(message, 'harness_replaced_step') ? { harness: true } : {}) })) as never });
     return root;
   }
 
@@ -1083,8 +1084,14 @@ describe('upgrade: a thread the 0.11.x line wrote', () => {
       const rows = (await root.thread().messages()).map((row) => row.message);
       expect(rows.filter((row) => Object.hasOwn(row, 'harness_replaced_step'))).toHaveLength(1);
       expect(rows.some((row) => Object.hasOwn(row, 'harness_superseded'))).toBe(false);
-      // The replaced-step answer never reaches a provider as S2's result.
-      expect(JSON.stringify(r.requests.at(-1)!.messages)).not.toContain(REPLACED);
+      // The replaced-step answer never reaches a provider as S2's result: the
+      // replay gives S1's calls their one replaced result in S1's OWN result
+      // run (round 15, item 4), and S2's segment holds only S2's.
+      const sent = r.requests.at(-1)!.messages as JsonObject[];
+      const s2 = sent.findIndex((row) => row.type === 'assistant' && JSON.stringify(row.tool_calls).includes('"n":3'));
+      const replaced = sent.flatMap((row, index) => (row.type === 'tool_result' ? (row.tool_results as JsonObject[]).filter((entry) => entry.result === REPLACED).map((entry) => [index, (entry.args as JsonObject).n]) : []));
+      expect(replaced.map(([, n]) => n).sort()).toEqual([1, 2]);
+      for (const [index] of replaced) expect(index as number).toBeLessThan(s2);
     });
   }
 });

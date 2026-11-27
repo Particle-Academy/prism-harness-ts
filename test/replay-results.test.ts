@@ -32,7 +32,7 @@ describe('G-403: the replay keeps a result for each call that shares an id', () 
     ['ungated + gated: an ungated and a gated call with the same id and different arguments', [{ id: 'c', name: 'free', arguments: { n: 1 } }, { id: 'c', name: 'echo', arguments: { n: 2 } }]],
     ['ungated + ungated: two ungated calls with the same id (and a gated call under another id)', [{ id: 'c', name: 'free', arguments: { n: 1 } }, { id: 'c', name: 'free', arguments: { n: 2 } }, { id: 'd', name: 'echo', arguments: { n: 3 } }]],
   ] as [string, JsonObject[]][]) {
-    it(`${label}: the next request sends one result per call, and the resolution row carries every result`, async () => {
+    it(`${label}: the next request sends one result per call, and the stored rows hold exactly one result per call`, async () => {
       const harness = new PrismHarness({
         drivers: { memory: () => new MemorySessionStore(), durable: () => new DurableMemory() },
         stores: { ephemeral: 'memory', durable: 'durable' },
@@ -63,11 +63,13 @@ describe('G-403: the replay keeps a result for each call that shares an id', () 
         expect(results.some((entry) => entry.result === `free:${String((call.arguments as JsonObject).n)}`)).toBe(true);
       }
 
-      // The resolution row (the last tool_result row stored) carries every
-      // result of the step, each occurrence, never one per id.
+      // Round 15 (the reference's rule): EXACTLY ONE stored outcome per call.
+      // The resolution row no longer carries the step's earlier results; the
+      // stored rows together hold each call's result once, each occurrence,
+      // never one per id.
       const stored = (await session.thread().messages()).map((entry) => entry.message);
-      const resolution = stored.filter((row) => row.type === 'tool_result').at(-1)!;
-      expect((resolution.tool_results as JsonObject[]).map((entry) => [entry.tool_call_id, entry.tool_name, (entry.args as JsonObject).n]).sort())
+      const every = stored.filter((row) => row.type === 'tool_result').flatMap((row) => row.tool_results as JsonObject[]);
+      expect(every.map((entry) => [entry.tool_call_id, entry.tool_name, (entry.args as JsonObject).n]).sort())
         .toEqual(calls.map((call) => [call.id, call.name, (call.arguments as JsonObject).n]).sort());
       // A repeated-id step runs none of its gated calls; an ungated one ran once.
       expect(ran.filter((name) => name === 'free')).toHaveLength(calls.filter((call) => call.name === 'free').length);

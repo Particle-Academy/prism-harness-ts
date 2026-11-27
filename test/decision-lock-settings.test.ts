@@ -71,7 +71,9 @@ describe('a decision recorded through the runtime', () => {
     const {session, runtime, ran, approvalId} = await parked({lock_wait: 0});
 
     await runtime.decide(session, approvalId, true);
-    await expect(runtime.decide(session, approvalId, false)).rejects.toMatchObject({code: 'approval_not_pending'});
+    // A second approval is refused (round 15: only a denial may still revoke
+    // an approval whose call has not started).
+    await expect(runtime.decide(session, approvalId, true)).rejects.toMatchObject({code: 'approval_not_pending'});
 
     // A resume acts on it (a new message would supersede the step, DECISION B).
     const resumed = await runtime.send(session, '');

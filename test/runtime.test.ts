@@ -343,7 +343,8 @@ describe('approvals', () => {
     const response = await guardedRuntime(once([{ id: 'c1', name: 'echo', arguments: {} }]), {}).send(session, 'go');
 
     const assistant = (await session.thread().messages()).find((m) => m.message.type === 'assistant')?.message;
-    expect(assistant?.tool_approval_requests).toEqual([{ approval_id: response.pendingApprovals[0]!.id, tool_call_id: 'c1', arguments_format: 1 }]);
+    // Round 15: each request is bound to its own call (its tool and arguments digest), the binding last.
+    expect(assistant?.tool_approval_requests).toEqual([{ approval_id: response.pendingApprovals[0]!.id, tool_call_id: 'c1', arguments_format: 1, harness_call: { tool_name: 'echo', args_digest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/) } }]);
   });
 
   it('runs the calls that need nobody, and records their results, before stopping for the rest', async () => {

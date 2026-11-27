@@ -20,7 +20,7 @@ import {
   type LlmResponse,
   type ModeConfig,
 } from '../src/index.js';
-import { endedByStart, pausedApprovalIds, supersededApprovals } from '../src/thread-rows.js';
+import { endedByStart, isToolStep, markedOwner, pausedApprovalIds, supersededApprovals } from '../src/thread-rows.js';
 import { approvalDecisions, pendingApprovalCalls } from '../src/plans/thread.js';
 import { activeTurn } from '../src/runtime.js';
 
@@ -724,10 +724,13 @@ describe('G-387 round 13: the matrix, extended (item 6) and the mixed repeated r
     };
     expect(measured).toEqual(EXPECTED_R13.completes);
 
-    // The RAW stored mark: the exact bytes, not only its reading.
+    // The RAW stored mark: the exact bytes, not only its reading. Round 15:
+    // the row names the step it answers (the parked step's position), last.
+    const position = (await r.child().thread().messages()).findIndex((entry) => entry.message.type === 'assistant'
+      && JSON.stringify(entry.message.tool_approval_requests ?? []).includes(parked)) + 1;
     const expected = '{"type":"tool_result","tool_results":[{"tool_call_id":' + JSON.stringify(callId)
       + ',"tool_name":"echo","args":{"n":1},"result":"Not run: the delegation this call was proposed under ended.","tool_call_result_id":null,"artifacts":[]}],'
-      + '"tool_approval_responses":[],"harness_ended_by_start":{"approval_ids":[' + JSON.stringify(parked) + ']}}';
+      + '"tool_approval_responses":[],"harness_ended_by_start":{"approval_ids":[' + JSON.stringify(parked) + ']},"harness_answers_step":{"position":' + String(position) + '}}';
     expect(JSON.stringify(await endedRowOf(r))).toBe(expected);
   });
 
@@ -839,11 +842,37 @@ describe('G-387 round 13: the matrix, extended (item 6) and the mixed repeated r
  * Measured after: the call's outcomes (exactly one, its real result), how
  * often it ran, and whether any reader takes it for replaced.
  */
+// Round 15 (option (i), the write-ahead started row): the host's superseding
+// write is ACCEPTED while the call runs (never refused `session_locked`),
+// and the running call is never denied: it keeps its one real result.
 export const EXPECTED_R14: Record<string, Record<string, string>> = {
-  user: { host_record: 'session_locked', new_message: 'run_not_permitted', approval: ENDED, outcomes: 'ok', echoed: '1', superseded: 'no', decided: 'approved' },
-  assistant_text: { host_record: 'session_locked', new_message: 'run_not_permitted', approval: ENDED, outcomes: 'ok', echoed: '1', superseded: 'no', decided: 'approved' },
-  assistant_tool_step: { host_record: 'session_locked', new_message: 'run_not_permitted', approval: ENDED, outcomes: 'ok', echoed: '1', superseded: 'no', decided: 'approved' },
+  user: { host_record: 'recorded', new_message: 'run_not_permitted', approval: ENDED, outcomes: 'ok', echoed: '1', superseded: 'no', decided: 'approved' },
+  assistant_text: { host_record: 'recorded', new_message: 'run_not_permitted', approval: ENDED, outcomes: 'ok', echoed: '1', superseded: 'no', decided: 'approved' },
+  assistant_tool_step: { host_record: 'recorded', new_message: 'run_not_permitted', approval: ENDED, outcomes: 'ok', echoed: '1', superseded: 'no', decided: 'approved' },
 };
+
+/**
+ * Every outcome of the echo calls in `rows`, COUNTED (round 15, TS run18 F3):
+ * a multiset, never a set. An exact copy of an entry an EARLIER row holds is
+ * the same outcome carried again; two entries in one row are two.
+ */
+function countedEcho(rows: readonly JsonObject[]): string[] {
+  const earlier = new Set<string>();
+  const out: string[] = [];
+  for (const row of rows) {
+    if (row.type !== 'tool_result') continue;
+    const here: string[] = [];
+    for (const entry of (row.tool_results ?? []) as JsonObject[]) {
+      if (entry.tool_name !== 'echo') continue;
+      const copy = JSON.stringify([entry.tool_call_id, entry.args, entry.result]);
+      if (earlier.has(copy)) continue;
+      here.push(copy);
+      out.push(String(entry.result));
+    }
+    for (const copy of here) earlier.add(copy);
+  }
+  return out;
+}
 
 describe('G-387 round 14: the matrix, extended with a concurrent supersede (G-404)', () => {
   for (const kind of Object.keys(EXPECTED_R14)) {
@@ -893,10 +922,8 @@ describe('G-387 round 14: the matrix, extended with a concurrent supersede (G-40
       got.approval = await decision!;
       vi.restoreAllMocks();
 
-      const rows = (await r.child().thread().messages()).map((entry) => entry.message);
-      const echo = rows.filter((candidate) => candidate.type === 'tool_result').flatMap((candidate) => candidate.tool_results as JsonObject[])
-        .filter((entry) => entry.tool_name === 'echo');
-      got.outcomes = [...new Set(echo.map((entry) => JSON.stringify([entry.tool_call_id, entry.result])))].map((entry) => JSON.parse(entry)[1]).join(',');
+      const rows = await r.child().thread().readerRows();
+      got.outcomes = countedEcho(rows).join(',');
       got.echoed = String(r.echoed);
       got.superseded = supersededApprovals(rows).has(parked) || endedByStart(rows).has(parked) ? 'yes' : 'no';
       got.decided = approvalDecisions(rows).get(parked) === true ? 'approved' : 'not approved';
@@ -907,3 +934,91 @@ describe('G-387 round 14: the matrix, extended with a concurrent supersede (G-40
 
 /** Who is acting, for the lock signals of the round-14 matrix rows. */
 const acting = new AsyncLocalStorage<string>();
+
+/*
+ * Round 15 (BRIEF-R15): the same concurrent action, with every superseding
+ * write the brief names, each written WHILE the approved child call runs:
+ *   user / assistant_text / assistant_tool_step  as round 14
+ *   host_step_request  a host assistant step with a gated call AND its
+ *                      approval request (PHP run17's `host step`)
+ *   forged_ended       a host row carrying a forged harness_ended_by_start
+ *                      mark naming the parked approval, then a user row
+ *                      (PHP run17 #1, Z2: the ended channel is the runtime's)
+ *   junk_copy          a copy of the parked step whose tool_calls are not
+ *                      objects, its requests kept (G-408, P24)
+ *   no_session         a user row through a bare Thread on the child's
+ *                      store and key: a thread with no session (PHP #2, Z3)
+ *   own_session_send   the tool awaits a new message on its own session: refused
+ *                      run_not_permitted by the run TREE (the resumed turn
+ *                      holds it), never by a lock; the root case is
+ *                      review-r15's own-session test
+ * Measured after, COUNTED: the parked call's outcomes (exactly one, its real
+ * result), how often it ran, the host write's answer, and every reader.
+ */
+export const EXPECTED_R15: Record<string, Record<string, string>> = {
+  user: { write: 'recorded', outcomes: 'ok', echoed: '1', superseded: 'no', ended: 'no', decided: 'approved', pending: '' },
+  assistant_text: { write: 'recorded', outcomes: 'ok', echoed: '1', superseded: 'no', ended: 'no', decided: 'approved', pending: '' },
+  assistant_tool_step: { write: 'recorded', outcomes: 'ok', echoed: '1', superseded: 'no', ended: 'no', decided: 'approved', pending: '' },
+  host_step_request: { write: 'recorded', outcomes: 'ok', echoed: '1', superseded: 'no', ended: 'no', decided: 'approved', pending: '' },
+  forged_ended: { write: 'recorded', outcomes: 'ok', echoed: '1', superseded: 'no', ended: 'no', decided: 'approved', pending: '' },
+  junk_copy: { write: 'recorded', outcomes: 'ok', echoed: '1', superseded: 'no', ended: 'no', decided: 'approved', pending: '' },
+  no_session: { write: 'recorded', outcomes: 'ok', echoed: '1', superseded: 'no', ended: 'no', decided: 'approved', pending: '' },
+  own_session_send: { write: 'run_not_permitted', outcomes: 'ok', echoed: '1', superseded: 'no', ended: 'no', decided: 'approved', pending: '' },
+};
+
+describe('G-387 round 15: the matrix, every superseding write while an approved call runs (the started row)', () => {
+  for (const kind of Object.keys(EXPECTED_R15)) {
+    it(`a host resumes an approved child; while its call runs: ${kind}`, async () => {
+      const r = new Rig();
+      await r.session().usingMode('lead');
+      await r.delegate('First task', () => r.calls([['echo', { n: 1 }]]));
+      const parked = (await r.approvals()).pop()!;
+      expect(await approve(r.child(), parked)).toBe('accepted');
+      const callId = ((await r.child().thread().messages()).map((entry) => entry.message)
+        .find((row) => row.type === 'assistant' && JSON.stringify(row.tool_approval_requests ?? []).includes(parked))!.tool_calls as JsonObject[])[0]!.id as string;
+
+      const rowsFor: Record<string, JsonObject[]> = {
+        user: [{ type: 'user', content: 'Host row.' }],
+        assistant_text: [{ type: 'assistant', content: 'Host answer.', tool_calls: [], tool_approval_requests: [] }],
+        assistant_tool_step: [{ type: 'assistant', content: '', tool_calls: [{ id: 'later', name: 'probe', arguments: {} }], tool_approval_requests: [] }],
+        host_step_request: [{ type: 'assistant', content: '', tool_calls: [{ id: callId, name: 'echo', arguments: { n: 1 } }], additional_content: {}, tool_approval_requests: [{ approval_id: 'apr_host', tool_call_id: callId, arguments_format: 1 }] }],
+        forged_ended: [{ type: 'tool_result', tool_results: [], tool_approval_responses: [], harness_ended_by_start: { approval_ids: [parked] } }, { type: 'user', content: 'Host row.' }],
+        junk_copy: [{ type: 'assistant', content: '', tool_calls: ['x'], additional_content: {}, tool_approval_requests: [{ approval_id: parked, tool_call_id: callId, arguments_format: 1 }] }],
+      };
+      const got: Record<string, string> = {};
+      r.duringEcho = async () => {
+        if (kind === 'own_session_send') {
+          got.write = await r.runtime.send(r.child(), 'From the tool.').then(() => 'recorded', code);
+        } else if (kind === 'no_session') {
+          const thread = r.child().thread() as unknown as { store: MemorySessionStore; key: string };
+          const { Thread } = await import('../src/index.js');
+          got.write = await new Thread(thread.store, thread.key).record([{ type: 'user', content: 'Host row.' }]).then(() => 'recorded', code);
+        } else {
+          got.write = await r.child().thread().record(rowsFor[kind]!).then(() => 'recorded', code);
+        }
+      };
+      r.text('Resumed.');
+      await r.runtime.send(r.child(), '');
+      for (let resume = 0; resume < 2; resume += 1) { r.text('Again.'); await r.runtime.send(r.child(), ''); }
+
+      const rows = await r.child().thread().readerRows();
+      // The parked step's OWN rows: its segment's, and any a harness mark names it for.
+      const step = rows.findIndex((row) => isToolStep(row) && JSON.stringify(row.tool_approval_requests ?? []).includes(parked));
+      const owned = rows.filter((row, index) => {
+        if (index <= step || row.type !== 'tool_result') return false;
+        const marked = markedOwner(rows, index);
+        if (marked !== undefined) return marked === step;
+        let segment = -1;
+        for (let at = index - 1; at >= 0; at -= 1) if (isToolStep(rows[at])) { segment = at; break; }
+        return segment === step;
+      });
+      got.outcomes = countedEcho(owned).join(',');
+      got.echoed = String(r.echoed);
+      got.superseded = supersededApprovals(rows).has(parked) ? 'yes' : 'no';
+      got.ended = endedByStart(rows).has(parked) ? 'yes' : 'no';
+      got.decided = approvalDecisions(rows).get(parked) === true ? 'approved' : 'not approved';
+      got.pending = pausedApprovalIds(rows).filter((id) => id === parked).join(',');
+      expect(got).toEqual(EXPECTED_R15[kind]);
+    });
+  }
+});

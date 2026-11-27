@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+### Fixed: a running approved call is never denied, and a write during it is never refused (G-387 round 15)
+
+- Before a resume runs an approved call it records a `started` row for that
+  call. A new message, a host `thread().record()` or a tool writing to its
+  own session while the call runs is accepted at once, with no lock and no
+  wait, and gives the running call no replaced denial: the call keeps its
+  one real result. The in-flight claim and the session lock around a new
+  message are removed, so nothing about a running call expires or throws
+  `session_locked` into a tool.
+- Every result row the harness writes names the step it answers
+  (`harness_answers_step`), and its results count for that step wherever
+  the row lands.
+- A started call whose result never lands reads "Tool call was interrupted,
+  it may have run": it is never run again on a later resume, and the replay
+  gives it that one result.
+- The harness's marks (started, answers-step, ended, replaced) are read only
+  on rows the harness itself wrote.
+- An assistant row is a tool-call step only when its `tool_calls` is a list
+  holding at least one object (its calls are those objects), for every
+  reader; and an approval belongs only to the step that first asked for it.
+- Every stored approval request is bound to the call it was asked for
+  (`harness_call: {tool_name, args_digest}`): a call runs only when its
+  request's binding matches it, and is otherwise denied with one outcome. A
+  request stored before bindings existed binds to its own step's call.
+- A result row the runtime writes holds only results its step does not hold
+  yet, so every call has exactly one stored outcome.
+- A denial recorded after an approval, before the call starts, is the
+  answer; nothing overrides a denial.
+- A lock refusal inside a tool reaches the model as its code only.
+- Threads an older version wrote read a step it replaced as replaced, with
+  one outcome per call, never approvable afterwards.
+
 ### Fixed: one outcome per call when a new message or a host row lands during a resume, and a replay that shows each result once (G-387 round 14)
 
 - A new message on a session parked on approvals denies each of the paused
@@ -9,11 +41,8 @@
   no resume has acted on, even if that new turn then fails: the denial is
   written in the same write as the message, so neither is ever stored
   without the other.
-- That write is serialised with the resume: while a resume is running an
-  approved call, a new message waits for it (on the session lock, up to
-  `lock_wait`), and a host `thread().record()` of a row that would replace
-  the step is refused with `session_locked` and writes nothing. A call that
-  ran is never also recorded as not run.
+- A call that ran is never also recorded as not run (round 15 replaced the
+  lock this round used for it with a started row: see above).
 - A decision's pending check is made again inside the thread write, so a
   decision recorded while a new message or a host row replaces the step is
   refused `approval_not_pending`, all-or-nothing per batch, in every window;
@@ -23,8 +52,7 @@
   arguments, occurrence by occurrence (as the reference does), never by call
   id alone, so two calls that share an id each keep their result, and each
   result is shown once, in its own step's segment, even when a copy of it
-  was stored after a row of another kind. The resume carries every earlier
-  result of the step as stored.
+  was stored after a row of another kind.
 - A copy of an earlier result of the same step answers no other call.
 - Only the runtime's own record call counts as written inside its run: a row
   a store hook or listener records during that write is outside it.

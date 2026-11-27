@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { assistantRow, threadView, toolResultRow, type JsonObject } from '../src/index.js';
-import { endedByStart, endedByStartRow, pairStepApprovals } from '../src/thread-rows.js';
+import { endedByStart, endedByStartRow, pairStepApprovals, replayView, startedRow, withBoundRequests } from '../src/thread-rows.js';
 
 /**
  * The cross-language thread-rows corpus from `prism-parity`.
@@ -13,8 +13,10 @@ import { endedByStart, endedByStartRow, pairStepApprovals } from '../src/thread-
  */
 interface RowsCase {
   id: string;
-  input?: JsonObject & { write: 'assistant' | 'tool_result' | 'ended_by_start' };
+  input?: JsonObject & { write: 'assistant' | 'tool_result' | 'ended_by_start' | 'started' };
   fold?: JsonObject[];
+  /** A PLACE case (0.5.1): rows as stored (`harness: true` on a row the harness wrote), placed then folded as the replay sends them. */
+  place?: JsonObject[];
   /** A READ case (0.4.0): what the harness reads from `stored` rows for each id in `approvals`. */
   read?: 'approval_states';
   stored?: JsonObject[];
@@ -30,6 +32,11 @@ const corpus = JSON.parse(readFileSync(new URL('./fixtures/harness-thread-rows.j
 /** The same conversion prism-parity's recorder makes. */
 function rowsFor(testCase: RowsCase): JsonObject[] {
   if (testCase.fold !== undefined) return threadView(testCase.fold);
+
+  // Round 15: the rows as stored, placed (started rows dropped, a marked row
+  // moved to its own step, interrupted / replaced results given, standing
+  // decisions, void requests) and then folded: what the runtime sends.
+  if (testCase.place !== undefined) return replayView(testCase.place);
 
   if (testCase.read === 'approval_states') {
     // Which approvals a runner start ended (G-387 round 13), by the harness's
@@ -54,9 +61,16 @@ function rowsFor(testCase: RowsCase): JsonObject[] {
     ];
   }
 
+  if (testCase.input?.write === 'started') {
+    // The write-ahead started row (round 15), the harness's own builder.
+    return [startedRow({ id: input.tool_call_id as string, name: input.tool_name as string }, input.approval_id as string, input.position as number)];
+  }
+
   if (testCase.input?.write === 'assistant') {
+    // `bind`: the requests as Thread.record() stores them, each bound to its own call (round 15).
+    const bind = (row: JsonObject): JsonObject => (testCase.input?.bind === true ? withBoundRequests(row) : row);
     return [
-      assistantRow(
+      bind(assistantRow(
         input.content,
         (input.tool_calls as JsonObject[]).map((call) => ({
           id: call.id as string,
@@ -68,7 +82,7 @@ function rowsFor(testCase: RowsCase): JsonObject[] {
         })),
         input.additional_content,
         input.approval_requests,
-      ),
+      )),
     ];
   }
 
@@ -99,7 +113,7 @@ describe('harness-thread-rows corpus', () => {
   }
 
   it('is the whole suite, not a subset someone trimmed to green', () => {
-    expect(corpus.cases).toHaveLength(17);
+    expect(corpus.cases).toHaveLength(24);
   });
 
   it.each(corpus.cases.map((testCase) => [testCase.id, testCase] as const))('%s stores and replays the rows the corpus records for this port', (_id, testCase) => {

@@ -350,11 +350,26 @@ included) gives each call still waiting ONE result, "Tool call was not run becau
 later step replaced it", and nothing from it runs: to act on recorded decisions, resume
 with an empty prompt before sending a new message. A new message denies even an
 approved call that has not run yet, and does so even if its own turn then fails;
-its denial and its message are one write. While a resume is running an approved
-call, a new message waits for it on the session lock (up to `lock_wait`), and a
-host `thread().record()` of a row that would replace that step is refused with
-`session_locked` and writes nothing: retry it once the resume has recorded its
-results. A decision applies only to the step whose approvals were requested, taken
+its denial and its message are one write. Before a resume runs an approved
+call, it records a `started` row for that call (`harness_started`), so a call
+that is running is never denied: a new message, a host `thread().record()` of
+any row, or a tool writing to its own session while the call runs is accepted
+at once (no lock, no wait), and the call keeps its one real result. Every
+result row the harness writes names the step it answers
+(`harness_answers_step: {position}`), and pairs to that step wherever it lands.
+A started call whose result never lands (the process died, the write failed)
+reads "Tool call was interrupted, it may have run": it is never run again, and
+running it again takes a new call and a new approval. The harness's marks are
+read only on rows the harness itself wrote; on a host row they are ignored. A
+denial recorded after an approval, before the call starts, revokes it; nothing
+overrides a denial. An assistant row is a tool-call step only when its
+`tool_calls` is a list holding at least one object (its calls are those
+objects), and an approval belongs only to the step that first asked for it.
+Every stored approval request is bound to the call it was asked for
+(`harness_call: {tool_name, args_digest}`, the sha256 of the call's canonical
+arguments): a call runs only when its request's binding matches it, and is
+otherwise denied. A request stored before bindings existed binds to its own
+step's call. A decision applies only to the step whose approvals were requested, taken
 by one selector everywhere (the last assistant row, unless a user row follows
 it); and that step's results are read from every result row after it, up to
 the next assistant row, so no other row can hide one. A result counts

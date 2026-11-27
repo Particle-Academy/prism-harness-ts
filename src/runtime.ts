@@ -3,10 +3,12 @@ import { randomUUID } from 'node:crypto';
 import { validateAgent } from './address.js';
 import type { JsonObject, JsonValue } from './json.js';
 import { recordingInRun } from './thread.js';
+import type { Thread, ThreadMessage } from './thread.js';
 import {
   assistantRow,
   approvalToolScope, approvalRunSteps, pausedRunState, turnDecisions,
   threadView,
+  replayView,
   toolResultEntry,
   toolResultRow,
   type ApprovalDecisionEntry,
@@ -30,6 +32,17 @@ import {
   NOT_RUN_KEY,
   REPEATED_CALL_ID_RESULT,
   ARGUMENTS_AS_SENT,
+  answeringStep,
+  isToolStep,
+  askedBefore,
+  bindsCall,
+  newResults,
+  stepCalls,
+  UNBOUND_APPROVAL_RESULT,
+  ownRequests,
+  revocableApprovalIds,
+  stepResultsByPosition as answeredCalls,
+  startedRow,
 } from './thread-rows.js';
 import { usableArguments } from './tool-arguments.js';
 import { admitAttachments } from './attachments.js';
@@ -227,6 +240,9 @@ interface Invoked {
 }
 
 const REFUSED_CALL: ToolCallOutcome = { ok: false, code: 'tool_call_refused', refused: true };
+
+/** A started row's check refused: the call is no longer open on its step. */
+const NOT_OPEN = Symbol('not open');
 
 function approvalExpired(tool: string): string {
   return `Not run: the approval for ${tool} was recorded by an earlier version and has expired. `
@@ -489,7 +505,7 @@ export class AgentRuntime {
     const costSpent = agentSpent || contexts.some((c) => c.budget.maxCostUsd !== null && !(Number.isFinite(c.budget.maxCostUsd) && c.ledger.costUsd < c.budget.maxCostUsd));
     const unenforceable = agentUnmetered || contexts.some((c) => c.budget.maxCostUsd !== null && c.ledger.unmeteredRuns > 0);
     const busy = await session.childTurnLive(now, holdTtl);
-    const rows = (await session.thread().messages()).map((entry) => entry.message);
+    const rows = (await session.thread().readerRows());
     const pending = await pendingState(session, rows);
     const tree = await RunTrees.startGrant(session, membership);
     const wanted = Math.min(own.own_left, tree?.steps ?? Number.POSITIVE_INFINITY);
@@ -535,7 +551,7 @@ export class AgentRuntime {
         savedRefs.tree, savedRefs.planLedger, false);
       const committed = await session.rememberChildStart(runnerBinding, membership.depth, own.ceiling,
         { runId, steps: own.own_left, at: now }, holdTtl, refs, start.mode,
-        async () => (await pendingState(session, (await session.thread().messages()).map((entry) => entry.message))) === 'answerable');
+        async () => (await pendingState(session, (await session.thread().readerRows()))) === 'answerable');
       if (committed === 'busy') throw new StartRefused('child_busy', 'denied');
       if (committed === 'waiting') throw new StartRefused('child_waiting', 'denied');
       const steps = run.ledger.steps, cost = run.ledger.costUsd, unmetered = run.ledger.unmeteredRuns;
@@ -841,8 +857,8 @@ export class AgentRuntime {
     if (step === null) return null;
     const entry = entries[step]!;
     const message = entry.message;
-    const requests = Array.isArray(message.tool_approval_requests) ? message.tool_approval_requests : [];
-    if (!Array.isArray(message.tool_calls) || message.tool_calls.length === 0 || requests.length === 0 || entry.runId !== run.id) return null;
+    // A step only by the one rule (G-408): a non-empty list of call objects.
+    if (!isToolStep(message) || ownRequests(entries.map((candidate) => candidate.message), step).length === 0 || entry.runId !== run.id) return null;
     const seq = run.last_seq;
 
     return { id: run.id, lastSeq: typeof seq === 'number' && Number.isSafeInteger(seq) && seq >= 0 ? seq : 0 };
@@ -952,7 +968,7 @@ export class AgentRuntime {
     const contextKind = RunTrees.contextKind(context);
     const tail = contextKind === 'runner'
       ? null
-      : pausedRunState((await session.thread().messages()).map(entry => entry.message));
+      : pausedRunState((await session.thread().readerRows()));
     const paused = prompt === '' && execution == null ? tail : null;
     const savedRefs: ChildRefs = (await session.childRefs()) ?? { tree: tail?.tree ?? null, planLedger: tail?.planLedger ?? null };
     // The binding: from the runner's own context when the runner starts the child,
@@ -1089,7 +1105,7 @@ export class AgentRuntime {
         for (const tool of planTools) resolved.set(tool.name, tool);
         offered = this.#authorizer ? await this.#authorizer.allowed(session, resolved) : [...resolved.values()];
       } else offered = (await this.#offer(session, mode, toolNames, planTools)).tools;
-      const stored = (await thread.messages()).map(entry => entry.message);
+      const stored = (await thread.readerRows());
       const scope = approvalToolScope(stored);
       // A NEW prompt on a parked session under a context that was cancelled
       // or whose time is spent is refused: it would act on none of the parked
@@ -1225,16 +1241,13 @@ export class AgentRuntime {
               : { type: 'user', content: prompt, additional_content: [...attachments, { text: prompt }], additional_attributes: {} };
 
           // A new message's user row carries the paused step's replaced
-          // denial in the same write (supersede). While the step has an open
-          // call it is written under the SESSION LOCK, the lock the resolver
-          // and every decision path hold (G-404): it waits for a resolution
-          // running an approved call, and no decision interleaves with it.
-          const write = (): Promise<unknown> => recordingInRun(runId, () => thread.record([...(ended?.rows ?? []), message], runId, started === null ? { supersede: true } : {}));
-          if (started === null && stepping?.locked !== true && await thread.hasOpenStep()) {
-            await session.lock(() => write(), this.#setting(session, 'lock_ttl') ?? RESOLUTION_LOCK_SECONDS, this.#setting(session, 'lock_wait') ?? RESOLUTION_WAIT_SECONDS);
-          } else {
-            await write();
-          }
+          // denial in the same write (supersede, G-404), decided inside the
+          // thread lock, where every decision's pending check is too. It
+          // never waits on the session lock (round 15): a call a resolution
+          // is running has its started row, so the denial leaves it out, and
+          // a new message from inside a running tool never stalls on its own
+          // run's lock.
+          await recordingInRun(runId, () => thread.record([...(ended?.rows ?? []), message], runId, started === null ? { supersede: true } : {}));
           // Recorded the moment its row is (round 11), before any event: a
           // listener that throws or re-enters never sees a recorded task as
           // unrecorded, and a start whose task row exists is never undone.
@@ -1354,7 +1367,7 @@ export class AgentRuntime {
       steps?.stepStart();
       const response = await this.#client({
         systemPrompt,
-        messages: threadView((await thread.messages()).map((entry) => entry.message)),
+        messages: replayView(await thread.readerRows()),
         tools: offered,
         provider,
         model,
@@ -1411,6 +1424,8 @@ export class AgentRuntime {
         }
         gated.push(call);
       }
+      // Thread.record() binds each request to the exact call the person is
+      // shown (round 15): its tool and the digest of its arguments.
       const requests: ApprovalRequestEntry[] = gated.map((call) => ({
         approval_id: `apr_${randomUUID().replaceAll('-', '')}`,
         tool_call_id: call.id,
@@ -1462,7 +1477,11 @@ export class AgentRuntime {
           if (refs?.planLedger != null) row.harness_plan_ledger = { ...refs.planLedger };
         }
       }
-      await recordingInRun(runId, () => thread.record([row], runId));
+      const [recordedStep] = await recordingInRun(runId, () => thread.record([row], runId));
+      // Every result row the harness writes for this step names it (round
+      // 15): a tool-call step another writer records while a call runs never
+      // takes the call's result.
+      const forStep = <T extends JsonObject | ToolResultRow>(resultRow: T): T => (recordedStep === undefined ? resultRow : answeringStep(resultRow, recordedStep.position));
 
       if (failedFinish !== null) {
         // The code travels; nothing the provider said does.
@@ -1470,8 +1489,8 @@ export class AgentRuntime {
         // Complete the transcript with refusals, never approval requests, so a
         // later resume cannot dispatch calls from this failed response.
         if (toolCalls.length > 0) {
-          await recordingInRun(runId, () => thread.record([toolResultRow(toolCalls.map(call =>
-            toolResultEntry(call, `Not run: model step failed (${failedFinish}).`)))], runId));
+          await recordingInRun(runId, () => thread.record([forStep(toolResultRow(toolCalls.map(call =>
+            toolResultEntry(call, `Not run: model step failed (${failedFinish}).`))))], runId));
         }
         throw HarnessError.modelStepFailed(failedFinish);
       }
@@ -1528,7 +1547,7 @@ export class AgentRuntime {
       }
 
       if (results.length > 0) {
-        await recordingInRun(runId, () => thread.record([toolResultRow(results)], runId));
+        await recordingInRun(runId, () => thread.record([forStep(toolResultRow(results))], runId));
       }
 
       // After the results, as core yields them: the calls that ran, then the
@@ -1595,7 +1614,8 @@ export class AgentRuntime {
     const row = endedByStartRow(inputs, inputs.map((_input, index) => work.approvalIds[index]));
 
     return {
-      rows: [row as unknown as JsonObject],
+      // It answers the paused step's calls, and names that step (round 15).
+      rows: [answeringStep(row as unknown as JsonObject, work.position)],
       // The events and run steps for them, emitted by the caller only once
       // the rows are recorded with the task row (G-387 round 10).
       announce: () => {
@@ -1637,70 +1657,98 @@ export class AgentRuntime {
       if (work.scope?.legacy && !legacyDiagnosticEmitted) console.warn('Pending approval has no valid stored tool scope; offering approved requests only.');
       const bounded = offered.filter(tool => work.scope?.names.includes(tool.name) === true);
 
-      // CLAIMED before anything runs (G-404): while this resolution runs the
-      // step's approved calls, a write that would supersede the step (a
-      // host's row; a new message waits on this lock) is refused, so a call
-      // that runs is never also recorded as not run. Checked in the thread
-      // lock: a step superseded since it was read runs nothing.
-      const claim = randomUUID();
-      const ttl = this.#setting(live, 'lock_ttl') ?? RESOLUTION_LOCK_SECONDS;
-      if (!(await live.thread().claimInFlight(work.position, claim, ttl))) return offered;
-      let settled = false;
-      try {
-        const resolved: ToolResultEntry[] = [];
+      // WRITE-AHEAD (G-387 round 15, option (i)): each approved call gets its
+      // STARTED row, under the private in-run token, before it runs, and
+      // only while it is still open on its step (checked in the thread lock
+      // with the write). A superseding write from then on (a host's row,
+      // another run's new message, a tool writing to its own session) treats
+      // the call as answered in progress: it is never denied and the write is
+      // never refused. The real result row names the step and pairs to the
+      // call wherever it lands. A call whose result never lands reads
+      // interrupted and never runs again. No claim, no ttl.
+      const thread = live.thread();
+      const resolved: { entry: ToolResultEntry; at: number; started: boolean }[] = [];
 
-        for (const [index, call] of work.calls.entries()) {
-          const input = { id: call.id, name: call.name, arguments: call.arguments, resultId: call.result_id };
-          // The call's OWN approval, paired by position (G-392).
-          const approvalId = work.approvalIds[index];
-          const decision = approvalId === undefined ? undefined : work.decisions.get(approvalId);
+      for (const [index, call] of work.calls.entries()) {
+        const input = { id: call.id, name: call.name, arguments: call.arguments, resultId: call.result_id };
+        // The call's OWN approval, paired by position (G-392).
+        const approvalId = work.approvalIds[index];
+        const decision = approvalId === undefined ? undefined : work.decisions.get(approvalId);
+        const at = work.indices[index]!;
 
-          const declared = bounded.find((tool) => tool.name === call.name);
-          if (work.repeated) {
-            // The step repeats a call id, so no decision can be told apart from
-            // another (G-392): none of its gated calls runs, whatever was
-            // decided. Marked, so the step reads settled and no later decision
-            // or resume revives it, and the plan never reads it as approved.
-            this.#toolDecision('tool_denied', live, runId, input, declared, 'policy');
-            const entry = { ...toolResultEntry(input, REPEATED_CALL_ID_RESULT), [NOT_RUN_KEY]: REPEATED_CALL_ID, ...(approvalId === undefined ? {} : { approval_id: approvalId }) };
-            steps?.toolResult(call.id, entry.result, { ok: false, code: 'approval_denied', refused: true });
-            resolved.push(entry);
-          } else if (decision?.approved === true && work.unusable.has(call.id)) {
-            const entry = toolResultEntry(input, `Not run: the arguments for ${call.name} are not a JSON object.`);
-            steps?.toolResult(call.id, entry.result, { ok: false, code: 'tool_failed', refused: false });
-            resolved.push(entry);
-          } else if (decision?.approved === true && work.ambiguous.has(call.id)) {
-            // Stored by 0.11.0 or earlier, which wrote no marker and stored a
-            // bare number or boolean as no arguments. Not run, and recorded
-            // without arguments; the model is told to call again, and a new
-            // call is a new approval for the person.
-            const entry = toolResultEntry({ ...input, arguments: {} }, approvalExpired(call.name));
-            this.#toolDecision('tool_approval_expired', live, runId, { ...input, arguments: {} }, declared, 'policy');
-            steps?.toolResult(call.id, entry.result, { ok: false, code: 'approval_denied', refused: true });
-            resolved.push(entry);
-          } else if (decision?.approved === true) {
-            this.#toolDecision('tool_approved', live, runId, input, declared, 'person');
-            called.push(call.name);
-            const invoked = await this.#runApproved(bounded, input);
-            steps?.toolResult(call.id, invoked.entry.result, invoked.outcome);
-            resolved.push(invoked.entry);
-          } else {
-            // Denied, or never answered: either way not approved, and refused.
-            this.#toolDecision('tool_denied', live, runId, input, declared, 'person');
-            const entry = toolResultEntry(input, decision === undefined ? 'No approval response provided' : (decision.reason ?? 'User denied tool execution'));
-            steps?.toolResult(call.id, entry.result, { ok: false, code: 'approval_denied', refused: true });
-            resolved.push(entry);
-          }
+        const declared = bounded.find((tool) => tool.name === call.name);
+        if (work.repeated) {
+          // The step repeats a call id, so no decision can be told apart from
+          // another (G-392): none of its gated calls runs, whatever was
+          // decided. Marked, so the step reads settled and no later decision
+          // or resume revives it, and the plan never reads it as approved.
+          this.#toolDecision('tool_denied', live, runId, input, declared, 'policy');
+          const entry = { ...toolResultEntry(input, REPEATED_CALL_ID_RESULT), [NOT_RUN_KEY]: REPEATED_CALL_ID, ...(approvalId === undefined ? {} : { approval_id: approvalId }) };
+          steps?.toolResult(call.id, entry.result, { ok: false, code: 'approval_denied', refused: true });
+          resolved.push({ entry, at, started: false });
+        } else if (decision?.approved === true && work.unbound.has(at)) {
+          // Approved for ANOTHER call (round 15): its request is bound to a
+          // tool and arguments this call does not have. Denied, fail-closed.
+          this.#toolDecision('tool_denied', live, runId, input, declared, 'policy');
+          const entry = toolResultEntry(input, UNBOUND_APPROVAL_RESULT);
+          steps?.toolResult(call.id, entry.result, { ok: false, code: 'approval_denied', refused: true });
+          resolved.push({ entry, at, started: false });
+        } else if (decision?.approved === true && work.unusable.has(call.id)) {
+          const entry = toolResultEntry(input, `Not run: the arguments for ${call.name} are not a JSON object.`);
+          steps?.toolResult(call.id, entry.result, { ok: false, code: 'tool_failed', refused: false });
+          resolved.push({ entry, at, started: false });
+        } else if (decision?.approved === true && work.ambiguous.has(call.id)) {
+          // Stored by 0.11.0 or earlier, which wrote no marker and stored a
+          // bare number or boolean as no arguments. Not run, and recorded
+          // without arguments; the model is told to call again, and a new
+          // call is a new approval for the person.
+          const entry = toolResultEntry({ ...input, arguments: {} }, approvalExpired(call.name));
+          this.#toolDecision('tool_approval_expired', live, runId, { ...input, arguments: {} }, declared, 'policy');
+          steps?.toolResult(call.id, entry.result, { ok: false, code: 'approval_denied', refused: true });
+          resolved.push({ entry, at, started: false });
+        } else if (decision?.approved === true && approvalId !== undefined) {
+          // The started row, written only while the call is still open on its
+          // step: a call a superseding write already answered (it was denied
+          // as replaced while an earlier call ran) never runs.
+          if (!(await this.#start(thread, runId, work.position, at, input, approvalId))) continue;
+          this.#toolDecision('tool_approved', live, runId, input, declared, 'person');
+          called.push(call.name);
+          const invoked = await this.#runApproved(bounded, input);
+          steps?.toolResult(call.id, invoked.entry.result, invoked.outcome);
+          resolved.push({ entry: invoked.entry, at, started: true });
+        } else {
+          // Denied, or never answered: either way not approved, and refused.
+          this.#toolDecision('tool_denied', live, runId, input, declared, 'person');
+          const entry = toolResultEntry(input, decision === undefined ? 'No approval response provided' : (decision.reason ?? 'User denied tool execution'));
+          steps?.toolResult(call.id, entry.result, { ok: false, code: 'approval_denied', refused: true });
+          resolved.push({ entry, at, started: false });
         }
-
-        await recordingInRun(runId, () => live.thread().record([toolResultRow([...work.results, ...resolved], [...work.decisions.values()])], runId, { settles: claim }));
-        settled = true;
-        return bounded;
-      } finally {
-        // A resolution that failed before its results were written leaves no
-        // claim refusing writes (best effort: an expired claim is ignored).
-        if (!settled) await live.thread().releaseInFlight(claim).catch(() => undefined);
       }
+
+      // ONE row with the step's results, built inside the thread lock: a
+      // started call's result always, any other call's outcome only while
+      // that call still has none (a superseding write may have denied it
+      // since it was read), so every call keeps exactly one. It names the
+      // step it answers.
+      const stepIndex = work.position - 1;
+      await recordingInRun(runId, () => thread.record([toolResultRow([])], runId, {
+        build: (rows) => {
+          const answered = answeredCalls(rows, stepIndex);
+          // Only what the step does not hold yet (round 15): never a copy of
+          // an earlier result of the step.
+          // The step's results so far come first, so an outcome sharing a
+          // key with one of them (an identical duplicate call) is counted
+          // beyond it, occurrence by occurrence, as the fold counts.
+          const own = newResults(rows, stepIndex, [...work.results, ...resolved.filter(({ at, started }) => started || !answered[at]).map(({ entry }) => entry)]);
+          // A row left with no results and no decisions is not written.
+          if (own.length === 0 && work.decisions.size === 0) return [];
+
+          const row = toolResultRow(own, [...work.decisions.values()]);
+          // A row that carries results names the step it answers.
+          return [own.length === 0 ? row : answeringStep(row, work.position)];
+        },
+      }));
+      return bounded;
     };
 
     if (alreadyLocked) return await resolve(session);
@@ -1713,16 +1761,38 @@ export class AgentRuntime {
   }
 
   /**
+   * Record the STARTED row for the call at `at` of the step at `position`
+   * (round 15), only while that call is still open on its step: checked in
+   * the thread lock with the write. False, with nothing written, when a
+   * superseding write answered it since it was read: then it must not run.
+   */
+  async #start(thread: Thread, runId: string, position: number, at: number, call: LlmToolCall, approvalId: string): Promise<boolean> {
+    try {
+      await recordingInRun(runId, () => thread.record([startedRow(call, approvalId, position)], runId, {
+        guard: (rows) => { if (answeredCalls(rows, position - 1)[at] !== false) throw NOT_OPEN; },
+      }));
+      return true;
+    } catch (error) {
+      if (error === NOT_OPEN) return false;
+      throw error;
+    }
+  }
+
+  /**
    * Answer, once, every earlier step a thread written by an older harness
    * left superseded with a gated call unanswered (unansweredReplacedSteps):
    * one replaced-step row each, in the 0.11.x shape, read again under the
    * session lock so two turns never answer one step twice.
    */
   async #answerReplacedSteps(session: Session, mode: AgentMode, runId: string, alreadyLocked: boolean): Promise<void> {
-    const pending = async (live: Session): Promise<JsonObject[]> => unansweredReplacedSteps(
-      (await live.thread().messages()).map((entry) => ({ position: entry.position, message: entry.message, runId: entry.runId })),
-      (name) => mode.needsApproval(name),
-    ).map(({ position, calls }) => replacedStepRow(position, calls));
+    const pending = async (live: Session): Promise<JsonObject[]> => {
+      const entries: ThreadMessage[] = await live.thread().messages();
+      const rows = await live.thread().readerRows();
+      return unansweredReplacedSteps(
+        entries.map((entry, index) => ({ position: entry.position, message: rows[index] ?? entry.message, runId: entry.runId })),
+        (name) => mode.needsApproval(name),
+      ).map(({ position, calls }) => replacedStepRow(position, calls));
+    };
     if ((await pending(session)).length === 0) return;
     const answer = async (live: Session): Promise<void> => {
       const rows = await pending(live);
@@ -1748,15 +1818,20 @@ export class AgentRuntime {
     scope: ReturnType<typeof approvalToolScope>;
     unusable: Set<string>;
     ambiguous: Set<string>;
-    /** The step's thread position, which a resolution claims (G-404). */
+    /** The step's thread position: its started rows and its result row name it (round 15). */
     position: number;
+    /** Each call's index among the step's calls, by position in `calls`. */
+    indices: number[];
+    /** Indices (among the step's calls) of calls whose approval is bound to another call (round 15). */
+    unbound: Set<number>;
   } | null> {
-    const entries = await session.thread().messages();
-    const rows = entries.map((entry) => entry.message);
-    // THE paused step (G-397): the one selector every decision reader uses.
+    // The rows as the readers take them: only the harness's own marks count.
+    const rows = await session.thread().readerRows();
+    // THE paused step (G-397): the one selector every decision reader uses,
+    // and a step only by the one rule (G-408).
     const stored = pausedStepIndex(rows);
-    if (stored === null || list(rows[stored]!.tool_calls).length === 0) return null;
-    const view = threadView(rows);
+    if (stored === null || !isToolStep(rows[stored])) return null;
+    const view = replayView(rows);
     // The same row in the replay view (which folds a 0.3.0 request row into it).
     const ordinal = rows.slice(0, stored + 1).filter((row) => row.type === 'assistant').length;
     const index = view.findIndex((row, at) => row.type === 'assistant' && view.slice(0, at + 1).filter((candidate) => candidate.type === 'assistant').length === ordinal);
@@ -1784,7 +1859,15 @@ export class AgentRuntime {
     // A request pairs only with a call that has no result of its own: the
     // calls the step ran at once (ungated, or with unusable arguments) never
     // take an approval. (Not the mode's list: a plan tool gates itself.)
-    const pairing = pairStepApprovals(assistant.tool_calls, assistant.tool_approval_requests, (_call, position) => !answeredAt[position]);
+    // Only the requests this step OWNS: an approval an earlier step asked for
+    // is that step's, never a copy's (G-408, TS 0.11.x #92).
+    const asked = askedBefore(rows, stored);
+    const requests = assistant.tool_approval_requests.filter((request) => !asked.has(request.approval_id));
+    const pairing = pairStepApprovals(assistant.tool_calls, requests, (_call, position) => !answeredAt[position]);
+    // Each approval's request as STORED (the view keeps only known keys): its
+    // binding to the call it was asked for (round 15).
+    const storedRequests = new Map(ownRequests(rows, stored).map((request) => [request.approval_id as string, request]));
+    const storedCalls = stepCalls(rows[stored]);
     // A step that repeats a call id: its gated calls are open until the
     // harness settled the step.
     const settled = pairing.repeated && repeatedStepSettled(rows, stored);
@@ -1797,8 +1880,14 @@ export class AgentRuntime {
         && !answeredAt[index] && !settled);
     const calls = open.map(({ call }) => call);
     const approvalIds = open.map(({ approvalId }) => approvalId);
+    const indices = open.map(({ index }) => index);
+    // A call its approval was not asked for (another tool or other
+    // arguments under the request's call id) is never run on it.
+    const unbound = new Set(open.filter(({ approvalId, index }) => approvalId !== undefined && storedCalls[index] !== undefined
+      && !bindsCall(storedRequests.get(approvalId), storedCalls[index]!)).map(({ index }) => index));
 
-    return calls.length === 0 ? null : { calls, results, decisions, approvalIds, repeated: pairing.repeated, scope: approvalToolScope(rows), unusable: unusableStoredCalls(rows), ambiguous: ambiguousCalls(assistant), position: entries[stored]!.position };
+    // The row at index i is at thread position i + 1 (Thread assigns them so).
+    return calls.length === 0 ? null : { calls, results, decisions, approvalIds, repeated: pairing.repeated, scope: approvalToolScope(rows), unusable: unusableStoredCalls(rows), ambiguous: ambiguousCalls(assistant), position: stored + 1, indices, unbound };
   }
 
   /**
@@ -2038,17 +2127,25 @@ async function writeDecisions(session: Session, decisions: readonly ApprovalDeci
   return inOwnTurnScope(() => writeDecisionsIn(session, decisions, context));
 }
 
-/** Every decision names a pending approval, each once, or the whole batch is refused `approval_not_pending`. */
+/**
+ * Every decision names a pending approval, each once, or the whole batch is
+ * refused `approval_not_pending`. A DENIAL may also revoke an approval whose
+ * call has not started (G-401's recommended option, revocableApprovalIds);
+ * an approval never overrides a decision.
+ */
 function assertPending(rows: readonly JsonObject[], given: readonly ApprovalDecision[]): void {
   const pending = new Set(pendingApprovalIds(rows));
+  const revocable = new Set(revocableApprovalIds(rows));
   for (const decision of given) {
-    if (!pending.delete(decision.approvalId)) throw HarnessError.approvalNotPending(decision.approvalId);
+    if (pending.delete(decision.approvalId)) continue;
+    if (!decision.approved && revocable.delete(decision.approvalId)) continue;
+    throw HarnessError.approvalNotPending(decision.approvalId);
   }
 }
 
 /** Writes the decisions and returns them as RECORDED (a repeated-id step's as denials). */
 async function writeDecisionsIn(session: Session, given: readonly ApprovalDecision[], context?: RunContext): Promise<ApprovalDecision[]> {
-  const rows = (await session.thread().messages()).map((entry) => entry.message);
+  const rows = (await session.thread().readerRows());
   assertPending(rows, given);
   // A step whose call ids repeat runs none of its gated calls (G-392), so
   // every decision on it is RECORDED as a denial with that reason (round
@@ -2105,7 +2202,7 @@ export async function decisionsAnswerable(session: Session): Promise<boolean> {
   // ONLY the known reasons nobody could answer make an approval unanswerable
   // (G-387 round 8). Any read that fails throws, so the start that asked is
   // refused (failed) rather than ending an approval a person could answer.
-  return await actionability(session, (await session.thread().messages()).map((entry) => entry.message), undefined) === null;
+  return await actionability(session, (await session.thread().readerRows()), undefined) === null;
 }
 
 /**
@@ -2179,6 +2276,9 @@ export function stopCodeOf(response: AgentResponse): RunStop | null {
  * named-class rule; it never turns a tool's failure into a broken run.
  */
 function toolFailureText(error: unknown): string {
+  // A lock refusal's text names the session's internal key: the model is
+  // told only that the tool could not get the session (round 15, Py run19 F2).
+  if (error instanceof HarnessError && error.code === 'session_locked') return 'session_locked';
   try {
     const text: unknown = error instanceof Error ? error.message : String(error);
     return typeof text === 'string' ? text : failureName(error);

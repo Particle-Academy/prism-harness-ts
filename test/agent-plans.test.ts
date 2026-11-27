@@ -373,7 +373,9 @@ describe('agent plans (G-360)', () => {
     r.text('ok');
     await r.approve(pending.id);
     expect((await r.plan()).status).not.toBe('active');
-    expect(r.outputs()).toContain(planRefusalForModel('plan.not_waiting'));
+    // Round 15: the request is bound to the call the person saw, so the
+    // changed call never reaches the plan tool: it is denied fail-closed.
+    expect(r.outputs()).toContain('Not run: this call is not the one that was approved, or it is no longer open.');
   });
 
   it('does not activate a draft from a stored request without the arguments marker', async () => {
