@@ -4,6 +4,15 @@ import { HarnessError } from './errors.js';
 import type { AppendLogStore, SessionStore } from './stores/session-store.js';
 import { supportsAppendLog } from './stores/session-store.js';
 
+/**
+ * The harness's own recording path. Rows recorded with it, and only those,
+ * count as recorded inside their run; a run id given through the public
+ * `record()` without it never does (G-397). Not exported from the package.
+ *
+ * @internal
+ */
+export const HARNESS_RECORDING: unique symbol = Symbol('prism-harness recording');
+
 export interface ThreadMessage {
   /** Position in the conversation, from 1. Assigned by the thread, never by the caller. */
   position: number;
@@ -11,6 +20,8 @@ export interface ThreadMessage {
   message: JsonObject;
   /** The run that produced it, when there was one. */
   runId: string | null;
+  /** True when the harness itself recorded the row inside its run (never for a row recorded through the public `record()`). */
+  harness?: true;
   recordedAt: string;
 }
 
@@ -76,15 +87,16 @@ export class Thread {
    *
    * Read-and-write inside ONE lock. See the class docblock.
    */
-  async record(messages: readonly JsonObject[], runId: string | null = null): Promise<ThreadMessage[]> {
+  async record(messages: readonly JsonObject[], runId: string | null = null, origin?: typeof HARNESS_RECORDING): Promise<ThreadMessage[]> {
     if (messages.length === 0) return [];
+    const harness = origin === HARNESS_RECORDING;
 
     const store = this.store;
 
     if (supportsAppendLog(store)) {
       return store.withLock(this.key, async () => {
         const length = (await store.logLength(this.key)) ?? (await this.#migrate(store));
-        const appended = this.#entries(messages, length, runId);
+        const appended = this.#entries(messages, length, runId, harness);
         await store.appendLog(this.key, appended);
 
         return appended.map((entry) => this.#toMessage(entry));
@@ -95,7 +107,7 @@ export class Thread {
       const stored = (await store.get(this.key)) ?? {};
       const existing = Array.isArray(stored.messages) ? stored.messages.filter(isJsonObject) : [];
 
-      const appended = this.#entries(messages, existing.length, runId);
+      const appended = this.#entries(messages, existing.length, runId, harness);
 
       await store.put(this.key, {
         ...stored,
@@ -142,7 +154,7 @@ export class Thread {
     return existing.length;
   }
 
-  #entries(messages: readonly JsonObject[], length: number, runId: string | null): JsonObject[] {
+  #entries(messages: readonly JsonObject[], length: number, runId: string | null, harness: boolean): JsonObject[] {
     const recordedAt = new Date().toISOString();
 
     return messages.map((message, index) => ({
@@ -150,6 +162,7 @@ export class Thread {
       message,
       run_id: runId,
       recorded_at: recordedAt,
+      ...(harness ? { harness: true } : {}),
     }));
   }
 
@@ -167,6 +180,7 @@ export class Thread {
       message,
       runId: typeof entry.run_id === 'string' ? entry.run_id : null,
       recordedAt: typeof entry.recorded_at === 'string' ? entry.recorded_at : '',
+      ...(entry.harness === true ? { harness: true as const } : {}),
     };
   }
 }

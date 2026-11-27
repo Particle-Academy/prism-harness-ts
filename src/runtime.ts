@@ -25,6 +25,7 @@ import {
   ARGUMENTS_AS_SENT,
 } from './thread-rows.js';
 import { usableArguments } from './tool-arguments.js';
+import { HARNESS_RECORDING } from './thread.js';
 import { admitAttachments } from './attachments.js';
 import { HarnessError } from './errors.js';
 import type { HarnessEvents } from './events.js';
@@ -603,7 +604,7 @@ export class AgentRuntime {
             ? { type: 'user', content: prompt }
             : { type: 'user', content: prompt, additional_content: [...attachments, { text: prompt }], additional_attributes: {} };
 
-        await thread.record([turn], runId);
+        await thread.record([turn], runId, HARNESS_RECORDING);
       }
 
       return await this.#loop(session, mode, run, runId, provider, model, offered, called, schema, steps);
@@ -715,7 +716,7 @@ export class AgentRuntime {
 
       const row: JsonObject = assistantRow(response.text, toolCalls, metadata, requests);
       if (requests.length > 0) row.harness_tool_names = offered.map(tool => tool.name);
-      await thread.record([row], runId);
+      await thread.record([row], runId, HARNESS_RECORDING);
 
       if (failedFinish !== null) {
         // The code travels; nothing the provider said does.
@@ -724,7 +725,7 @@ export class AgentRuntime {
         // later resume cannot dispatch calls from this failed response.
         if (toolCalls.length > 0) {
           await thread.record([toolResultRow(toolCalls.map(call =>
-            toolResultEntry(call, `Not run: model step failed (${failedFinish}).`)))], runId);
+            toolResultEntry(call, `Not run: model step failed (${failedFinish}).`)))], runId, HARNESS_RECORDING);
         }
         throw HarnessError.modelStepFailed(failedFinish);
       }
@@ -766,7 +767,7 @@ export class AgentRuntime {
       }
 
       if (results.length > 0) {
-        await thread.record([toolResultRow(results)], runId);
+        await thread.record([toolResultRow(results)], runId, HARNESS_RECORDING);
       }
 
       // After the results, as core yields them: the calls that ran, then the
@@ -907,7 +908,7 @@ export class AgentRuntime {
       await live.thread().record([
         ...replaced,
         ...(work.calls.length === 0 ? [] : [toolResultRow([...work.results.values(), ...resolved], [...work.decisions.values()])]),
-      ], runId);
+      ], runId, HARNESS_RECORDING);
       // Only replaced steps were answered: this turn's tools are not narrowed.
       return work.calls.length === 0 ? offered : bounded;
     };
@@ -974,7 +975,7 @@ export class AgentRuntime {
     // Which of its calls already has an outcome: each result belongs to one
     // call, matched by id and the arguments it records, in the segment it sits
     // in or an earlier step's, never by id alone (G-392, G-397).
-    const done = stored >= 0 ? resultOwners(rows).get(stored) ?? new Set<number>() : new Set<number>();
+    const done = stored >= 0 ? resultOwners(messages).get(stored) ?? new Set<number>() : new Set<number>();
     // A superseded step is never resolved here: it is answered as replaced
     // (G-397), and nothing of it runs.
     const calls = stored >= 0 && supersededAt(messages, stored) !== -1
@@ -1177,7 +1178,7 @@ async function writeDecisions(session: Session, decisions: readonly ApprovalDeci
     approval_id: decision.approvalId,
     approved: decision.approved,
     reason: decision.reason ?? null,
-  })))], run?.id ?? null);
+  })))], run?.id ?? null, HARNESS_RECORDING);
 }
 
 /** Runtime guards: a decision arrives from an app's request handling, not from a typed caller. */

@@ -381,7 +381,7 @@ export function isReplacedStepRow(row: JsonObject): boolean {
 }
 
 /** A stored thread row and the run that recorded it. @internal */
-export type StoredRow = { position: number; message: JsonObject; runId: string | null };
+export type StoredRow = { position: number; message: JsonObject; runId: string | null; harness?: true };
 
 /**
  * The index of the row that SUPERSEDES the tool-call step at `index` of the
@@ -389,10 +389,11 @@ export type StoredRow = { position: number; message: JsonObject; runId: string |
  *
  * - any later assistant row WITH tool calls, always;
  * - a later assistant row without tool calls, or a user row, recorded
- *   OUTSIDE the runs that own the step: the run that recorded it and the
- *   runs that recorded its results. Rows the runtime writes inside those
- *   runs (a resume's answer, a structured turn's document) never supersede;
- *   a row recorded with no run id, or under another run, does.
+ *   OUTSIDE the runs that own the step: the run the harness recorded it in
+ *   and the runs the harness recorded its results in. Rows the runtime
+ *   writes inside those runs (a resume's answer, a structured turn's
+ *   document) never supersede; a row recorded through the public
+ *   Thread.record does, whatever run id it was given.
  *
  * Rows of any other kind (a system row, a tool result row) never supersede.
  * This only decides how a step's open calls are labelled and whether a late
@@ -401,80 +402,75 @@ export type StoredRow = { position: number; message: JsonObject; runId: string |
  * @internal
  */
 export function supersededAt(rows: readonly StoredRow[], index: number): number {
+  // Only rows the harness itself recorded name a run that owns the step: a
+  // run id given through the public Thread.record counts as outside.
+  const inside = (row: StoredRow | undefined): string | null => (row?.harness === true && typeof row.runId === 'string' ? row.runId : null);
   const owners = new Set<string>();
-  const own = rows[index]?.runId;
-  if (typeof own === 'string') owners.add(own);
+  const own = inside(rows[index]);
+  if (own !== null) owners.add(own);
   for (let at = index + 1; at < rows.length; at += 1) {
-    const { message, runId } = rows[at]!;
+    const row = rows[at]!;
+    const { message } = row;
+    const run = inside(row);
     if (message.type === 'assistant' && list(message.tool_calls).length > 0) return at;
-    if (message.type === 'tool_result' && typeof runId === 'string' && list(message.tool_results).length > 0) owners.add(runId);
-    if ((message.type === 'user' || message.type === 'assistant') && (typeof runId !== 'string' || !owners.has(runId))) return at;
+    if (message.type === 'tool_result' && run !== null && list(message.tool_results).length > 0) owners.add(run);
+    if ((message.type === 'user' || message.type === 'assistant') && (run === null || !owners.has(run))) return at;
   }
   return -1;
 }
 
 /**
  * Which call every stored result belongs to, as the calls each tool-call step
- * has an outcome for (by the step's index in `rows`, then the call's position
- * in it). One owner per result, so every call has at most one outcome:
- *
- * - a result belongs to the call with its id AND the arguments it records
- *   (the harness copies a call's parsed arguments into its result; both are
- *   compared parsed), in the step whose segment holds the row (after it,
- *   before the next tool-call step) or, failing that, an earlier step's call
- *   that has no result yet, the latest first. A copy of a result of the
- *   segment's step belongs to the same call again; it never answers a
- *   second one;
- * - a result whose arguments match no call with its id belongs to the last
- *   call with its id, of the step whose segment holds it, still without one.
- *
- * A result never answers a call of a step recorded after it. The rows a
- * replaced step is answered with count too, so it is answered once.
+ * has an outcome for (by the step's index in `rows`, then the call's
+ * position in it). ABSOLUTE SEGMENT OWNERSHIP (G-397): a result answers only
+ * a call of the step whose segment holds its row (after that step, before
+ * the next tool-call step); the rows a replaced step is answered with answer
+ * the step their mark names. Inside that step, by exact id, name and parsed
+ * arguments (usableArguments, keys in a fixed order), then id and name, then
+ * id, each the first call still without a result. A result an earlier row of
+ * that segment already holds (a copy) answers nothing new, and neither does a
+ * further result for a call that has one. A result never answers a call of
+ * another step.
  *
  * @internal
  */
-export function resultOwners(rows: readonly JsonObject[]): Map<number, Set<number>> {
+export function resultOwners(messages: readonly StoredRow[]): Map<number, Set<number>> {
   const owned = new Map<number, Set<number>>();
-  const steps: number[] = [];
-  // Both sides in the form the harness uses a call's arguments, parsed
-  // (usableArguments), whatever form a writer stored them in: a JSON string
-  // (as the PHP reference stores them) and the same object compare equal.
+  const seen = new Map<number, Set<string>>();
+  const byPosition = new Map<number, number>();
+  let segment = -1;
   const args = (value: JsonValue | undefined): string => canonicalJson(usableArguments(value) ?? {});
-  for (const [index, row] of rows.entries()) {
+  for (const [index, { position, message: row }] of messages.entries()) {
     if (row.type === 'assistant' && list(row.tool_calls).length > 0) {
-      steps.push(index);
+      segment = index;
       owned.set(index, new Set());
+      seen.set(index, new Set());
+      byPosition.set(position, index);
       continue;
     }
-    if (steps.length === 0) continue;
+    if (segment === -1) continue;
+    const replaced = isReplacedStepRow(row);
+    const target = replaced ? byPosition.get((row[REPLACED_STEP_KEY] as JsonObject).position as number) ?? segment : segment;
+    const calls = list(messages[target]!.message.tool_calls);
+    const mine = owned.get(target)!;
+    const prints = seen.get(target)!;
     // Each row read on its own: folding rows would merge results sharing an id.
-    const entries = isReplacedStepRow(row) ? list(row.tool_results)
+    const entries = replaced ? list(row.tool_results)
       : threadView([row]).filter((view) => view.type === 'tool_result').flatMap((view) => list(view.tool_results));
+    const added: string[] = [];
     for (const entry of entries) {
-      const id = text(entry.tool_call_id);
-      let owner: [number, number] | undefined;
-      let copy = false;
-      for (const step of [...steps].reverse()) {
-        const calls = list(rows[step]!.tool_calls);
-        for (const [at, call] of calls.entries()) {
-          if (text(call.id) !== id || args(call.arguments) !== args(entry.args)) continue;
-          if (!owned.get(step)!.has(at)) { owner = [step, at]; break; }
-          // A copy of a result of the segment's own step answers nothing new.
-          // An exact match on an EARLIER call that already has its result is
-          // not a copy of it: the result stays in this segment (below).
-          if (step === steps.at(-1)) copy = true;
-        }
-        if (owner !== undefined || copy) break;
-      }
-      if (owner === undefined && !copy) {
-        const segment = steps.at(-1)!;
-        const calls = list(rows[segment]!.tool_calls);
-        const at = calls.map((call, position) => ({ call, position }))
-          .filter(({ call, position }) => text(call.id) === id && !owned.get(segment)!.has(position)).at(-1)?.position;
-        if (at !== undefined) owner = [segment, at];
-      }
-      if (owner !== undefined) owned.get(owner[0])!.add(owner[1]);
+      const id = text(entry.tool_call_id), name = text(entry.tool_name), recorded = args(entry.args);
+      const print = canonicalJson([id, name, recorded, text(entry.result)]);
+      if (prints.has(print)) continue;
+      added.push(print);
+      const exact = (call: JsonObject): boolean => text(call.id) === id && text(call.name) === name && args(call.arguments) === recorded;
+      if (calls.some((call, at) => exact(call) && mine.has(at)) && !calls.some((call, at) => exact(call) && !mine.has(at))) continue;
+      let at = calls.findIndex((call, position) => exact(call) && !mine.has(position));
+      if (at === -1) at = calls.findIndex((call, position) => text(call.id) === id && text(call.name) === name && !mine.has(position));
+      if (at === -1) at = calls.findIndex((call, position) => text(call.id) === id && !mine.has(position));
+      if (at !== -1) mine.add(at);
     }
+    for (const print of added) prints.add(print);
   }
   return owned;
 }
@@ -496,7 +492,7 @@ export function replacedStepCalls(
   gated: (name: string) => boolean,
 ): { position: number; calls: JsonObject[] }[] {
   const rows = messages.map(({ message }) => message);
-  const owners = resultOwners(rows);
+  const owners = resultOwners(messages);
   const replaced: { position: number; calls: JsonObject[] }[] = [];
   for (const [index, step] of rows.entries()) {
     if (step.type !== 'assistant' || list(step.tool_calls).length === 0) continue;
