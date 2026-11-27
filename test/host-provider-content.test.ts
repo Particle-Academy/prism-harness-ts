@@ -10,36 +10,28 @@ import {
   type LlmResponse,
 } from '../src/index.js';
 
-// G-415: an assistant row a host records with Thread.record that holds NO tool
-// calls, but carries provider-native content copied from a stored step, must
-// not send a tool call to the model again. A client built on prism-ts replays
-// `additional_content.output_items` (OpenAI Responses) and
-// `additional_content.content_blocks` (Anthropic) from an assistant message
-// as given, so a tool item there would reach the provider with no result. The
-// request the model is sent carries such a row without its tool items; the
-// stored row is unchanged, and the harness's own rows are untouched. Checked
-// at the request the client receives. Offline.
+// G-415: a client built on prism-ts replays an assistant message's
+// provider-native content as given: `additional_content.output_items`
+// (OpenAI Responses) and `additional_content.content_blocks` (Anthropic),
+// even after a 'fallback' block. An assistant row a host records with
+// Thread.record can carry content copied from another step. Sent as is, it
+// can send a tool call with no result, drop the row's own text for the copied
+// text, or send a reasoning item twice.
+//
+// The rule: a host row's provider content is sent ONLY when its tool items
+// match the row's own tool_calls exactly (ids and names, as a multiset) AND
+// its text matches the row's content. Otherwise it is dropped, and the client
+// maps the row from content and tool_calls. Rows the harness writes from
+// provider responses are sent byte for byte as recorded. The stored row never
+// changes. Checked at the request the client receives. Offline.
 
 class Durable extends MemorySessionStore {
   override durability(): 'durable' { return 'durable'; }
 }
 
-const OUTPUT_ITEMS = [
-  { type: 'reasoning', id: 'rs_1', summary: [] },
-  { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'lookup', arguments: '{"q":"x"}' },
-  { type: 'function_call_output', call_id: 'call_1', output: 'found' },
-  { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Here it is.' }] },
-];
+const NOTE = 'My note.';
 
-const CONTENT_BLOCKS = [
-  { type: 'text', text: 'Looking it up.' },
-  { type: 'tool_use', id: 'toolu_1', name: 'lookup', input: { q: 'x' } },
-  { type: 'fallback', reason: 'copied' },
-  { type: 'tool_use', id: 'toolu_2', name: 'lookup', input: { q: 'y' } },
-  { type: 'text', text: 'Here it is.' },
-];
-
-function rig() {
+function rig(responses: LlmResponse[] = []) {
   const harness = new PrismHarness({ drivers: { m: () => new MemorySessionStore(), d: () => new Durable() }, stores: { ephemeral: 'm', durable: 'd' } });
   const session = harness.for({ type: 'User', id: 1 }).session('host-content');
   const requests: LlmRequest[] = [];
@@ -48,72 +40,109 @@ function rig() {
     tools: new ToolRegistry().register({ name: 'lookup', handle: () => 'found' }),
     client: async (request: LlmRequest): Promise<LlmResponse> => {
       requests.push(JSON.parse(JSON.stringify(request)) as LlmRequest);
-      return { text: 'ok', finishReason: 'stop' };
+      return responses.shift() ?? { text: 'ok', finishReason: 'stop' };
     },
   });
   return { session, agent, requests };
 }
 
-function hostRow(additional: JsonObject, toolCalls: unknown = []): JsonObject {
-  return { type: 'assistant', content: 'Here it is.', tool_calls: toolCalls as JsonObject[], additional_content: additional, tool_approval_requests: [] };
+function call(id: string, name = 'lookup'): JsonObject {
+  return { id, name, arguments: { q: 'x' }, result_id: null, reasoning_id: null, reasoning_summary: null };
 }
 
-/** The sent assistant row whose content is the host's. */
-function sentHostRow(request: LlmRequest): JsonObject {
-  return (request.messages as JsonObject[]).find((row) => row.type === 'assistant' && row.content === 'Here it is.')!;
+function hostRow(content: string, additional: JsonObject, toolCalls: unknown[] = []): JsonObject {
+  return { type: 'assistant', content, tool_calls: toolCalls as JsonObject[], additional_content: additional, tool_approval_requests: [] };
 }
 
-describe('G-415: a host assistant row with no tool calls sends no tool item', () => {
-  it('OpenAI output_items: function_call and function_call_output are left out of the request; reasoning and the message are kept', async () => {
-    const r = rig();
-    await r.session.thread().record([{ type: 'user', content: 'q' }, hostRow({ output_items: OUTPUT_ITEMS, keep: 'me' })]);
-    await r.agent.send(r.session, 'next');
+/** Record `row` as a host would, after a user row, then send; return the sent copy of it and the stored one. */
+async function sendWith(row: JsonObject): Promise<{ sent: JsonObject; stored: JsonObject }> {
+  const r = rig();
+  await r.session.thread().record([{ type: 'user', content: 'q' }, row]);
+  // A host row with tool calls is a step: answer it, as a host would.
+  const calls = (row.tool_calls as JsonObject[]).filter((entry) => typeof entry === 'object' && entry !== null);
+  if (calls.length > 0) {
+    await r.session.thread().record([{ type: 'tool_result', tool_approval_responses: [], tool_results: calls.map((entry) => ({ tool_call_id: entry.id, tool_name: entry.name, args: { q: 'x' }, result: 'found', tool_call_result_id: null, artifacts: [] })) }]);
+  }
+  await r.agent.send(r.session, 'next');
+  const assistants = (rows: JsonObject[]) => rows.filter((entry) => entry.type === 'assistant' && entry.content === row.content);
+  return {
+    sent: assistants(r.requests.at(-1)!.messages as JsonObject[])[0]!,
+    stored: assistants((await r.session.thread().messages()).map((entry) => entry.message))[0]!,
+  };
+}
 
-    const sent = sentHostRow(r.requests.at(-1)!);
-    expect((sent.additional_content as JsonObject).output_items).toEqual([OUTPUT_ITEMS[0], OUTPUT_ITEMS[3]]);
-    expect((sent.additional_content as JsonObject).keep).toBe('me');
-    // Stored as recorded.
-    const stored = (await r.session.thread().messages()).map((entry) => entry.message).find((row) => row.type === 'assistant')!;
-    expect((stored.additional_content as JsonObject).output_items).toEqual(OUTPUT_ITEMS);
+const additional = (row: JsonObject): JsonObject => row.additional_content as JsonObject;
+
+const openaiCall = (id: string) => ({ type: 'function_call', id, call_id: `c_${id}`, name: 'lookup', arguments: '{"q":"x"}' });
+const message = (text: string) => ({ type: 'message', role: 'assistant', content: [{ type: 'output_text', text }] });
+const toolUse = (id: string) => ({ type: 'tool_use', id, name: 'lookup', input: { q: 'x' } });
+
+describe('G-415: a host row\'s provider content is sent only when it is that row\'s own', () => {
+  it('OpenAI, a note with no tool calls carrying a copied function_call: output_items are dropped; content and other keys are kept; stored unchanged', async () => {
+    const items = [{ type: 'reasoning', id: 'rs_1', summary: [] }, openaiCall('fc_1'), { type: 'function_call_output', call_id: 'c_fc_1', output: 'found' }, message(NOTE)];
+    const { sent, stored } = await sendWith(hostRow(NOTE, { output_items: items, keep: 'me' }));
+    expect(additional(sent)).toEqual({ keep: 'me' });
+    expect(sent.content).toBe(NOTE);
+    expect(additional(stored).output_items).toEqual(items);
   });
 
-  it('Anthropic content_blocks: every tool_use is left out of the request, including one after a fallback block', async () => {
-    const r = rig();
-    await r.session.thread().record([{ type: 'user', content: 'q' }, hostRow({ content_blocks: CONTENT_BLOCKS })]);
-    await r.agent.send(r.session, 'next');
-
-    const sent = sentHostRow(r.requests.at(-1)!);
-    expect((sent.additional_content as JsonObject).content_blocks).toEqual([CONTENT_BLOCKS[0], CONTENT_BLOCKS[2], CONTENT_BLOCKS[4]]);
+  it('Anthropic, a note with no tool calls carrying a copied tool_use: content_blocks are dropped', async () => {
+    const { sent } = await sendWith(hostRow(NOTE, { content_blocks: [{ type: 'text', text: NOTE }, toolUse('toolu_1')] }));
+    expect(additional(sent)).toEqual({});
   });
 
-  it('a host row whose tool_calls hold no objects counts as one with none: its tool items are left out too', async () => {
-    const r = rig();
-    await r.session.thread().record([{ type: 'user', content: 'q' }, hostRow({ output_items: OUTPUT_ITEMS, content_blocks: CONTENT_BLOCKS }, ['{"id":"call_1"}'])]);
-    await r.agent.send(r.session, 'next');
-
-    const sent = sentHostRow(r.requests.at(-1)!);
-    expect(JSON.stringify(sent.additional_content)).not.toContain('function_call');
-    expect(JSON.stringify(sent.additional_content)).not.toContain('tool_use');
+  it('A1 OpenAI: a host row WITH tool calls carrying another step\'s function_call: output_items are dropped', async () => {
+    const { sent } = await sendWith(hostRow('', { output_items: [openaiCall('fc_other')] }, [call('fc_own')]));
+    expect(additional(sent)).toEqual({});
+    expect((sent.tool_calls as JsonObject[]).map((entry) => entry.id)).toEqual(['fc_own']);
   });
 
-  it('the harness\'s own rows are sent as recorded: a model step with tool calls keeps its function_call item', async () => {
-    const harness = new PrismHarness({ drivers: { m: () => new MemorySessionStore(), d: () => new Durable() }, stores: { ephemeral: 'm', durable: 'd' } });
-    const session = harness.for({ type: 'User', id: 1 }).session('own-rows');
-    const requests: LlmRequest[] = [];
-    let model = 0;
-    const agent = new AgentRuntime({
-      modes: new ModeRegistry({ default: 'm', modes: { m: { system_prompt: 'S.', tools: ['lookup'], max_steps: 4 } } }),
-      tools: new ToolRegistry().register({ name: 'lookup', handle: () => 'found' }),
-      client: async (request: LlmRequest): Promise<LlmResponse> => {
-        requests.push(JSON.parse(JSON.stringify(request)) as LlmRequest);
-        return ++model === 1
-          ? { text: '', finishReason: 'tool_calls', toolCalls: [{ id: 'call_1', name: 'lookup', arguments: { q: 'x' } }], additionalContent: { output_items: [OUTPUT_ITEMS[1]!] } }
-          : { text: 'done', finishReason: 'stop' };
-      },
-    });
-    await agent.send(session, 'go');
+  it('A1 Anthropic: a host row WITH tool calls carrying another step\'s tool_use, also after a fallback block: content_blocks are dropped', async () => {
+    for (const blocks of [[toolUse('toolu_other')], [{ type: 'fallback' }, toolUse('toolu_own'), toolUse('toolu_other')]]) {
+      const { sent } = await sendWith(hostRow('', { content_blocks: blocks }, [call('toolu_own')]));
+      expect(additional(sent)).toEqual({});
+    }
+  });
 
-    const step = (requests.at(-1)!.messages as JsonObject[]).find((row) => row.type === 'assistant' && Array.isArray(row.tool_calls) && row.tool_calls.length > 0)!;
-    expect((step.additional_content as JsonObject).output_items).toEqual([OUTPUT_ITEMS[1]]);
+  it('A2 Anthropic: a note whose copied text block is not its own text: content_blocks are dropped, so the note\'s text is what is sent (with and without a fallback block)', async () => {
+    for (const blocks of [[{ type: 'text', text: 'Copied text.' }], [{ type: 'fallback' }, { type: 'text', text: 'Copied text.' }]]) {
+      const { sent } = await sendWith(hostRow(NOTE, { content_blocks: blocks }));
+      expect(additional(sent)).toEqual({});
+      expect(sent.content).toBe(NOTE);
+    }
+  });
+
+  it('A3 OpenAI: a note carrying a copied reasoning item and no message: output_items are dropped', async () => {
+    const { sent } = await sendWith(hostRow(NOTE, { output_items: [{ type: 'reasoning', id: 'rs_copied', summary: [] }] }));
+    expect(additional(sent)).toEqual({});
+  });
+
+  it('a host row whose provider content IS its own (same calls, same text) is sent as recorded, on both providers', async () => {
+    const own = { output_items: [message('Looking.'), openaiCall('fc_1')], content_blocks: [{ type: 'text', text: 'Looking.' }, toolUse('fc_1')] };
+    // OpenAI's text is the first part of the last output item: here the call, so empty.
+    const openai = await sendWith(hostRow('', { output_items: [{ type: 'reasoning', id: 'rs_1', summary: [] }, openaiCall('fc_1')] }, [call('fc_1')]));
+    expect(additional(openai.sent).output_items).toEqual([{ type: 'reasoning', id: 'rs_1', summary: [] }, openaiCall('fc_1')]);
+    const anthropic = await sendWith(hostRow('Looking.', { content_blocks: own.content_blocks }, [call('fc_1')]));
+    expect(additional(anthropic.sent).content_blocks).toEqual(own.content_blocks);
+  });
+
+  it('a host row whose tool_calls hold no objects counts as one with none', async () => {
+    const { sent } = await sendWith(hostRow(NOTE, { output_items: [openaiCall('fc_1'), message(NOTE)], content_blocks: [{ type: 'text', text: NOTE }, toolUse('t1')] }, ['{"id":"fc_1"}']));
+    expect(additional(sent)).toEqual({});
+  });
+
+  it('rows the harness writes from a provider response are sent byte for byte, even when their content would not match', async () => {
+    const returned = {
+      output_items: [{ type: 'reasoning', id: 'rs_9', summary: [] }, openaiCall('fc_9'), message('different text')],
+      content_blocks: [{ type: 'fallback' }, toolUse('toolu_9'), { type: 'text', text: 'other' }],
+      thinking: 'kept',
+    };
+    const r = rig([
+      { text: '', finishReason: 'tool_calls', toolCalls: [{ id: 'call_1', name: 'lookup', arguments: { q: 'x' } }], additionalContent: returned },
+      { text: 'done', finishReason: 'stop' },
+    ]);
+    await r.agent.send(r.session, 'go');
+    const step = (r.requests.at(-1)!.messages as JsonObject[]).find((row) => row.type === 'assistant' && Array.isArray(row.tool_calls) && row.tool_calls.length > 0)!;
+    expect(JSON.stringify(step.additional_content)).toBe(JSON.stringify(returned));
   });
 });
