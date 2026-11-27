@@ -1011,11 +1011,6 @@ export class AgentRuntime {
     const answered = view.slice(index + 1).filter((row) => row.type === 'tool_result') as ToolResultRow[];
     // Each result as the replay view holds it, never folded by call id alone (G-402).
     const results = answered.flatMap((row) => row.tool_results);
-    const decisions = new Map(answered.flatMap((row) => row.tool_approval_responses).map((entry) => [entry.approval_id, entry]));
-    // A started call keeps the decision it started under: a decision written
-    // after it started (straight into the thread) is not recorded beside its
-    // outcome (G-411).
-    for (const [approvalId, entry] of startedDecisions(messages, stored)) if (decisions.has(approvalId)) decisions.set(approvalId, entry);
     // An approval belongs to the step that first asked for it: a later row
     // repeating its id (a copy a host recorded) asks for nothing, so one
     // decision never decides a call of another step (G-408).
@@ -1034,6 +1029,19 @@ export class AgentRuntime {
     // id a result by id cannot say whose it is, so its gated calls stay open
     // until there are as many results for the id as calls carrying it.
     // Counted on the rows as stored: the replay view folds results by id.
+    // The FIRST decision recorded for an approval stands, as when it was
+    // written (G-401): a later one, from a racing writer or a row recorded
+    // before the rule, is never read in its place. Read row by row, as
+    // stored: the replay view folds rows and keeps the last.
+    const decisions = new Map<string, ApprovalDecisionEntry>();
+    for (const row of rows.slice(stored + 1).flatMap((message) => threadView([message]))) {
+      if (row.type !== 'tool_result') continue;
+      for (const entry of (row as ToolResultRow).tool_approval_responses) if (!decisions.has(entry.approval_id)) decisions.set(entry.approval_id, entry);
+    }
+    // A started call keeps the decision it started under: a decision written
+    // after it started (straight into the thread) is not recorded beside its
+    // outcome (G-411).
+    for (const [approvalId, entry] of startedDecisions(messages, stored)) if (decisions.has(approvalId)) decisions.set(approvalId, entry);
     // Which of its calls already has an outcome: each result belongs to one
     // call, matched by id and the arguments it records, in the segment it sits
     // in or an earlier step's, never by id alone (G-392, G-397).
