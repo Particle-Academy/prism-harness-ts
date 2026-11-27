@@ -1080,10 +1080,13 @@ async function replaySentAnswersEveryCall(session: Session, c: Case, label: stri
   const forged = c.insert?.kind === 'tool_result';
   const readers = await session.thread().readerRows();
   const sent = replayView(readers);
+  // The paused step (the last assistant row, no user row after it) is the
+  // resume's to answer: the replay gives its open calls nothing (the
+  // reference's rule, parity-r16 item 3a).
   const last = sent.findLastIndex((row) => row.type === 'assistant');
-  const parked = pendingApprovalIds(readers).length > 0;
+  const paused = last !== -1 && !sent.slice(last + 1).some((row) => row.type === 'user');
   for (const [index, row] of sent.entries()) {
-    if (row.type !== 'assistant' || (index === last && parked)) continue;
+    if (row.type !== 'assistant' || (index === last && paused)) continue;
     const calls = ((row.tool_calls ?? []) as JsonObject[]);
     if (calls.length === 0) continue;
     const answers: string[] = [];
@@ -1094,7 +1097,11 @@ async function replaySentAnswersEveryCall(session: Session, c: Case, label: stri
     for (const call of calls) counts.set(String(call.id), (counts.get(String(call.id)) ?? 0) + 1);
     for (const [id, want] of counts) {
       const got = answers.filter((answer) => answer === id).length;
-      check(forged ? got >= want : got === want, `${label}: the sent replay answers every call of a step exactly once`, { step: index, id, got, want });
+      // Calls that share an id: the fold keys a result by id, tool and
+      // arguments and a later row's replaces an earlier one's (thr-0009), so
+      // IDENTICAL calls may show one answer between them; never none.
+      const ok = forged ? got >= want : want > 1 ? got >= 1 && got <= want : got === want;
+      check(ok, `${label}: the sent replay answers every call of a step exactly once`, { step: index, id, got, want });
     }
   }
 }

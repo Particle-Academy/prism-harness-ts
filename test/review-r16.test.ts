@@ -387,12 +387,11 @@ describe('item 3: ungated calls and the interrupted replay', () => {
       inner = response.pendingApprovals.map((pending) => pending.id);
     };
     const requests = r.requests.length;
-    const outer = await r.runtime.send(r.session(), '');
+    // The outer resume takes no further model step (the reference's rule:
+    // `parked_elsewhere`); what it ran is recorded.
+    expect(await r.runtime.send(r.session(), '').then(() => 'ran', code)).toBe('parked_elsewhere');
     expect(r.during).toEqual(['awaiting_approval']);
-    // The outer resume stopped with no model step of its own and reports the inner step's approvals.
     expect(r.requests.length).toBe(requests + 1);
-    expect(outer.finishReason).toBe('awaiting_approval');
-    expect(outer.pendingApprovals.map((pending) => [pending.id, pending.toolCallId, pending.tool])).toEqual([[inner[0], 'c9', 'echo']]);
     for (const request of r.requests) expect(everyCallAnswered(request)).toEqual([]);
     let rows = await r.rows();
     expect(outcomes(rows, 1)).toEqual(['ran:1']);

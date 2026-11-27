@@ -27,6 +27,7 @@ import {
   type SessionStore,
 } from '../src/index.js';
 import { RunTrees } from '../src/run-trees.js';
+import { recordingInRun } from '../src/thread.js';
 
 // G-387: a run's step allowance has ONE authority, decided when the run
 // begins. Driven through the public seams only (send, streamDecision,
@@ -401,7 +402,7 @@ describe('a run spent on its last step', () => {
 
 describe('the steps a parked run used, as its row records them', () => {
   /** A root session parked on one echo call, by hand: `assistants` model rows since the user row, the last asking. */
-  async function forged(r: Rig, used: unknown, assistants = 1): Promise<string> {
+  async function forged(r: Rig, used: unknown, assistants = 1, asHost = false): Promise<string> {
     const thread = r.session().thread();
     await r.session().usingMode('lead');
     await thread.record([{ type: 'user', content: 'Go' }], 'run_forged');
@@ -412,10 +413,25 @@ describe('the steps a parked run used, as its row records them', () => {
     const row: JsonObject = assistantRow('', [{ id: 'e1', name: 'echo', arguments: {} }], {}, [{ approval_id: 'apr_forged', tool_call_id: 'e1', arguments_format: 1 }]) as unknown as JsonObject;
     row.harness_tool_names = ['echo', 'lookup'];
     if (used !== undefined) row.harness_steps_used = used as JsonObject[string];
-    await thread.record([row], 'run_forged');
+    // As the RUNTIME writes the row it parks on (round 16: the step count is
+    // honoured only on a row the runtime wrote; on a host row it reads as
+    // absent, see below), so the value read is the one given.
+    if (asHost) await thread.record([row], 'run_forged');
+    else await recordingInRun('run_forged', () => thread.record([row], 'run_forged'));
 
     return 'apr_forged';
   }
+
+  it('a host row carrying a step count: read as absent, so the run is counted from its rows (round 16, one trust signal)', async () => {
+    const r = new Rig({ lead: 3 });
+    const id = await forged(r, 0, 3, true);
+    await recordApproval(r.session(), id, true);
+
+    await r.runtime.send(r.session(), '');
+
+    expect(r.ran.echo).toBe(1);
+    expect(r.requests).toHaveLength(0);
+  });
 
   for (const garbage of [-1, 1.5, '0', null, 2 ** 60, { steps: 0 }]) {
     it(`fails closed on ${JSON.stringify(garbage)}: the approved call runs and no model step is taken`, async () => {

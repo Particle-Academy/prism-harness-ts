@@ -227,6 +227,9 @@ export function threadView(rows: readonly JsonObject[]): JsonObject[] {
   let run: ToolResultRow[] = [];
   let replayed = new Map<string, number>();
   let decided = new Set<string>();
+  // Each decision as it STANDS (round 16, item 10; the reference's fold): a
+  // decision recorded after its call's outcome is never shown.
+  const standing = standingDecisions(rows);
   const flush = (): void => {
     if (run.length === 0) return;
     const merged = unreplayed(run.reduce((earlier, later) => fold(earlier, later)), replayed, decided);
@@ -240,7 +243,12 @@ export function threadView(rows: readonly JsonObject[]): JsonObject[] {
     if (normalised === null) continue;
 
     if (normalised.type === 'tool_result') {
-      run.push(normalised as ToolResultRow);
+      const result = normalised as ToolResultRow;
+      result.tool_approval_responses = result.tool_approval_responses.flatMap((entry) => {
+        const stands = standing.get(entry.approval_id);
+        return stands === undefined ? [] : [{ approval_id: stands.approval_id, approved: stands.approved, reason: stands.reason }];
+      });
+      run.push(result);
       continue;
     }
 
@@ -332,14 +340,12 @@ function replayOrder(rows: readonly JsonObject[], synthesise = true): readonly J
     if (!answers.includes(null) && !answers.includes('started')) continue;
     const calls = stepCalls(row);
     const requested = pairStepApprovals(calls, requests, (_call, position) => answers[position] === null).approvalIds;
-    // The paused step's calls still waiting on a person are the resume's to
-    // answer; any other call of it with no result (one nobody ran: a host's
-    // step, a write that failed) reads interrupted too.
+    // The paused step's calls with no started row and no result get nothing:
+    // a resume answers them (or they are a host's own client-run calls).
     const entries = answers.flatMap((answer, position) => {
       const result = answer === 'started' ? INTERRUPTED_RESULT
-        : answer !== null ? null
-          : index !== paused ? (requested[position] !== undefined ? SUPERSEDED_RESULT : INTERRUPTED_RESULT)
-            : requested[position] === undefined ? INTERRUPTED_RESULT : null;
+        : answer !== null || index === paused ? null
+          : requested[position] !== undefined ? SUPERSEDED_RESULT : INTERRUPTED_RESULT;
       if (result === null) return [];
       const call = calls[position]!;
       return [{
@@ -727,16 +733,32 @@ function buildIndex(rows: readonly JsonObject[]): RowIndex {
   let segment: number | null = null;
   let lastAssistant = -1;
 
-  const decide = (answer: JsonObject, at: number): void => {
+  // Each step's pairing of its requests with its calls, fixed at the first
+  // decision its rows carry: a request prefers a call that had no result
+  // before that decision (the resolver's and the replay's pairing).
+  const pairing = new Map<number, (string | undefined)[]>();
+  // `row` holds this decision; `target` the step the row belongs to (its
+  // segment's, or the one its honoured mark names).
+  const decide = (answer: JsonObject, at: number, target: number | null): void => {
     const entry = decision(answer);
     const step = firstAsker.get(entry.approval_id);
     if (step !== undefined) {
-      // Counted only while its call (paired by position with the step's
-      // calls that have no outcome yet) has none.
+      // Only the rows of the approval's OWN step decide it.
+      if (target !== step) return;
       const state = steps.get(step)!;
-      const paired = pairStepApprovals(state.calls, ownOf.get(step) ?? [], (_call, position) => state.has[position] === null).approvalIds;
-      const position = paired.indexOf(entry.approval_id);
-      if (position === -1 || state.has[position] !== null) return;
+      if (!pairing.has(step)) {
+        // PREFERS such a call; a request no such call takes pairs as stored.
+        const requests = ownOf.get(step) ?? [];
+        const preferred = pairStepApprovals(state.calls, requests, (_call, position) => state.has[position] === null).approvalIds;
+        const anyCall = pairStepApprovals(state.calls, requests).approvalIds;
+        for (const id of anyCall) if (id !== undefined && !preferred.includes(id) && preferred[anyCall.indexOf(id)] === undefined) preferred[anyCall.indexOf(id)] = id;
+        pairing.set(step, preferred);
+      }
+      // Counted only while the call its request was issued for has no
+      // outcome (no result, no started row) in the rows before this one; an
+      // approval that pairs with no call of its step counts always.
+      const position = pairing.get(step)!.indexOf(entry.approval_id);
+      if (position !== -1 && state.has[position] !== null) return;
     }
     if (prevails(standing.get(entry.approval_id)?.entry, entry.approved)) standing.set(entry.approval_id, { entry, at });
   };
@@ -760,10 +782,10 @@ function buildIndex(rows: readonly JsonObject[]): RowIndex {
       ownOf.set(at, own);
       continue;
     }
-    if (row.type === 'tool_approval_response') { decide(row, at); continue; }
+    if (row.type === 'tool_approval_response') { decide(row, at, segment); continue; }
     if (row.type !== 'tool_result') continue;
     // The row's decisions first, against what the calls had BEFORE it.
-    for (const answer of list(row.tool_approval_responses)) decide(answer, at);
+    for (const answer of list(row.tool_approval_responses)) decide(answer, at, owner ?? segment);
     for (const [key, set] of marked) {
       const mark = row[key];
       if (!isObject(mark) || !Array.isArray(mark.approval_ids)) continue;

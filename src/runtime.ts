@@ -1244,21 +1244,7 @@ export class AgentRuntime {
         // A thread an older harness wrote may hold an earlier step it left
         // superseded and unanswered: answered once, first (0.11.x shape).
         if (started === null) await this.#answerReplacedSteps(session, mode, runId, stepping?.locked === true);
-        const resolvedStep: { position: number | null } = { position: null };
-        if (started === null && prompt === '' && !turn.ledger.cancelled && !outOfTime) offered = await this.#resolveApprovals(session, mode, offered, runId, called, scope?.legacy === true, steps, stepping?.locked === true, resolvedStep);
-        // A NESTED PARK (round 16, item 3): a tool this resume ran sent on its
-        // own session and that turn parked a NEWER step for a person. This
-        // resume is no longer the newest run: it stops here, with no model
-        // step, so it neither sends a request whose last step has unanswered
-        // calls nor replaces the step just reported as awaiting approval.
-        if (resolvedStep.position !== null) {
-          const nested = await this.#nestedPark(session, resolvedStep.position);
-          if (nested !== null) {
-            taskRecorded = true;
-            const finished = await this.#finish(session, runId, called, 'awaiting_approval', '', turn, null);
-            return { ...finished, pendingApprovals: nested };
-          }
-        }
+        if (started === null && prompt === '' && !turn.ledger.cancelled && !outOfTime) offered = await this.#resolveApprovals(session, mode, offered, runId, called, scope?.legacy === true, steps, stepping?.locked === true);
 
         if (prompt !== '') {
           // With attachments, the shape prism-ts's UserMessage.toObject() writes:
@@ -1297,7 +1283,7 @@ export class AgentRuntime {
           }
         }
 
-        return this.#loop(session, mode, turn, runId, provider, model, offered, called, systemPrompt, schema, steps);
+        return this.#loop(session, mode, turn, runId, provider, model, offered, called, systemPrompt, schema, steps, stored.length);
       });
     } catch (error) {
       // THE MODEL'S OWN WORDS DO NOT BELONG IN A RUN ROW OR AN EVENT. A schema
@@ -1374,6 +1360,7 @@ export class AgentRuntime {
     systemPrompt: string,
     schema?: Readonly<JsonObject>,
     steps?: RunStepTagger,
+    history = Number.POSITIVE_INFINITY,
   ): Promise<AgentResponse> {
     const thread = session.thread();
     let text = '';
@@ -1393,10 +1380,20 @@ export class AgentRuntime {
       const ceiling = session.agent === null ? null : (this.#agents[session.agent]?.spend_ceiling ?? null);
       if (session.agent !== null && ceiling !== null) run.ledger.assertAgentCeiling(session.agent, ceiling);
 
+      // A NESTED PARK (round 16, item 3; the reference's rule): a NEWER step
+      // than this run's history, written by anyone but this run (a tool's
+      // own send on this session, another run, a host), waits on approval.
+      // This run takes no further model step: it never sends a request whose
+      // last step has unanswered calls, and never writes a row after that
+      // step, so it never replaces it. What it ran is already recorded.
+      const sent = await thread.readerRows();
+      const pausedAt = pausedStepIndex(sent);
+      if (pausedAt !== null && pausedAt >= history && isToolStep(sent[pausedAt]) && pendingApprovalIds(sent).length > 0) throw HarnessError.parkedElsewhere();
+
       steps?.stepStart();
       const response = await this.#client({
         systemPrompt,
-        messages: replayView(await thread.readerRows()),
+        messages: replayView(sent),
         tools: offered,
         provider,
         model,
@@ -1676,7 +1673,6 @@ export class AgentRuntime {
     legacyDiagnosticEmitted: boolean,
     steps?: RunStepTagger,
     alreadyLocked = false,
-    resolvedStep: { position: number | null } = { position: null },
   ): Promise<HarnessTool[]> {
     // A read without the lock first: nearly every send() has nothing to resolve
     // and should not wait on the session lock to find that out.
@@ -1709,7 +1705,6 @@ export class AgentRuntime {
       // interrupted and never runs again. No claim, no ttl.
       const thread = live.thread();
       const resolved: { entry: ToolResultEntry; at: number; started: boolean }[] = [];
-      resolvedStep.position = work.position;
 
       for (const [index, call] of work.calls.entries()) {
         const input = { id: call.id, name: call.name, arguments: call.arguments, resultId: call.result_id };
@@ -1809,27 +1804,6 @@ export class AgentRuntime {
     if (alreadyLocked) return await resolve(session);
 
     return await this.#holding(session, resolve);
-  }
-
-  /**
-   * The approvals a NEWER step than the one at `position` is parked on (a
-   * nested turn's, recorded while this resume resolved), or null when the
-   * thread is not parked on one.
-   */
-  async #nestedPark(session: Session, position: number): Promise<AgentResponse['pendingApprovals'] | null> {
-    const rows = await session.thread().readerRows();
-    const paused = pausedStepIndex(rows);
-    if (paused === null || paused + 1 <= position || !isToolStep(rows[paused])) return null;
-    const pending = pendingApprovalIds(rows);
-    if (pending.length === 0) return null;
-    // Each approval's own call, paired by position (G-392).
-    const calls = stepCalls(rows[paused]);
-    const answered = stepResultsByPosition(rows, paused);
-    const paired = pairStepApprovals(calls, ownRequests(rows, paused), (_call, at) => !answered[at]).approvalIds;
-    return pending.map((id) => {
-      const call = calls[paired.indexOf(id)];
-      return { id, toolCallId: typeof call?.id === 'string' ? call.id : '', tool: typeof call?.name === 'string' ? call.name : '', arguments: usableArguments(call?.arguments) ?? {} };
-    });
   }
 
   /**

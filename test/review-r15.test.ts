@@ -189,7 +189,10 @@ describe('item 1: a superseding write while an approved call runs', () => {
       const [id] = await r.parked();
       await recordApproval(r.session(), id!, true);
       r.duringEcho = async () => { r.during.push(await r.session().thread().record([row]).then(() => 'recorded', code)); };
-      await r.runtime.send(r.session(), '');
+      // A host step that asks for an approval parks the session on it: the
+      // resume then takes no further model step (round 16, parked_elsewhere).
+      const asks = Array.isArray(row.tool_approval_requests) && row.tool_approval_requests.length > 0;
+      expect(await r.runtime.send(r.session(), '').then(() => 'ran', code)).toBe(asks ? 'parked_elsewhere' : 'ran');
       expect(r.during).toEqual(['recorded']);
 
       const rows = await r.rows();
@@ -215,15 +218,14 @@ describe('item 1: a superseding write while an approved call runs', () => {
   // person while the call ran stops the resume with no model step, so the
   // run no longer replaces it (it was REPLACED before). Its own approval
   // decides it: two empty resumes with no decision close it as unanswered.
-  it('a tool-call step reusing the call\'s id, recorded mid-call: the resume stops with no model step, the host\'s step stays pending on ITS OWN approval, and the earlier result never answers it', async () => {
+  it('a tool-call step reusing the call\'s id, recorded mid-call: the resume stops with no model step (parked_elsewhere), the host\'s step stays pending on ITS OWN approval, and the earlier result never answers it', async () => {
     const r = new Rig();
     const [id] = await r.parked();
     await recordApproval(r.session(), id!, true);
     r.duringEcho = async () => { await r.session().thread().record([hostStep('c1', 3, 'apr_later')]); };
     const requests = r.requests.length;
-    const resumed = await r.runtime.send(r.session(), '');
+    expect(await r.runtime.send(r.session(), '').then(() => 'ran', code)).toBe('parked_elsewhere');
     expect(r.requests.length).toBe(requests);
-    expect(resumed.pendingApprovals.map((pending) => pending.id)).toEqual(['apr_later']);
     expect(pendingApprovalIds(await r.rows())).toEqual(['apr_later']);
     for (let i = 0; i < 2; i += 1) await r.runtime.send(r.session(), '');
     const rows = await r.rows();

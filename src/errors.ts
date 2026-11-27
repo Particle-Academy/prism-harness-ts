@@ -19,6 +19,12 @@ export type HarnessErrorCode =
   /** A run was refused — by budget, by depth, or by a cancelled ledger. */
   | 'run_not_permitted'
   /**
+   * A run may not take another model step: a NEWER step on its session, which
+   * another run or a host wrote while it ran, is waiting on approval (G-387
+   * round 16, a nested park). The same code in the PHP reference.
+   */
+  | 'parked_elsewhere'
+  /**
    * A subagent child session has no saved provider and model binding, so it
    * may not run outside the subagent runner. The same code in the PHP reference.
    */
@@ -111,7 +117,7 @@ export type HarnessErrorCode =
  * refusal codes are added where they are defined (failures.ts).
  */
 export const HARNESS_ERROR_CODES = [
-  'session_locked', 'unsafe_state_configuration', 'unknown_store_driver', 'tool_not_available', 'run_not_permitted',
+  'session_locked', 'unsafe_state_configuration', 'unknown_store_driver', 'tool_not_available', 'run_not_permitted', 'parked_elsewhere',
   'child_binding_missing', 'plan_budget_exhausted', 'model_step_failed', 'unmappable_content', 'no_agent_runtime',
   'mode_not_configured', 'mode_malformed', 'unsafe_authorization_configuration', 'call_not_authorized',
   'tool_policy_refused', 'skill_path_refused', 'approval_not_pending', 'duplicate_task_id', 'task_identifier_blank',
@@ -209,6 +215,11 @@ export class HarnessError extends Error {
 
   static runNotPermitted(reason: string): HarnessError {
     return new HarnessError('run_not_permitted', reason);
+  }
+
+  /** A newer step on the run's session waits on approval: the run takes no further model step (G-387 round 16). */
+  static parkedElsewhere(): HarnessError {
+    return new HarnessError('parked_elsewhere', 'This run may not take another model step (parked_elsewhere): a newer step on its session is waiting on approval.');
   }
 
   /**

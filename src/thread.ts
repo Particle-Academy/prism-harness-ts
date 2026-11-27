@@ -49,7 +49,10 @@ export interface ThreadMessage {
  * the harness itself recorded under its private in-run token. On any other
  * row they are read exactly as if absent.
  */
-const ROW_MARKS: readonly string[] = [ANSWERS_STEP_KEY, STARTED_KEY, ENDED_BY_START_KEY, SUPERSEDED_KEY, REPLACED_STEP_KEY];
+const ROW_MARKS: readonly string[] = [ANSWERS_STEP_KEY, STARTED_KEY, ENDED_BY_START_KEY, SUPERSEDED_KEY, REPLACED_STEP_KEY,
+  // The step counts a parked run writes on the row it parks on (round 16: the
+  // reference's list): on a row the runtime did not write they read as absent.
+  'harness_steps_used', 'harness_steps_left'];
 
 /**
  * The rows as every harness reader takes them (G-387 round 15): a row the
