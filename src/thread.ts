@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { JsonObject, JsonValue } from './json.js';
 import { isJsonObject } from './json.js';
-import { ANSWERS_STEP_KEY, ENDED_BY_START_KEY, NOT_RUN_KEY, REPLACED_STEP_KEY, STARTED_KEY, SUPERSEDED_KEY, markedOwner, pausedStepIndex, supersededRow, supersedes } from './thread-rows.js';
+import { ANSWERS_STEP_KEY, ENDED_BY_START_KEY, NOT_RUN_KEY, REPLACED_STEP_KEY, STARTED_KEY, SUPERSEDED_KEY, markedOwner, pausedStepIndex, supersededRow, supersedes, withBoundRequests } from './thread-rows.js';
 import { HarnessError } from './errors.js';
 
 /**
@@ -289,9 +289,11 @@ export class Thread {
   #entries(messages: readonly Planned[], length: number, runId: string | null, harness: boolean): JsonObject[] {
     const recordedAt = new Date().toISOString();
 
+    // Every stored step's approval requests are bound to their own calls
+    // (round 15): a host's as well as the runtime's.
     return messages.map(({ message, own }, index) => ({
       position: length + index + 1,
-      message,
+      message: withBoundRequests(message),
       run_id: runId,
       recorded_at: recordedAt,
       ...(harness || own ? { harness: true } : {}),

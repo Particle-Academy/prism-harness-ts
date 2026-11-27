@@ -34,6 +34,10 @@ import {
   answeringStep,
   isToolStep,
   askedBefore,
+  bindsCall,
+  newResults,
+  stepCalls,
+  UNBOUND_APPROVAL_RESULT,
   ownRequests,
   revocableApprovalIds,
   stepResultsByPosition as answeredCalls,
@@ -1419,6 +1423,8 @@ export class AgentRuntime {
         }
         gated.push(call);
       }
+      // Thread.record() binds each request to the exact call the person is
+      // shown (round 15): its tool and the digest of its arguments.
       const requests: ApprovalRequestEntry[] = gated.map((call) => ({
         approval_id: `apr_${randomUUID().replaceAll('-', '')}`,
         tool_call_id: call.id,
@@ -1679,6 +1685,13 @@ export class AgentRuntime {
           const entry = { ...toolResultEntry(input, REPEATED_CALL_ID_RESULT), [NOT_RUN_KEY]: REPEATED_CALL_ID, ...(approvalId === undefined ? {} : { approval_id: approvalId }) };
           steps?.toolResult(call.id, entry.result, { ok: false, code: 'approval_denied', refused: true });
           resolved.push({ entry, at, started: false });
+        } else if (decision?.approved === true && work.unbound.has(at)) {
+          // Approved for ANOTHER call (round 15): its request is bound to a
+          // tool and arguments this call does not have. Denied, fail-closed.
+          this.#toolDecision('tool_denied', live, runId, input, declared, 'policy');
+          const entry = toolResultEntry(input, UNBOUND_APPROVAL_RESULT);
+          steps?.toolResult(call.id, entry.result, { ok: false, code: 'approval_denied', refused: true });
+          resolved.push({ entry, at, started: false });
         } else if (decision?.approved === true && work.unusable.has(call.id)) {
           const entry = toolResultEntry(input, `Not run: the arguments for ${call.name} are not a JSON object.`);
           steps?.toolResult(call.id, entry.result, { ok: false, code: 'tool_failed', refused: false });
@@ -1720,10 +1733,18 @@ export class AgentRuntime {
       await recordingInRun(runId, () => thread.record([toolResultRow([])], runId, {
         build: (rows) => {
           const answered = answeredCalls(rows, stepIndex);
-          const own = resolved.filter(({ at, started }) => started || !answered[at]).map(({ entry }) => entry);
-          if (own.length === 0) return [];
+          // Only what the step does not hold yet (round 15): never a copy of
+          // an earlier result of the step.
+          // The step's results so far come first, so an outcome sharing a
+          // key with one of them (an identical duplicate call) is counted
+          // beyond it, occurrence by occurrence, as the fold counts.
+          const own = newResults(rows, stepIndex, [...work.results, ...resolved.filter(({ at, started }) => started || !answered[at]).map(({ entry }) => entry)]);
+          // A row left with no results and no decisions is not written.
+          if (own.length === 0 && work.decisions.size === 0) return [];
 
-          return [answeringStep(toolResultRow([...work.results, ...own], [...work.decisions.values()]), work.position)];
+          const row = toolResultRow(own, [...work.decisions.values()]);
+          // A row that carries results names the step it answers.
+          return [own.length === 0 ? row : answeringStep(row, work.position)];
         },
       }));
       return bounded;
@@ -1800,6 +1821,8 @@ export class AgentRuntime {
     position: number;
     /** Each call's index among the step's calls, by position in `calls`. */
     indices: number[];
+    /** Indices (among the step's calls) of calls whose approval is bound to another call (round 15). */
+    unbound: Set<number>;
   } | null> {
     // The rows as the readers take them: only the harness's own marks count.
     const rows = await session.thread().readerRows();
@@ -1840,6 +1863,10 @@ export class AgentRuntime {
     const asked = askedBefore(rows, stored);
     const requests = assistant.tool_approval_requests.filter((request) => !asked.has(request.approval_id));
     const pairing = pairStepApprovals(assistant.tool_calls, requests, (_call, position) => !answeredAt[position]);
+    // Each approval's request as STORED (the view keeps only known keys): its
+    // binding to the call it was asked for (round 15).
+    const storedRequests = new Map(ownRequests(rows, stored).map((request) => [request.approval_id as string, request]));
+    const storedCalls = stepCalls(rows[stored]);
     // A step that repeats a call id: its gated calls are open until the
     // harness settled the step.
     const settled = pairing.repeated && repeatedStepSettled(rows, stored);
@@ -1853,9 +1880,13 @@ export class AgentRuntime {
     const calls = open.map(({ call }) => call);
     const approvalIds = open.map(({ approvalId }) => approvalId);
     const indices = open.map(({ index }) => index);
+    // A call its approval was not asked for (another tool or other
+    // arguments under the request's call id) is never run on it.
+    const unbound = new Set(open.filter(({ approvalId, index }) => approvalId !== undefined && storedCalls[index] !== undefined
+      && !bindsCall(storedRequests.get(approvalId), storedCalls[index]!)).map(({ index }) => index));
 
     // The row at index i is at thread position i + 1 (Thread assigns them so).
-    return calls.length === 0 ? null : { calls, results, decisions, approvalIds, repeated: pairing.repeated, scope: approvalToolScope(rows), unusable: unusableStoredCalls(rows), ambiguous: ambiguousCalls(assistant), position: stored + 1, indices };
+    return calls.length === 0 ? null : { calls, results, decisions, approvalIds, repeated: pairing.repeated, scope: approvalToolScope(rows), unusable: unusableStoredCalls(rows), ambiguous: ambiguousCalls(assistant), position: stored + 1, indices, unbound };
   }
 
   /**

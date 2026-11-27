@@ -1,5 +1,7 @@
 import type { JsonObject, JsonValue } from './json.js';
+import { createHash } from 'node:crypto';
 import { usableArguments } from './tool-arguments.js';
+import { canonicalJson } from './tool-policy.js';
 
 /**
  * The rows a run writes to a thread, in the shape the PHP reference stores.
@@ -38,7 +40,77 @@ export type ApprovalRequestEntry = {
   tool_call_id: string;
   /** Present when the call's arguments were stored as the model sent them. */
   arguments_format?: number;
+  /** The call this approval was asked for (round 15, CALL_BINDING_KEY): its LAST key. */
+  harness_call?: { tool_name: string; args_digest: string };
 };
+
+/**
+ * The key of the binding on every approval request the runtime writes when
+ * a step parks (round 15, the reference's shape): `{tool_name, args_digest}`,
+ * the request's LAST key; `args_digest` is `sha256:` and the hex sha256 of
+ * the call's arguments as canonical JSON (callArgsDigest). A call runs only
+ * when its id (the request's pairing), its tool name and that digest all
+ * match its request's; otherwise it is denied. A request stored before
+ * bindings were kept has none, and binds to its own step's call paired by
+ * position (the request is its FIRST asker's, so that call is the one the
+ * person was shown).
+ *
+ * @internal
+ */
+export const CALL_BINDING_KEY = 'harness_call';
+
+/** The digest a binding holds for a call's arguments, as stored (a JSON string decoded first). @internal */
+export function callArgsDigest(args: JsonValue | undefined): string {
+  return `sha256:${createHash('sha256').update(canonicalJson(usableArguments(args) ?? {}), 'utf8').digest('hex')}`;
+}
+
+/**
+ * The outcome of an approved call the resolver may not start (round 15, the
+ * reference's text): its request does not bind it (item 7), or it is no
+ * longer open. Written only for a call that has no outcome yet.
+ *
+ * @internal
+ */
+export const UNBOUND_APPROVAL_RESULT = 'Not run: this call is not the one that was approved, or it is no longer open.';
+
+/** `request` bound to `call` (CALL_BINDING_KEY last). @internal */
+export function boundRequest(request: ApprovalRequestEntry, call: { name: string; arguments: JsonValue | undefined }): ApprovalRequestEntry {
+  const { harness_call: _old, ...rest } = request;
+  return { ...rest, harness_call: { tool_name: call.name, args_digest: callArgsDigest(call.arguments) } };
+}
+
+/**
+ * `row` (an assistant step) with every approval request bound to its OWN
+ * call (CALL_BINDING_KEY last): the first call with the request's
+ * tool_call_id not already taken by an earlier request of the step. A
+ * request with no call of its own is left unbound. Thread.record() writes it
+ * on every stored step with requests, a host's or the runtime's (round 15).
+ *
+ * @internal
+ */
+export function withBoundRequests(row: JsonObject): JsonObject {
+  const calls = stepCalls(row);
+  const requests = row.tool_approval_requests;
+  if (calls.length === 0 || !Array.isArray(requests) || requests.length === 0) return row;
+  const taken = new Set<number>();
+  const bound = requests.map((request) => {
+    if (!isObject(request)) return request;
+    const at = calls.findIndex((call, index) => !taken.has(index) && text(call.id) === text(request.tool_call_id));
+    if (at === -1) return request;
+    taken.add(at);
+    const call = calls[at]!;
+    const { [CALL_BINDING_KEY]: _old, ...rest } = request;
+    return { ...rest, [CALL_BINDING_KEY]: { tool_name: text(call.name), args_digest: callArgsDigest(call.arguments) } };
+  });
+  return { ...row, tool_approval_requests: bound };
+}
+
+/** Whether `request` may decide `call`: its binding names the call's tool and arguments digest; a request with none binds by position. @internal */
+export function bindsCall(request: JsonObject | undefined, call: JsonObject): boolean {
+  if (request === undefined || !Object.hasOwn(request, CALL_BINDING_KEY)) return true;
+  const binding = request[CALL_BINDING_KEY];
+  return isObject(binding) && binding.tool_name === call.name && binding.args_digest === callArgsDigest(call.arguments);
+}
 
 /**
  * The marker on an approval request whose call was stored exactly as the model
@@ -149,6 +221,17 @@ export function toolResultRow(
  * `turnDecisions()`, where the first answer to an approval is the answer.
  */
 export function threadView(rows: readonly JsonObject[]): JsonObject[] {
+  // Round 15: every decision entry is replayed as the one that STANDS for
+  // its approval (a denial if any was recorded, else the first approval).
+  const standing = new Map<string, ApprovalDecisionEntry>();
+  for (const row of rows) {
+    const answers = row.type === 'tool_result' ? list(row.tool_approval_responses) : row.type === 'tool_approval_response' ? [row] : [];
+    for (const answer of answers) {
+      const entry = decision(answer);
+      if (prevails(standing.get(entry.approval_id), entry.approved)) standing.set(entry.approval_id, entry);
+    }
+  }
+  const context: ViewContext = { asked: new Set(), standing };
   rows = replayOrder(rows);
   const view: JsonObject[] = [];
   // The consecutive tool result rows not yet replayed, and what the current
@@ -164,7 +247,7 @@ export function threadView(rows: readonly JsonObject[]): JsonObject[] {
   };
 
   for (const row of rows) {
-    const normalised = normalise(row, view);
+    const normalised = normalise(row, view, context);
 
     if (normalised === null) continue;
 
@@ -198,7 +281,37 @@ export function threadView(rows: readonly JsonObject[]): JsonObject[] {
 function replayOrder(rows: readonly JsonObject[]): readonly JsonObject[] {
   const marked = (row: JsonObject): boolean => row.harness === true && row.type === 'tool_result'
     && (Object.hasOwn(row, ANSWERS_STEP_KEY) || Object.hasOwn(row, STARTED_KEY));
-  if (!rows.some(marked)) return rows;
+  const paused = pausedStepIndex(rows);
+  const anyMarked = rows.some(marked);
+  // What each step's replay is given (round 15): its started calls with no
+  // result read INTERRUPTED; a step that is NOT the paused one, a requested
+  // call of which has no outcome (a thread an older version wrote, item 9),
+  // reads REPLACED. One row per step, in call order.
+  const synthesised = new Map<number, JsonObject>();
+  for (const [index, row] of rows.entries()) {
+    if (!isToolStep(row)) continue;
+    const requests = ownRequests(rows, index);
+    if (requests.length === 0 && !anyMarked) continue;
+    const calls = stepCalls(row);
+    const answers = stepAnswers(rows, index);
+    const requested = pairStepApprovals(calls, requests, (_call, position) => answers[position] === null).approvalIds;
+    const entries = answers.flatMap((answer, position) => {
+      const result = answer === 'started' ? INTERRUPTED_RESULT
+        : answer === null && index !== paused && requested[position] !== undefined ? SUPERSEDED_RESULT : null;
+      if (result === null) return [];
+      const call = calls[position]!;
+      return [{
+        tool_call_id: text(call.id),
+        tool_name: text(call.name),
+        args: usableArguments(call.arguments) ?? {},
+        result,
+        tool_call_result_id: nullableText(call.result_id),
+        artifacts: [],
+      }];
+    });
+    if (entries.length > 0) synthesised.set(index, toolResultRow(entries) as unknown as JsonObject);
+  }
+  if (synthesised.size === 0 && !anyMarked) return rows;
   const moved = new Map<number, JsonObject[]>();
   const kept: { row: JsonObject; index: number }[] = [];
   let segment = -1;
@@ -220,20 +333,8 @@ function replayOrder(rows: readonly JsonObject[]): readonly JsonObject[] {
     // The step's own result run: the result and system rows right after it.
     while (at + 1 < kept.length && (kept[at + 1]!.row.type === 'tool_result' || kept[at + 1]!.row.type === 'system')) out.push(kept[++at]!.row);
     out.push(...(moved.get(index) ?? []));
-    const calls = stepCalls(row);
-    const interrupted = stepAnswers(rows, index).flatMap((answer, position) => {
-      if (answer !== 'started') return [];
-      const call = calls[position]!;
-      return [{
-        tool_call_id: text(call.id),
-        tool_name: text(call.name),
-        args: usableArguments(call.arguments) ?? {},
-        result: INTERRUPTED_RESULT,
-        tool_call_result_id: nullableText(call.result_id),
-        artifacts: [],
-      }];
-    });
-    if (interrupted.length > 0) out.push(toolResultRow(interrupted) as unknown as JsonObject);
+    const extra = synthesised.get(index);
+    if (extra !== undefined) out.push(extra);
   }
 
   return out;
@@ -322,27 +423,24 @@ function sortedJson(value: unknown): string {
 }
 
 /**
- * Whether a stored row is a TOOL-CALL STEP (G-408): an assistant row whose
- * `tool_calls` is a non-empty list of OBJECTS, every one of them. Anything
- * else (a JSON string, a number, null, a list of strings, a list of
- * JSON-string calls, a list mixing objects and non-objects) is not a step for
- * ANY reader: not the paused step's calls, not a request row, not a mark's
+ * Whether a stored row is a TOOL-CALL STEP (G-408, the reference's rule and
+ * TS 0.11.x #92's): an assistant row whose `tool_calls` is a JSON ARRAY
+ * holding AT LEAST ONE OBJECT; its calls are exactly those objects, in order
+ * (stepCalls). Anything else (a JSON string, a number, null, a JSON object,
+ * an array of strings, an array of JSON-string calls) is not a step for ANY
+ * reader: not the paused step's calls, not a request row, not a mark's
  * target, and it replays as an assistant text row with no tool calls. The
- * ONE rule every reader takes the calls and the requests by (stepCalls,
- * stepRequests), the reference's.
+ * ONE rule every reader takes the calls and the requests by.
  *
  * @internal
  */
 export function isToolStep(row: JsonObject | undefined): boolean {
-  if (row?.type !== 'assistant') return false;
-  const calls = row.tool_calls;
-
-  return Array.isArray(calls) && calls.length > 0 && calls.every(isObject);
+  return row?.type === 'assistant' && list(row.tool_calls).length > 0;
 }
 
-/** The calls of a tool-call step (isToolStep); none for any other row. @internal */
+/** The calls of a tool-call step (isToolStep): its object calls, in order; none for any other row. @internal */
 export function stepCalls(row: JsonObject | undefined): JsonObject[] {
-  return isToolStep(row) ? (row!.tool_calls as JsonObject[]) : [];
+  return isToolStep(row) ? list(row!.tool_calls) : [];
 }
 
 /** The approval requests of a tool-call step (isToolStep); none for any other row. @internal */
@@ -1199,6 +1297,43 @@ export function pairStepApprovals(
 }
 
 /**
+ * The entries of `entries` that are NEW for the step at `index` (round 15:
+ * exactly one stored outcome per call): by the fold's key (call id, tool
+ * name, canonical arguments), an entry is new only beyond the most any one
+ * row the step OWNS (stepAnswers' rule) holds of that key.
+ *
+ * @internal
+ */
+/** The fold's key of a stored result entry, read defensively: call id, tool name, canonical arguments. */
+function foldKey(entry: JsonObject): string {
+  return sortedJson([text(entry.tool_call_id), text(entry.tool_name), isObject(entry.args) ? entry.args : {}]);
+}
+
+export function newResults<T extends JsonObject | ToolResultEntry>(rows: readonly JsonObject[], index: number, entries: readonly T[]): T[] {
+  const most = new Map<string, number>();
+  let inSegment = true;
+  for (let at = index + 1; at < rows.length; at += 1) {
+    const row = rows[at]!;
+    if (row.type === 'assistant') inSegment = false;
+    if (row.type !== 'tool_result' || isReplacedStepRow(row)) continue;
+    const owner = markedOwner(rows, at);
+    if (owner === undefined ? !inSegment : owner !== index) continue;
+    const here = new Map<string, number>();
+    for (const entry of list(row.tool_results)) {
+      const key = foldKey(entry);
+      here.set(key, (here.get(key) ?? 0) + 1);
+    }
+    for (const [key, count] of here) most.set(key, Math.max(most.get(key) ?? 0, count));
+  }
+  const seen = new Map<string, number>();
+  return entries.filter((entry) => {
+    const key = foldKey(entry as JsonObject);
+    seen.set(key, (seen.get(key) ?? 0) + 1);
+    return seen.get(key)! > (most.get(key) ?? 0);
+  });
+}
+
+/**
  * Which calls of the stored assistant step at `index` are answered: a result
  * its step owns, or a started row (answered in progress). stepAnswers()
  * says which.
@@ -1277,9 +1412,16 @@ export function repeatedIdDenials(rows: readonly JsonObject[]): Set<string> {
   return denied;
 }
 
-function normalise(row: JsonObject, view: JsonObject[]): JsonObject | null {
+/** What the replay carries from row to row (round 15): the approval ids steps asked so far, and each approval's standing decision. */
+type ViewContext = { asked: Set<string>; standing: Map<string, ApprovalDecisionEntry> };
+
+function normalise(row: JsonObject, view: JsonObject[], context: ViewContext = { asked: new Set(), standing: new Map() }): JsonObject | null {
   switch (row.type) {
-    case 'assistant':
+    case 'assistant': {
+      // A request repeating an approval id an EARLIER step asked for asks for
+      // nothing (G-408, #92): it is not replayed.
+      const requests = stepRequests(row).filter((request) => !context.asked.has(text(request.approval_id)));
+      for (const request of requests) context.asked.add(text(request.approval_id));
       return assistantRow(
         typeof row.content === 'string' ? row.content : '',
         stepCalls(row).map((call) => ({
@@ -1291,12 +1433,13 @@ function normalise(row: JsonObject, view: JsonObject[]): JsonObject | null {
           reasoningSummary: Array.isArray(call.reasoning_summary) ? call.reasoning_summary : null,
         })),
         isObject(row.additional_content) ? row.additional_content : {},
-        stepRequests(row).map((request) => ({
+        requests.map((request) => ({
           approval_id: text(request.approval_id),
           tool_call_id: text(request.tool_call_id),
           ...(request.arguments_format === ARGUMENTS_AS_SENT ? { arguments_format: ARGUMENTS_AS_SENT } : {}),
         })),
       );
+    }
 
     case 'tool_result':
       // A 0.11.x replaced-step answer is stored after the step that replaced
@@ -1312,7 +1455,7 @@ function normalise(row: JsonObject, view: JsonObject[]): JsonObject | null {
             tool_call_result_id: nullableText(entry.tool_call_result_id),
             artifacts: Array.isArray(entry.artifacts) ? entry.artifacts : [],
           })),
-          list(row.tool_approval_responses).map(decision),
+          list(row.tool_approval_responses).map((answer) => standingOf(decision(answer), context)),
         );
       }
 
@@ -1341,7 +1484,7 @@ function normalise(row: JsonObject, view: JsonObject[]): JsonObject | null {
     }
 
     case 'tool_approval_response':
-      return toolResultRow([], [decision(row)]);
+      return toolResultRow([], [standingOf(decision(row), context)]);
 
     default: {
       // The reader view's trust flag (readerRows) is never sent anywhere.
@@ -1350,6 +1493,12 @@ function normalise(row: JsonObject, view: JsonObject[]): JsonObject | null {
       return rest;
     }
   }
+}
+
+/** The decision that stands for `entry`'s approval (prevails), as the replay shows every entry of it. */
+function standingOf(entry: ApprovalDecisionEntry, context: ViewContext): ApprovalDecisionEntry {
+  const stands = context.standing.get(entry.approval_id);
+  return stands === undefined ? entry : { ...stands };
 }
 
 function decision(value: JsonObject): ApprovalDecisionEntry {
