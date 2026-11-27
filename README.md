@@ -307,6 +307,9 @@ pending call with no decision is refused with "No approval response provided".
 A call that has a result never runs again. Who may approve is your application's
 decision: authorize before calling `recordApproval()`. `recordDecisions(session,
 [{ approvalId, approved, reason }])` records several decisions as one row.
+The first decision recorded for an approval stands. A later decision for the
+same approval, through any of these calls or `streamDecision()`, records
+nothing, and a `decision_recorded` step reports the decision that stands.
 
 A paused step is replaced when a later step with tool calls is recorded after
 it, or when your application records a user or assistant message on the thread

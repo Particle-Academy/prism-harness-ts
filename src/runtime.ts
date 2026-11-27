@@ -420,15 +420,17 @@ export class AgentRuntime {
 
       // DURABLE FIRST, through the one writer every decision path uses, and
       // before any tool or provider call.
-      await writeDecisions(live, decisions);
+      const stands = await writeDecisions(live, decisions);
 
       const tagger = this.#tagger(context, channel, parked?.lastSeq ?? 0);
       const execution = executionContext(context);
       const runId = parked?.id ?? randomUUID();
       tagger.bind(live.key(), runId, execution?.parentRunId ?? null, execution?.rootRunId ?? runId);
 
-      for (const decision of decisions) {
+      for (const decision of stands) {
         // From the APP's run context, never from the model or the request.
+        // The decision that stands for the approval: a second one recorded
+        // nothing (G-401).
         tagger.decision(decision.approvalId, decision.approved, decision.reason ?? null, context?.actor ?? null);
       }
 
@@ -1244,20 +1246,45 @@ export async function recordDecisions(session: Session, decisions: readonly Appr
 }
 
 /** Where decisions are made durable, for every path that takes them. */
-async function writeDecisions(session: Session, decisions: readonly ApprovalDecision[]): Promise<void> {
+/**
+ * Returns, for each decision given and in its order, the decision that
+ * STANDS for its approval (G-401): the first one recorded for it, before this
+ * call or earlier in this list. Only decisions for approvals that had none
+ * are written; a second decision for an approval records nothing, whatever
+ * its verdict, so nothing a person denied can be approved afterwards.
+ */
+async function writeDecisions(session: Session, decisions: readonly ApprovalDecision[]): Promise<ApprovalDecision[]> {
   // A decision for a step that was superseded is refused before anything is
   // written: it could never run anything (G-397).
   const messages = await session.thread().messages();
   for (const decision of decisions) {
     if (approvalSuperseded(messages, decision.approvalId)) throw HarnessError.approvalNotPending(decision.approvalId);
   }
-  const run = await session.run();
+  const standing = new Map<string, ApprovalDecision>();
+  for (const { message } of messages) {
+    for (const row of threadView([message])) {
+      if (row.type !== 'tool_result') continue;
+      for (const response of (row as ToolResultRow).tool_approval_responses) {
+        if (!standing.has(response.approval_id)) standing.set(response.approval_id, { approvalId: response.approval_id, approved: response.approved, reason: response.reason });
+      }
+    }
+  }
+  const fresh: ApprovalDecision[] = [];
+  for (const decision of decisions) {
+    if (standing.has(decision.approvalId)) continue;
+    standing.set(decision.approvalId, decision);
+    fresh.push(decision);
+  }
+  if (fresh.length > 0) {
+    const run = await session.run();
+    await session.thread().record([toolResultRow([], fresh.map((decision) => ({
+      approval_id: decision.approvalId,
+      approved: decision.approved,
+      reason: decision.reason ?? null,
+    })))], run?.id ?? null, HARNESS_RECORDING);
+  }
 
-  await session.thread().record([toolResultRow([], decisions.map((decision) => ({
-    approval_id: decision.approvalId,
-    approved: decision.approved,
-    reason: decision.reason ?? null,
-  })))], run?.id ?? null, HARNESS_RECORDING);
+  return decisions.map((decision) => standing.get(decision.approvalId)!);
 }
 
 /** Runtime guards: a decision arrives from an app's request handling, not from a typed caller. */
