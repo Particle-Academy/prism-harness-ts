@@ -442,10 +442,16 @@ export const REPLACED_STEP_KEY = 'harness_replaced_step';
 
 /**
  * The key of the mark on every result row the harness writes for a step's
- * calls: `{position}`, the thread position of the step it answers (G-407).
- * Such a row answers that step wherever it lands: a tool-call step another
- * writer records while a call runs never takes the call's result. Kept out of
- * the replay view, which rebuilds rows from their known keys.
+ * calls: `{position}`, the 1-based thread position of the step it answers, an
+ * integer (G-407). Stored last, after `tool_approval_responses`:
+ * `{"type":"tool_result","tool_results":[...],"tool_approval_responses":[...],
+ * "harness_answers_step":{"position":2}}`. Such a row answers that step
+ * wherever it lands: a tool-call step another writer records while a call
+ * runs never takes the call's result. Honoured only on rows the harness
+ * recorded, and only for a result whose id and tool name a call of an
+ * earlier tool-call step at that position has; otherwise the result is its
+ * segment's. Kept out of the replay view, which rebuilds rows from their
+ * known keys.
  *
  * @internal
  */
@@ -541,20 +547,24 @@ export function resultOwners(messages: readonly StoredRow[]): Map<number, Set<nu
     // A harness row answers the step it names (G-407); any other row, the step
     // whose segment holds it.
     // Only a mark the harness itself recorded is honoured.
+    // It must name an EARLIER tool-call step (one already read) holding a call
+    // with the result's id and tool name; otherwise the result is its
+    // segment's, which fails closed: that call is answered.
     const named = harness === true ? answeredStep(row) : undefined;
-    const target = named === undefined ? segment : byPosition.get(named) ?? segment;
-    const calls = list(messages[target]!.message.tool_calls);
-    const mine = owned.get(target)!;
-    const prints = seen.get(target)!;
+    const step = named === undefined ? undefined : byPosition.get(named);
     // Each row read on its own: folding rows would merge results sharing an id.
     const entries = replaced ? list(row.tool_results)
       : threadView([row]).filter((view) => view.type === 'tool_result').flatMap((view) => list(view.tool_results));
-    const added: string[] = [];
+    const added = new Map<number, string[]>();
     for (const entry of entries) {
       const id = text(entry.tool_call_id), name = text(entry.tool_name), recorded = args(entry.args);
+      const target = step !== undefined && list(messages[step]!.message.tool_calls).some((call) => text(call.id) === id && text(call.name) === name) ? step : segment;
+      const calls = list(messages[target]!.message.tool_calls);
+      const mine = owned.get(target)!;
+      const prints = seen.get(target)!;
       const print = canonicalJson([id, name, recorded, text(entry.result)]);
       if (prints.has(print)) continue;
-      added.push(print);
+      added.set(target, [...(added.get(target) ?? []), print]);
       const exact = (call: JsonObject): boolean => text(call.id) === id && text(call.name) === name && args(call.arguments) === recorded;
       if (calls.some((call, at) => exact(call) && mine.has(at)) && !calls.some((call, at) => exact(call) && !mine.has(at))) continue;
       let at = calls.findIndex((call, position) => exact(call) && !mine.has(position));
@@ -562,7 +572,7 @@ export function resultOwners(messages: readonly StoredRow[]): Map<number, Set<nu
       if (at === -1) at = calls.findIndex((call, position) => text(call.id) === id && !mine.has(position));
       if (at !== -1) mine.add(at);
     }
-    for (const print of added) prints.add(print);
+    for (const [target, prints] of added) for (const print of prints) seen.get(target)!.add(print);
   }
   return owned;
 }
