@@ -22,6 +22,7 @@ import {
   approvalSuperseded,
   REPLACED_STEP_KEY,
   answeringStep,
+  isToolCallStep,
   REPLACED_STEP_RESULT,
   ARGUMENTS_AS_SENT,
 } from './thread-rows.js';
@@ -463,7 +464,7 @@ export class AgentRuntime {
       const entry = entries[index]!;
       const message = entry.message;
 
-      if (message.type !== 'assistant' || !Array.isArray(message.tool_calls) || message.tool_calls.length === 0) continue;
+      if (!isToolCallStep(message)) continue;
 
       const requests = Array.isArray(message.tool_approval_requests) ? message.tool_approval_requests : [];
 
@@ -950,12 +951,21 @@ export class AgentRuntime {
     const rows = messages.map((entry) => entry.message);
     const view = threadView(rows);
     const replaced = replacedStepCalls(messages, (name) => mode.needsApproval(name));
-    let index = view.length - 1;
-
-    while (index >= 0 && !(view[index]!.type === 'assistant' && (view[index] as AssistantRow).tool_calls.length > 0)) {
-      index -= 1;
+    // ONE step selection (G-408): the newest stored row that is a tool-call
+    // step by the one rule, and the same step in the replay view (the view
+    // keeps every assistant row, in order). The calls answered here, the
+    // results counted for them, the replaced check and the position the result
+    // row names all come from it.
+    let stored = rows.length - 1;
+    while (stored >= 0 && !isToolCallStep(rows[stored])) stored -= 1;
+    if (stored === -1) return null;
+    const ordinal = rows.slice(0, stored).filter((row) => isToolCallStep(row)).length;
+    let index = -1;
+    for (let at = 0, seen = 0; at < view.length; at += 1) {
+      if (!isToolCallStep(view[at])) continue;
+      if (seen === ordinal) { index = at; break; }
+      seen += 1;
     }
-
     if (index === -1) return null;
 
     const assistant = view[index] as AssistantRow;
@@ -967,7 +977,14 @@ export class AgentRuntime {
     // Each result as the replay view holds it, never folded by call id alone (G-402).
     const results = answered.flatMap((row) => row.tool_results);
     const decisions = new Map(answered.flatMap((row) => row.tool_approval_responses).map((entry) => [entry.approval_id, entry]));
-    const approvalIds = new Map(assistant.tool_approval_requests.map((request) => [request.tool_call_id, request.approval_id]));
+    // An approval belongs to the step that first asked for it: a later row
+    // repeating its id (a copy a host recorded) asks for nothing, so one
+    // decision never decides a call of another step (G-408).
+    const askedBefore = new Set(rows.slice(0, stored).filter((row) => row.type === 'assistant')
+      .flatMap((row) => (Array.isArray(row.tool_approval_requests) ? row.tool_approval_requests as JsonObject[] : []))
+      .map((request) => request.approval_id));
+    const approvalIds = new Map(assistant.tool_approval_requests.filter((request) => !askedBefore.has(request.approval_id))
+      .map((request) => [request.tool_call_id, request.approval_id]));
 
     // Read before any decision is used: a map keyed by a repeated call id
     // would hand one approval to every call carrying it (G-392).
@@ -978,8 +995,6 @@ export class AgentRuntime {
     // id a result by id cannot say whose it is, so its gated calls stay open
     // until there are as many results for the id as calls carrying it.
     // Counted on the rows as stored: the replay view folds results by id.
-    let stored = rows.length - 1;
-    while (stored >= 0 && !(rows[stored]!.type === 'assistant' && Array.isArray(rows[stored]!.tool_calls) && (rows[stored]!.tool_calls as JsonValue[]).length > 0)) stored -= 1;
     // Which of its calls already has an outcome: each result belongs to one
     // call, matched by id and the arguments it records, in the segment it sits
     // in or an earlier step's, never by id alone (G-392, G-397).
