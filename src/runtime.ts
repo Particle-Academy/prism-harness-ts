@@ -27,7 +27,6 @@ import {
   isToolCallStep,
   startedRow,
   startedCalls,
-  INTERRUPTED_RESULT,
   NOT_OPEN_RESULT,
   turnStepsSoFar,
   REPLACED_STEP_RESULT,
@@ -683,7 +682,7 @@ export class AgentRuntime {
       const response = await this.#client({
         systemPrompt: mode.systemPrompt,
         // Every result directly after its own step, a replaced step's too (G-412).
-        messages: requestView(await thread.messages()),
+        messages: requestView(await thread.messages(), (name) => mode.needsApproval(name)),
         tools: offered,
         provider,
         model,
@@ -869,18 +868,7 @@ export class AgentRuntime {
         const decision = approvalId === undefined ? undefined : work.decisions.get(approvalId);
         const at = work.indices[offset]!;
 
-        if (work.ended.has(at)) {
-          // No request names it and it needs nobody, with no result (G-412):
-          // it may have run; it is never run here.
-          const entry = toolResultEntry(input, INTERRUPTED_RESULT);
-          steps?.toolResult(call.id, entry.result, { ok: false, code: 'tool_failed', refused: false });
-          resolved.push(entry);
-        } else if (work.started.has(at)) {
-          // Started before, with no result (G-410): it may have run; never again.
-          const entry = toolResultEntry(input, INTERRUPTED_RESULT);
-          steps?.toolResult(call.id, entry.result, { ok: false, code: 'approval_denied', refused: true });
-          resolved.push(entry);
-        } else if (work.repeated) {
+        if (work.repeated) {
           // The step repeats a call id, so no decision can be told apart from
           // another (G-392): none of its gated calls runs, whatever was decided.
           const entry = toolResultEntry(input, REPEATED_CALL_ID_RESULT);
@@ -934,8 +922,8 @@ export class AgentRuntime {
 
       // A replaced step's calls are answered with their own rows, kept out of
       // this step's results (G-397).
-      const replaced = work.replaced.map(({ position, calls, started }) => ({
-        ...toolResultRow(calls.map((call, index) => toolResultEntry(
+      const replaced = work.replaced.map(({ position, calls }) => ({
+        ...toolResultRow(calls.map((call) => toolResultEntry(
           {
             id: typeof call.id === 'string' ? call.id : '',
             name: typeof call.name === 'string' ? call.name : '',
@@ -943,7 +931,7 @@ export class AgentRuntime {
             arguments: usableArguments(call.arguments) ?? {},
             resultId: typeof call.result_id === 'string' ? call.result_id : null,
           },
-          started[index] ? INTERRUPTED_RESULT : REPLACED_STEP_RESULT,
+          REPLACED_STEP_RESULT,
         ))),
         [REPLACED_STEP_KEY]: { position },
       }) as JsonObject);
@@ -951,9 +939,8 @@ export class AgentRuntime {
         ...replaced,
         ...(work.calls.length === 0 ? [] : [answeringStep(toolResultRow([...work.results, ...resolved], [...work.decisions.values()]), work.position)]),
       ], runId, HARNESS_RECORDING);
-      // Only replaced steps, or only calls that needed nobody, were answered:
-      // this turn's tools are not narrowed.
-      return work.calls.every((_call, offset) => work.ended.has(work.indices[offset]!)) ? offered : bounded;
+      // Only replaced steps were answered: this turn's tools are not narrowed.
+      return work.calls.length === 0 ? offered : bounded;
     };
 
     if (alreadyLocked) return await resolve(session);
@@ -978,14 +965,10 @@ export class AgentRuntime {
     /** The step repeats a tool call id: none of its gated calls may run (G-392). */
     repeated: boolean;
     /** Earlier parked steps a later tool-call step replaced, with their unanswered gated calls (G-397). */
-    replaced: { position: number; calls: JsonObject[]; started: boolean[] }[];
+    replaced: { position: number; calls: JsonObject[] }[];
     /** The step's stored index, and the step position of each call in `calls`. */
     stepIndex: number;
     indices: number[];
-    /** Step positions of the calls a started row names with no result (G-410). */
-    started: Set<number>;
-    /** Step positions of the open calls no request names and that need nobody (G-412). */
-    ended: Set<number>;
     /** The thread position of the step resolved here (its result row names it). */
     position: number | undefined;
     scope: ReturnType<typeof approvalToolScope>;
@@ -1057,25 +1040,22 @@ export class AgentRuntime {
     const done = stored >= 0 ? resultOwners(messages).get(stored) ?? new Set<number>() : new Set<number>();
     // A superseded step is never resolved here: it is answered as replaced
     // (G-397), and nothing of it runs.
-    // A call a started row names with no result is answered as interrupted
-    // (G-410): it may have run, and it is never run again.
+    // A call a started row names with no result may have run, and is never
+    // run again (G-410). It is not answered here: nothing is stored for it,
+    // so a result that lands later (the call still running in another
+    // worker) is its one outcome. The request the model is sent answers it
+    // as interrupted until then (G-414, requestView). A call that needs
+    // nobody and that no request names is not this method's either (G-412).
     const started = startedCalls(messages, stored);
-    // A call no approval request names and that needs nobody, with no result
-    // (its result was never stored, or a host recorded the call): no
-    // decision will ever answer it, so it is answered now, as interrupted,
-    // and never run (G-412). Otherwise it would stay unanswered in every
-    // later request, which a provider refuses.
-    const unrequested = (call: AssistantRow['tool_calls'][number]): boolean => !mode.needsApproval(call.name) && (repeated || !approvalIds.has(call.id));
     const open = stored >= 0 && supersededAt(messages, stored) !== -1
       ? []
-      : assistant.tool_calls.map((call, at) => ({ call, at })).filter(({ call, at }) => !done.has(at) && (started.has(at) || unrequested(call) || (repeated
+      : assistant.tool_calls.map((call, at) => ({ call, at })).filter(({ call, at }) => !done.has(at) && !started.has(at) && (repeated
         ? mode.needsApproval(call.name)
-        : approvalIds.has(call.id) || mode.needsApproval(call.name))));
+        : approvalIds.has(call.id) || mode.needsApproval(call.name)));
     const calls = open.map(({ call }) => call);
     const indices = open.map(({ at }) => at);
-    const ended = new Set(open.filter(({ call, at }) => !started.has(at) && unrequested(call)).map(({ at }) => at));
 
-    return calls.length === 0 && replaced.length === 0 ? null : { calls, results, decisions, approvalIds, repeated, replaced, stepIndex: stored, indices, started, ended, position: messages[stored]?.position, scope: approvalToolScope(rows), unusable: unusableStoredCalls(rows), ambiguous: ambiguousCalls(assistant) };
+    return calls.length === 0 && replaced.length === 0 ? null : { calls, results, decisions, approvalIds, repeated, replaced, stepIndex: stored, indices, position: messages[stored]?.position, scope: approvalToolScope(rows), unusable: unusableStoredCalls(rows), ambiguous: ambiguousCalls(assistant) };
   }
 
   /**

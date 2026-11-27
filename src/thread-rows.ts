@@ -624,36 +624,57 @@ export function replayRows(messages: readonly StoredRow[]): JsonObject[] {
 
 /**
  * What the model is sent (G-412): the replay view of `replayRows()`, with
- * every call that no result directly after its step answers given ONE result
- * reading `REPLACED_STEP_RESULT`. By the time a request is made every call the
- * run can answer has its stored outcome; one still without a result is a call
- * no resolution answers (an earlier step's, or one in a step a later row
- * superseded), and a provider refuses a request with a tool call that is not
- * answered in the very next message. Nothing is stored. Results pair with
- * calls by id and tool name, in order.
+ * every call that no result directly after its step answers given ONE result.
+ * By the time a request is made every call the run can answer has its stored
+ * outcome; one still without a result is a call no resolution answers, and a
+ * provider refuses a request with a tool call that is not answered in the
+ * very next message. Nothing is stored (G-414): a result that lands later is
+ * the call's one outcome.
+ *
+ * - A call that may have run, because a started row names it or because it
+ *   needs nobody (`gated` false), reads `INTERRUPTED_RESULT`, and its
+ *   approval reads as the decision it started under (G-411).
+ * - Any other call, a gated call that never started, reads
+ *   `REPLACED_STEP_RESULT`.
+ *
+ * Results pair with calls by id and tool name, in order.
  *
  * @internal
  */
-export function requestView(messages: readonly StoredRow[]): JsonObject[] {
+export function requestView(messages: readonly StoredRow[], gated: (name: string) => boolean): JsonObject[] {
   const view = threadView(replayRows(messages));
+  // The stored index of each tool-call step, in order: the view keeps every
+  // tool-call step, in the same order (G-408).
+  const storedSteps = messages.flatMap(({ message }, index) => (isToolCallStep(message) ? [index] : []));
+  let ordinal = -1;
   const out: JsonObject[] = [];
   view.forEach((row, at) => {
     // A step's result row is written out with the step, below.
     if (at > 0 && isToolCallStep(view[at - 1]) && row.type === 'tool_result') return;
     out.push(row);
     if (!isToolCallStep(row)) return;
+    ordinal += 1;
+    const storedStep = storedSteps[ordinal];
+    const started = storedStep === undefined ? new Set<number>() : startedCalls(messages, storedStep);
     const next = view[at + 1]?.type === 'tool_result' ? view[at + 1] as ToolResultRow : undefined;
     const held = new Map<string, number>();
     for (const entry of next?.tool_results ?? []) held.set(ownerKey(entry.tool_call_id, entry.tool_name), (held.get(ownerKey(entry.tool_call_id, entry.tool_name)) ?? 0) + 1);
     const missing: ToolResultEntry[] = [];
-    for (const call of (row as AssistantRow).tool_calls) {
+    let interrupted = false;
+    (row as AssistantRow).tool_calls.forEach((call, place) => {
       const key = ownerKey(call.id, call.name);
       const count = held.get(key) ?? 0;
-      if (count > 0) { held.set(key, count - 1); continue; }
-      missing.push(toolResultEntry({ id: call.id, name: call.name, arguments: call.arguments, resultId: call.result_id }, REPLACED_STEP_RESULT));
-    }
-    if (next !== undefined) out.push(missing.length === 0 ? next : toolResultRow([...next.tool_results, ...missing], next.tool_approval_responses));
-    else if (missing.length > 0) out.push(toolResultRow(missing));
+      if (count > 0) { held.set(key, count - 1); return; }
+      const mayHaveRun = started.has(place) || !gated(call.name);
+      interrupted ||= started.has(place);
+      missing.push(toolResultEntry({ id: call.id, name: call.name, arguments: call.arguments, resultId: call.result_id }, mayHaveRun ? INTERRUPTED_RESULT : REPLACED_STEP_RESULT));
+    });
+    // A started call's approval reads as the decision it started under, not
+    // one written after it started (G-411).
+    const standing = interrupted && storedStep !== undefined ? startedDecisions(messages, storedStep) : new Map<string, ApprovalDecisionEntry>();
+    const decisions = (next?.tool_approval_responses ?? []).map((entry) => standing.get(entry.approval_id) ?? entry);
+    if (next !== undefined) out.push(missing.length === 0 ? next : toolResultRow([...next.tool_results, ...missing], decisions));
+    else if (missing.length > 0) out.push(toolResultRow(missing, [...standing.values()]));
   });
   return out;
 }
@@ -798,22 +819,23 @@ export function resultOwners(messages: readonly StoredRow[]): Map<number, Set<nu
 export function replacedStepCalls(
   messages: readonly StoredRow[],
   gated: (name: string) => boolean,
-): { position: number; calls: JsonObject[]; started: boolean[] }[] {
+): { position: number; calls: JsonObject[] }[] {
   const rows = messages.map(({ message }) => message);
   const owners = resultOwners(messages);
-  const replaced: { position: number; calls: JsonObject[]; started: boolean[] }[] = [];
+  const replaced: { position: number; calls: JsonObject[] }[] = [];
   for (const [index, step] of rows.entries()) {
     if (!isToolCallStep(step)) continue;
     if (supersededAt(messages, index) === -1) continue;
     const done = owners.get(index)!;
     const calls = list(step.tool_calls);
     const requested = new Set(list(step.tool_approval_requests).map((request) => text(request.tool_call_id)));
-    // A started call with no result is answered as interrupted (G-410), never
-    // denied as replaced.
+    // A started call with no result may have run: it is never denied as
+    // replaced, and nothing is stored for it (G-414). The request the model
+    // is sent answers it as interrupted until a result lands.
     const started = startedCalls(messages, index);
-    const open = calls.map((call, at) => ({ call, at })).filter(({ call, at }) => !done.has(at) && (started.has(at) || gated(text(call.name))
+    const open = calls.map((call, at) => ({ call, at })).filter(({ call, at }) => !done.has(at) && !started.has(at) && (gated(text(call.name))
       || (requested.has(text(call.id)) && !calls.some((other) => other.id === call.id && gated(text(other.name))))));
-    if (open.length > 0) replaced.push({ position: messages[index]!.position, calls: open.map(({ call }) => call), started: open.map(({ at }) => started.has(at)) });
+    if (open.length > 0) replaced.push({ position: messages[index]!.position, calls: open.map(({ call }) => call) });
   }
 
   return replaced;
