@@ -16,6 +16,10 @@ import {
   ambiguousCalls,
   repeatsCallIds,
   REPEATED_CALL_ID_RESULT,
+  replacedStepCalls,
+  isReplacedStepRow,
+  REPLACED_STEP_KEY,
+  REPLACED_STEP_RESULT,
   ARGUMENTS_AS_SENT,
 } from './thread-rows.js';
 import { usableArguments } from './tool-arguments.js';
@@ -869,7 +873,9 @@ export class AgentRuntime {
           steps?.toolResult(call.id, entry.result, { ok: false, code: 'approval_denied', refused: true });
           resolved.push(entry);
         } else if (decision?.approved === true) {
-          called.push(call.name);
+          // Reported as called only when it is offered to run: a call refused
+          // as not available did not run (G-399).
+          if (bounded.some((tool) => tool.name === call.name)) called.push(call.name);
           const invoked = await this.#runApproved(bounded, input);
           steps?.toolResult(call.id, invoked.entry.result, invoked.outcome);
           resolved.push(invoked.entry);
@@ -881,8 +887,26 @@ export class AgentRuntime {
         }
       }
 
-      await live.thread().record([toolResultRow([...work.results.values(), ...resolved], [...work.decisions.values()])], runId);
-      return bounded;
+      // A replaced step's calls are answered with their own rows, kept out of
+      // this step's results (G-397).
+      const replaced = work.replaced.map(({ position, calls }) => ({
+        ...toolResultRow(calls.map((call) => toolResultEntry(
+          {
+            id: typeof call.id === 'string' ? call.id : '',
+            name: typeof call.name === 'string' ? call.name : '',
+            arguments: typeof call.arguments === 'object' && call.arguments !== null && !Array.isArray(call.arguments) ? call.arguments : {},
+            resultId: typeof call.result_id === 'string' ? call.result_id : null,
+          },
+          REPLACED_STEP_RESULT,
+        ))),
+        [REPLACED_STEP_KEY]: { position },
+      }) as JsonObject);
+      await live.thread().record([
+        ...replaced,
+        ...(work.calls.length === 0 ? [] : [toolResultRow([...work.results.values(), ...resolved], [...work.decisions.values()])]),
+      ], runId);
+      // Only replaced steps were answered: this turn's tools are not narrowed.
+      return work.calls.length === 0 ? offered : bounded;
     };
 
     if (alreadyLocked) return await resolve(session);
@@ -905,12 +929,16 @@ export class AgentRuntime {
     approvalIds: Map<string, string>;
     /** The step repeats a tool call id: none of its gated calls may run (G-392). */
     repeated: boolean;
+    /** Earlier parked steps a later tool-call step replaced, with their unanswered gated calls (G-397). */
+    replaced: { position: number; calls: JsonObject[] }[];
     scope: ReturnType<typeof approvalToolScope>;
     unusable: Set<string>;
     ambiguous: Set<string>;
   } | null> {
-    const rows = (await session.thread().messages()).map((entry) => entry.message);
+    const messages = await session.thread().messages();
+    const rows = messages.map((entry) => entry.message);
     const view = threadView(rows);
+    const replaced = replacedStepCalls(messages, (name) => mode.needsApproval(name));
     let index = view.length - 1;
 
     while (index >= 0 && !(view[index]!.type === 'assistant' && (view[index] as AssistantRow).tool_calls.length > 0)) {
@@ -920,9 +948,13 @@ export class AgentRuntime {
     if (index === -1) return null;
 
     const assistant = view[index] as AssistantRow;
-    const answered = view.slice(index + 1).find((row) => row.type === 'tool_result') as ToolResultRow | undefined;
-    const results = new Map((answered?.tool_results ?? []).map((entry) => [entry.tool_call_id, entry]));
-    const decisions = new Map((answered?.tool_approval_responses ?? []).map((entry) => [entry.approval_id, entry]));
+    // EVERY result and decision recorded after the step, not only the first
+    // run of result rows: a row of another kind between them (a note, a
+    // system row) must not hide a result and let its call run again
+    // (G-397, G-399). A later entry for an id replaces an earlier one.
+    const answered = view.slice(index + 1).filter((row) => row.type === 'tool_result') as ToolResultRow[];
+    const results = new Map(answered.flatMap((row) => row.tool_results).map((entry) => [entry.tool_call_id, entry]));
+    const decisions = new Map(answered.flatMap((row) => row.tool_approval_responses).map((entry) => [entry.approval_id, entry]));
     const approvalIds = new Map(assistant.tool_approval_requests.map((request) => [request.tool_call_id, request.approval_id]));
 
     // Read before any decision is used: a map keyed by a repeated call id
@@ -936,7 +968,7 @@ export class AgentRuntime {
     // Counted on the rows as stored: the replay view folds results by id.
     let stored = rows.length - 1;
     while (stored >= 0 && !(rows[stored]!.type === 'assistant' && Array.isArray(rows[stored]!.tool_calls) && (rows[stored]!.tool_calls as JsonValue[]).length > 0)) stored -= 1;
-    const storedResults = rows.slice(stored + 1).filter((row) => row.type === 'tool_result')
+    const storedResults = rows.slice(stored + 1).filter((row) => row.type === 'tool_result' && !isReplacedStepRow(row))
       .flatMap((row) => (Array.isArray(row.tool_results) ? row.tool_results : []) as JsonObject[]);
     const settled = (id: string): boolean => storedResults.filter((entry) => entry.tool_call_id === id).length
       >= assistant.tool_calls.filter((call) => call.id === id).length;
@@ -946,7 +978,7 @@ export class AgentRuntime {
         (call) => !results.has(call.id) && (approvalIds.has(call.id) || mode.needsApproval(call.name)),
       );
 
-    return calls.length === 0 ? null : { calls, results, decisions, approvalIds, repeated, scope: approvalToolScope(rows), unusable: unusableStoredCalls(rows), ambiguous: ambiguousCalls(assistant) };
+    return calls.length === 0 && replaced.length === 0 ? null : { calls, results, decisions, approvalIds, repeated, replaced, scope: approvalToolScope(rows), unusable: unusableStoredCalls(rows), ambiguous: ambiguousCalls(assistant) };
   }
 
   /**
