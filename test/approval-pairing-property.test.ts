@@ -212,6 +212,30 @@ interface Case {
    * MIXED array, whose one object (an ungated call) makes it a tool-call step.
    */
   junk: { kind: 'string' | 'number' | 'null' | 'strings' | 'scalar' | 'mixed'; requests: boolean } | null;
+  /**
+   * G-408, order B: right after the park, BEFORE the person decides, the host
+   * records a copy of the parked step that keeps its approval requests but
+   * holds a NEW call with the same id and other arguments, alone or with
+   * non-objects, or beside a copy of the old call. Then the person decides
+   * the request they were shown. Not combined with a later step, an
+   * inserted row or a junk row: each is its own shape.
+   */
+  copy: { kind: CopyKind } | null;
+}
+
+type CopyKind = 'newOnly' | 'stringThenNew' | 'nullThenNew' | 'newThenJunk' | 'oldAndNewSameId';
+const COPY_KINDS: readonly CopyKind[] = ['newOnly', 'stringThenNew', 'nullThenNew', 'newThenJunk', 'oldAndNewSameId'];
+
+/** The copy's tool_calls: the new call (same id as `target`, arguments n 950), shaped by `kind`. */
+function copyCalls(kind: CopyKind, target: Call): JsonValue[] {
+  const call = (n: number): JsonObject => ({ id: target.id, name: 'echo', arguments: { n }, result_id: null, reasoning_id: null, reasoning_summary: null });
+  switch (kind) {
+    case 'newOnly': return [call(950)];
+    case 'stringThenNew': return ['x', call(950)];
+    case 'nullThenNew': return [null, call(950)];
+    case 'newThenJunk': return [call(950), 'x', null];
+    case 'oldAndNewSameId': return [call(target.token), call(950)];
+  }
 }
 
 /** An assistant row's tool_calls in the junk shape: never an object, except one ungated call in a mixed array. */
@@ -364,6 +388,7 @@ function generate(seed: number): Case {
     ...storage(seed, calls.length, later?.calls.length ?? 0),
     lossy: [],
     junk: null,
+    copy: null,
   };
   return sharing(c);
 }
@@ -394,6 +419,8 @@ function sharing(c: Case): Case {
   };
   const lossy = c.prior.filter((index) => c.calls[index]!.tool === 'echo' && rng.chance(0.5));
   const junk = rng.chance(0.15) ? { kind: rng.pick(['string', 'number', 'null', 'strings', 'scalar', 'mixed'] as const), requests: rng.chance(0.5) } : null;
+  const copyDraw = rng.next(), copyKind = rng.pick(COPY_KINDS);
+  const copy = copyDraw < 0.25 && c.later === null && c.insert === null && junk === null ? { kind: copyKind } : null;
   // Two IDENTICAL gated calls in one step (same id, tool and arguments): the
   // clone gets its own request, as the runtime would issue one.
   const source = gated[0];
@@ -401,9 +428,9 @@ function sharing(c: Case): Case {
     const index = calls.length;
     calls.push({ ...calls[c.calls.indexOf(source)]!, token: source.token });
     const requests = [...c.requests, { call: index, verdict: rng.pick<Verdict>(['approve', 'deny', 'none']), reason: null }];
-    return { ...c, calls, later, lossy, junk, requests, order: [...c.order, requests.length - 1], stringArgs: { ...c.stringArgs, parked: [...c.stringArgs.parked, false] } };
+    return { ...c, calls, later, lossy, junk, copy, requests, order: [...c.order, requests.length - 1], stringArgs: { ...c.stringArgs, parked: [...c.stringArgs.parked, false] } };
   }
-  return { ...c, calls, later, lossy, junk };
+  return { ...c, calls, later, lossy, junk, copy };
 }
 
 /** G-397: argument storage forms and an earlier step reusing ids, from a generator of their own. */
@@ -446,6 +473,17 @@ function expected(c: Case): Expected {
   // assistant row outside the run (or, mixed, a tool-call step): it
   // supersedes whichever step was still being decided.
   if (c.junk !== null) steps.at(-1)!.superseded = true;
+  // G-408, order B: the copy is a later tool-call step, so the parked step is
+  // replaced. Its requests repeat approval ids the parked step already asked
+  // for, so they ask for nothing: its gated calls have no decision.
+  let copySteps: { key: string; calls: Call[]; requests: Request[]; prior: number[]; superseded: boolean } | null = null;
+  if (c.copy !== null) {
+    steps[0]!.superseded = true;
+    const target = c.calls.find((call) => call.tool === 'echo')!;
+    const calls = copyCalls(c.copy.kind, target).filter((entry): entry is JsonObject => typeof entry === 'object' && entry !== null && !Array.isArray(entry))
+      .map((entry, index) => ({ id: String(entry.id), tool: 'echo' as const, token: Number((entry.arguments as JsonObject).n) + index * 0 }));
+    copySteps = { key: 'k', calls, requests: [], prior: [], superseded: false };
+  }
   // The call a forged result answers: in its own segment's step.
   let forged: { step: number; call: number; text: string } | null = null;
   if (insert?.kind === 'tool_result') {
@@ -481,6 +519,17 @@ function expected(c: Case): Expected {
       }
     });
   });
+  if (copySteps !== null) {
+    // The copy keeps the parked step's requests: they still count when the
+    // step is checked for repeated ids, but none of them asks for anything.
+    const dup = (ids: (string | number)[]): boolean => new Set(ids).size !== ids.length;
+    const repeated = dup(copySteps.calls.map((call) => call.id)) || dup(c.requests.map((q) => c.calls[q.call]!.id))
+      || dup(c.requests.map((q, index) => q.approval ?? index));
+    out.repeated = repeated;
+    out.runs = new Set();
+    out.open = copySteps.calls.map((_call, index) => `k${index}`);
+    copySteps.calls.forEach((_call, index) => out.outcome.set(`k${index}`, repeated ? REPEATED : NO_RESPONSE));
+  }
   return out;
 }
 
@@ -819,6 +868,17 @@ async function runCase(c: Case): Promise<void> {
   };
   let first: Turn | null = null;
   let resumedYet = false;
+  if (c.copy !== null) {
+    // Order B: the copy lands before the person decides.
+    const rowsNow = await rows(r.session);
+    const parkedRow = [...rowsNow].reverse().find((row) => isStepRow(row))!;
+    const target = c.calls.find((call) => call.tool === 'echo')!;
+    const tool_calls = copyCalls(c.copy.kind, target);
+    await r.session.thread().record([{ ...parkedRow, tool_calls }]);
+    recorded.push({ calls: tool_calls.filter((entry): entry is JsonObject => typeof entry === 'object' && entry !== null && !Array.isArray(entry))
+      .map((entry, index) => ({ key: `k${index}`, id: String(entry.id), name: 'echo', args: entry.arguments as JsonObject })) });
+    oldSuperseded = true;
+  }
   const plan = actions(c);
   for (const [at, action] of plan.entries()) {
     if (action === 'insert') {
@@ -1034,6 +1094,7 @@ function smaller(c: Case): Case[] {
   if (c.insert !== null) out.push({ ...c, insert: null });
   if (c.history !== null) out.push({ ...c, history: null });
   if (c.junk !== null) out.push({ ...c, junk: null });
+  if (c.copy !== null) out.push({ ...c, copy: null });
   if (c.failOnce) out.push({ ...c, failOnce: false });
   if (c.spent) out.push({ ...c, spent: false });
   if (c.later !== null) out.push({ ...c, later: null });
@@ -1165,6 +1226,12 @@ describe('G-392 property: approval pairing invariants over generated steps', () 
       }
     }
     expect(has((c) => c.junk !== null && c.junk.requests && c.spent && c.requests.some((q) => q.verdict === 'approve')), 'junk with requests on a spent run after an approve').toBe(true);
+    // G-408, order B: each copy shape, approved after the copy landed, on a spent run and with a model failure after the resolution.
+    for (const kind of COPY_KINDS) {
+      expect(has((c) => c.copy?.kind === kind && c.requests.some((q) => q.verdict === 'approve' && c.calls[q.call]!.tool === 'echo')), `copy ${kind} approved`).toBe(true);
+    }
+    expect(has((c) => c.copy !== null && c.spent && c.requests.some((q) => q.verdict === 'approve')), 'copy, spent').toBe(true);
+    expect(has((c) => c.copy !== null && c.failOnce && c.requests.some((q) => q.verdict === 'approve')), 'copy, model fails after the resolution').toBe(true);
     // Two identical gated calls (same id, tool and arguments) in one step, with an approval, and on a spent run.
     expect(has((c) => c.calls.some((call, i) => call.tool === 'echo' && c.calls.some((other, j) => j > i && other.tool === 'echo' && other.id === call.id && other.token === call.token))
       && c.requests.some((q) => q.verdict === 'approve')), 'identical gated calls').toBe(true);
