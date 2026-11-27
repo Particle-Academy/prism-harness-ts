@@ -38,6 +38,9 @@ async function heldReader(path: string, sharing: string): Promise<() => Promise<
   return async () => { if (!closed) { closed = true; child.stdin.end(); } await exited; };
 }
 
+/** FileSessionStore's retry window for a replace refused by a reader (src/stores/file-session-store.ts). */
+const RETRY_WINDOW_MS = 750;
+
 for (const sharing of ['ordinary', 'share-delete']) {
   it(`publishes complete state after a native ${sharing} reader closes`, async () => {
     const directory = await mkdtemp(join(tmpdir(), 'prism-state-write-')), store = new FileSessionStore(directory);
@@ -77,8 +80,11 @@ for (const sharing of ['ordinary', 'share-delete']) {
     try { await store.put('k', { revision: 1 }); } catch (error) { failure = error; }
     try {
       if (process.platform === 'win32') {
-        expect(performance.now() - started).toBeGreaterThanOrEqual(700);
-        expect(performance.now() - started).toBeLessThan(2000);
+        // The store retries a refused replace for its retry window, then gives
+        // up: at least the window, and bounded by a multiple of it rather than
+        // a fixed wall-clock figure that a loaded CI runner can miss.
+        expect(performance.now() - started).toBeGreaterThanOrEqual(RETRY_WINDOW_MS - 50);
+        expect(performance.now() - started).toBeLessThan(RETRY_WINDOW_MS * 4);
         expect(errors.length).toBeGreaterThan(1);
         expect(failure).toBe(errors[0]);
         expect(failure).toMatchObject({ code: expect.stringMatching(/^(EPERM|EACCES)$/) });
@@ -117,8 +123,8 @@ it('keeps an otherwise idle child alive until the awaited write settles', async 
     const result = JSON.parse(stdout);
     if (process.platform === 'win32') {
       expect(result.code).toMatch(/^(EPERM|EACCES)$/);
-      expect(result.elapsedMs).toBeGreaterThanOrEqual(700);
-      expect(result.elapsedMs).toBeLessThan(2000);
+      expect(result.elapsedMs).toBeGreaterThanOrEqual(RETRY_WINDOW_MS - 50);
+      expect(result.elapsedMs).toBeLessThan(RETRY_WINDOW_MS * 4);
       expect(await readFile(target)).toEqual(originalBytes);
     } else expect(result.code).toBeNull();
     expect((await readdir(directory)).filter(name => name.endsWith('.tmp'))).toEqual([]);
