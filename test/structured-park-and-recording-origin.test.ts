@@ -55,15 +55,22 @@ describe('a structured turn that parks for approval', () => {
     structured: { title: 12345, role: 'admin' },
   };
 
-  it('sendStructured returns no document, only the pending approval', async () => {
-    const s = session();
-    const agent = new AgentRuntime({ modes, tools: new ToolRegistry().register({ name: 'echo', handle: () => 'ok' }), client: async () => step });
-    const parked = await agent.sendStructured(s, 'go', SCHEMA);
+  // stop_reason tool_use maps to tool_calls; end_turn maps to stop, and the
+  // tool_use block is still a call (prism-ts keeps tool_use blocks whatever
+  // the stop reason). Both shapes keep the gated call and return no document.
+  for (const finishReason of ['tool_calls', 'stop'] as const) {
+    it(`sendStructured (finish ${finishReason}) keeps the gated call, parks on it, and returns no document`, async () => {
+      const s = session();
+      const ran: number[] = [];
+      const agent = new AgentRuntime({ modes, tools: new ToolRegistry().register({ name: 'echo', handle: (args: JsonObject) => { ran.push(Number(args.n)); return 'ok'; } }), client: async () => ({ ...step, finishReason }) });
+      const parked = await agent.sendStructured(s, 'go', SCHEMA);
 
-    expect(parked.finishReason).toBe('awaiting_approval');
-    expect(parked.pendingApprovals).toHaveLength(1);
-    expect((parked as { structured?: unknown }).structured).toBeUndefined();
-  });
+      expect(parked.finishReason).toBe('awaiting_approval');
+      expect(parked.pendingApprovals.map((p) => [p.toolCallId, p.tool])).toEqual([['c1', 'echo']]);
+      expect((parked as { structured?: unknown }).structured).toBeUndefined();
+      expect(ran).toEqual([]);
+    });
+  }
 
   it('and a structured resume after it is checked against the schema before anything is returned', async () => {
     const s = session();
