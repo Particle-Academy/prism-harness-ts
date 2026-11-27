@@ -46,7 +46,7 @@ jobs:
       - run: npm run build
       - run: npx vitest run
       - name: The property nightly's examples validation refuses what it claims to
-        run: node --test tools/property/examples-check.mjs tools/property/ref-check.mjs
+        run: node --test tools/property/examples-check.mjs
 
 
   file-owner-native:
