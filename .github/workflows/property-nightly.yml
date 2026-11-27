@@ -36,10 +36,12 @@ jobs:
         with:
           ref: ${{ matrix.ref }}
           persist-credentials: false
+      # No dependency cache: this job checks out another ref (a release line)
+      # in the default branch's context, so a cache it wrote could be restored
+      # by a default-branch run (CodeQL actions/cache-poisoning).
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
       - run: npm ci
       - name: Property tests
         shell: bash
