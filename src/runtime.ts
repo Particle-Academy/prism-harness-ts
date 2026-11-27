@@ -896,7 +896,8 @@ export class AgentRuntime {
           {
             id: typeof call.id === 'string' ? call.id : '',
             name: typeof call.name === 'string' ? call.name : '',
-            arguments: typeof call.arguments === 'object' && call.arguments !== null && !Array.isArray(call.arguments) ? call.arguments : {},
+            // Parsed, as every result records its call's arguments.
+            arguments: usableArguments(call.arguments) ?? {},
             resultId: typeof call.result_id === 'string' ? call.result_id : null,
           },
           REPLACED_STEP_RESULT,
