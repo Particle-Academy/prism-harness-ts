@@ -595,7 +595,9 @@ export function startedDecisions(messages: readonly StoredRow[], index: number):
 }
 
 /**
- * The stored rows in the order the model is shown them (G-412): the answer the
+ * The stored rows in the order the model is shown them (G-412), each host
+ * assistant row with no tool calls without its provider-native tool items
+ * (G-415, `withoutHostToolItems`): the answer the
  * harness recorded for a replaced step (G-397) is moved to directly after the
  * step it names, without its mark, so that step's calls are answered where
  * they were made. Only a mark the harness recorded, naming an EARLIER
@@ -619,7 +621,39 @@ export function replayRows(messages: readonly StoredRow[]): JsonObject[] {
     after.set(step, [...(after.get(step) ?? []), plain]);
     moved.add(index);
   });
-  return messages.flatMap(({ message }, index) => (moved.has(index) ? [] : [message, ...(after.get(index) ?? [])]));
+  return messages.flatMap(({ message, harness }, index) => (moved.has(index) ? [] : [withoutHostToolItems(message, harness), ...(after.get(index) ?? [])]));
+}
+
+/** Provider-native tool items, by the key a prism client replays them from (G-415). */
+const TOOL_ITEMS: Readonly<Record<string, readonly string[]>> = {
+  // OpenAI Responses output items.
+  output_items: ['function_call', 'function_call_output'],
+  // Anthropic content blocks, wherever they sit, also after a fallback block.
+  content_blocks: ['tool_use'],
+};
+
+/**
+ * `row` as the model is sent it (G-415): an assistant row a host recorded
+ * (not the harness) with no tool call objects carries no provider-native
+ * tool item in its `additional_content`. A client built on prism-ts replays
+ * `output_items` and `content_blocks` from an assistant message as given, so
+ * a tool item copied there from a stored step would reach the provider as a
+ * tool call with no result. Every other key and item is kept, and the stored
+ * row is unchanged.
+ */
+function withoutHostToolItems(row: JsonObject, harness: true | undefined): JsonObject {
+  if (harness === true || row.type !== 'assistant' || isToolCallStep(row) || !isObject(row.additional_content)) return row;
+  const additional: JsonObject = { ...row.additional_content };
+  let changed = false;
+  for (const [key, types] of Object.entries(TOOL_ITEMS)) {
+    const items = additional[key];
+    if (!Array.isArray(items)) continue;
+    const kept = items.filter((item) => !(isObject(item) && types.includes(text(item.type))));
+    if (kept.length === items.length) continue;
+    additional[key] = kept;
+    changed = true;
+  }
+  return changed ? { ...row, additional_content: additional } : row;
 }
 
 /**
