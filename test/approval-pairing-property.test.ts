@@ -42,13 +42,25 @@ const REPEATED = 'Tool call was not run because another call in this step has th
 const NO_RESPONSE = 'No approval response provided';
 const DENIED = 'User denied tool execution';
 
-const EXAMPLES = positive(process.env.PRISM_PROPERTY_EXAMPLES, 150);
-const BASE_SEED = positive(process.env.PRISM_PROPERTY_BASE_SEED, 0x6392);
-const REPLAY = process.env.PRISM_PROPERTY_SEED;
+const EXAMPLES = envInteger('PRISM_PROPERTY_EXAMPLES', 1, Number.MAX_SAFE_INTEGER, 150)!;
+const BASE_SEED = envInteger('PRISM_PROPERTY_BASE_SEED', 0, Number.MAX_SAFE_INTEGER, 0x6392)!;
+const REPLAY = envInteger('PRISM_PROPERTY_SEED', 0, 0xffffffff, undefined);
 
-function positive(value: string | undefined, fallback: number): number {
-  const parsed = value === undefined || value === '' ? NaN : Number(value);
-  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : fallback;
+/**
+ * An integer setting from the environment. Unset means the default; a value
+ * that is SET must be a plain decimal integer in [min, max], and anything else
+ * (empty, 0 for a count, negative, non-numeric, fractional) is refused. A run
+ * that silently checked nothing, or fell back to a default nobody asked for,
+ * would report green for a property it never examined.
+ */
+function envInteger(name: string, min: number, max: number, fallback: number | undefined): number | undefined {
+  const value = process.env[name];
+  if (value === undefined) return fallback;
+  const parsed = /^[0-9]+$/.test(value) ? Number(value) : NaN;
+  if (!Number.isSafeInteger(parsed) || parsed < min || parsed > max) {
+    throw new Error(`${name} must be an integer from ${min} to ${max} when set; got ${JSON.stringify(value)}.`);
+  }
+  return parsed;
 }
 
 // ---------------------------------------------------------------------------
@@ -535,7 +547,7 @@ describe('G-392 property: approval pairing invariants over generated steps', () 
   it(`holds for ${REPLAY === undefined ? `${EXAMPLES} examples from base seed ${BASE_SEED}` : `seed ${REPLAY}`}`, async () => {
     const seeds = REPLAY === undefined
       ? Array.from({ length: EXAMPLES }, (_unused, index) => caseSeed(BASE_SEED, index))
-      : [Number(REPLAY) >>> 0];
+      : [REPLAY];
     const started = Date.now();
     for (const seed of seeds) {
       const c = generate(seed);
@@ -554,6 +566,23 @@ describe('G-392 property: approval pairing invariants over generated steps', () 
     }
     console.info(`G-392 property: ${seeds.length} examples passed in ${Date.now() - started} ms (base seed ${BASE_SEED}).`);
   }, Math.max(120_000, EXAMPLES * 100));
+
+  it('a property setting that is set must be a valid integer: never a silent zero or a default', () => {
+    const name = 'PRISM_PROPERTY_TEST_SETTING';
+    const saved = process.env[name];
+    try {
+      delete process.env[name];
+      expect(envInteger(name, 1, 100, 7)).toBe(7);
+      for (const bad of ['', '0', '-1', '+3', '1.5', '1e3', ' 5', 'abc', '101', '0x10']) {
+        process.env[name] = bad;
+        expect(() => envInteger(name, 1, 100, 7), JSON.stringify(bad)).toThrow(`${name} must be an integer from 1 to 100 when set`);
+      }
+      process.env[name] = '42';
+      expect(envInteger(name, 1, 100, 7)).toBe(42);
+    } finally {
+      if (saved === undefined) delete process.env[name]; else process.env[name] = saved;
+    }
+  });
 
   it('the generator reaches every shape the brief asks for', () => {
     const cases = Array.from({ length: Math.max(EXAMPLES, 150) }, (_unused, index) => generate(caseSeed(BASE_SEED, index)));
