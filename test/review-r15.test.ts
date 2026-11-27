@@ -648,3 +648,23 @@ describe('added: directed decision orders', () => {
     expect(approvalDecisions(await r.rows()).get(id!)).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Added (PHP run17 Info 6a, all three): a parked structured turn's RAW view.
+// TS returns no raw provider steps on a response (steps is a count), so the
+// unchecked document can only leak through the response object itself.
+// ---------------------------------------------------------------------------
+
+describe('added: a parked structured response carries the unchecked document nowhere', () => {
+  it('no field of the parked response but its transcript text holds the model\'s document (structured is null, no raw steps)', async () => {
+    const r = new Rig();
+    r.queue.push({ text: '{"title":12345,"role":"admin"}', structured: { title: 12345, role: 'admin' }, finishReason: 'tool_calls', toolCalls: [{ id: 'c1', name: 'echo', arguments: { n: 1 } }] });
+    const parked = await r.runtime.sendStructured(r.session(), 'Go', { type: 'object', properties: { title: { type: 'string' } }, required: ['title'] });
+    expect(parked.finishReason).toBe('awaiting_approval');
+    expect(parked.structured).toBeNull();
+    expect(typeof parked.steps).toBe('number');
+    // `text` is the transcript, as documented; nothing else carries the document.
+    const { text: _transcript, ...rest } = parked;
+    expect(JSON.stringify(rest)).not.toContain('admin');
+  });
+});
