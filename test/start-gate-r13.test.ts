@@ -1055,7 +1055,8 @@ describe('upgrade: a thread the 0.11.x line wrote', () => {
     // The 0.11.x rows as stored: written straight to the store (positions 1..n), bypassing main's record().
     const store = (thread as unknown as { store: MemorySessionStore }).store;
     const threadKey = (thread as unknown as { key: string }).key;
-    await store.put(threadKey, { messages: rows.map(([message, runId], index) => ({ position: index + 1, message, run_id: runId, recorded_at: '2026-11-01T00:00:00.000Z' })) as never });
+    // 0.11.x's entry shape: a row its harness recorded carries `harness: true` (its replaced-step answer does).
+    await store.put(threadKey, { messages: rows.map(([message, runId], index) => ({ position: index + 1, message, run_id: runId, recorded_at: '2026-11-01T00:00:00.000Z', ...(Object.hasOwn(message, 'harness_replaced_step') ? { harness: true } : {}) })) as never });
     return root;
   }
 

@@ -192,7 +192,8 @@ describe("item 2: the ended mark is the reference's shape, on the row, and only 
 
       const row = (await endedRow(r, 'Start over'))!;
       expect(row).toBeDefined();
-      expect(Object.keys(row)).toEqual(['type', 'tool_results', 'tool_approval_responses', 'harness_ended_by_start']);
+      // Round 15: the runtime's result rows name the step they answer, the mark last.
+      expect(Object.keys(row)).toEqual(['type', 'tool_results', 'tool_approval_responses', 'harness_ended_by_start', 'harness_answers_step']);
       expect(row.harness_ended_by_start).toEqual({ approval_ids: parked });
       for (const entry of row.tool_results as JsonObject[]) {
         expect(Object.keys(entry)).toEqual(['tool_call_id', 'tool_name', 'args', 'result', 'tool_call_result_id', 'artifacts']);

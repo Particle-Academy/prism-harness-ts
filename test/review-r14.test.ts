@@ -95,6 +95,13 @@ class Signals {
       if (who !== undefined) signals.fire(who, 'read');
       return result;
     });
+    const readerRows = Thread.prototype.readerRows;
+    vi.spyOn(Thread.prototype, 'readerRows').mockImplementation(async function (this: Thread) {
+      const who = actor.getStore();
+      const result = await readerRows.call(this);
+      if (who !== undefined) signals.fire(who, 'read');
+      return result;
+    });
   }
 
   fire(who: string, what: 'queued' | 'read' | 'done'): void {
@@ -159,8 +166,9 @@ class Rig {
     this.queue.push({ text: '', finishReason: 'tool_calls', toolCalls: calls.map(([name, args, id]) => ({ id, name, arguments: args })) });
   }
 
+  /** The thread as the harness's readers take it (round 15: only the harness's own rows carry its marks). */
   async rows(scope = 'chat'): Promise<JsonObject[]> {
-    return (await this.session(scope).thread().messages()).map((entry) => entry.message);
+    return await this.session(scope).thread().readerRows();
   }
 
   /** Parked on one gated echo (c1); its approval id. */
@@ -223,10 +231,15 @@ describe('item 1: a new message and a decision (W1, W2)', () => {
   it('W1b: a thread holding a replaced denial with no superseding row after it (as a two-write supersede could leave one): every decision path refuses, nothing runs, one outcome', async () => {
     const r = new Rig();
     const [id] = await r.parked();
-    // The exact row the replaced denial is, recorded alone.
+    // The exact row the replaced denial is, stored alone as the HARNESS's
+    // own entry (round 15: a host row carrying the mark is read without it,
+    // so only a stored harness entry can be this thread).
     const denial = supersededRow(await r.rows())!;
     expect(denial.harness_superseded).toEqual({ approval_ids: [id] });
-    await r.session().thread().record([denial as unknown as JsonObject]);
+    const thread = r.session().thread() as unknown as { store: MemorySessionStore; key: string };
+    const payload = (await thread.store.get(thread.key))!;
+    const stored = payload.messages as JsonObject[];
+    await thread.store.put(thread.key, { ...payload, messages: [...stored, { position: stored.length + 1, message: denial as unknown as JsonObject, run_id: null, recorded_at: '2026-11-27T00:00:00.000Z', harness: true }] });
 
     const rows = await r.rows();
     expect(pendingApprovalIds(rows)).toEqual([]);
@@ -272,7 +285,7 @@ describe('item 1: a new message and a decision (W1, W2)', () => {
 });
 
 describe('item 1: a supersede while an approved call is running (PR1, PR2)', () => {
-  it('PR2: a new message sent while the resolver runs an approved call waits for it: the call has exactly ONE outcome, its real result, and is never read as replaced', async () => {
+  it('PR2 (round 15): a new message sent while the resolver runs an approved call does NOT wait for it: the call has exactly ONE outcome, its real result, and is never read as replaced', async () => {
     const r = new Rig();
     const signals = new Signals();
     signals.install();
@@ -292,15 +305,19 @@ describe('item 1: a supersede while an approved call is running (PR1, PR2)', () 
     expect(echoOutcomes(rows, 1)).toEqual(['ran:1']);
     expect(supersededApprovals(rows).has(id!)).toBe(false);
     expect(approvalDecisions(rows).get(id!)).toBe(true);
-    // The real result sits before the new message, in its own segment.
+    // The new message landed while the call ran (after its started row), and
+    // the real result after it, naming its step.
     const result = rows.findIndex((row) => row.type === 'tool_result' && ((row.tool_results ?? []) as JsonObject[]).some((entry) => entry.result === 'ran:1'));
     const message = rows.findIndex((row) => row.type === 'user' && row.content === NEW_MESSAGE);
-    expect(result).toBeGreaterThan(-1);
-    expect(result).toBeLessThan(message);
+    const started = rows.findIndex((row) => Object.hasOwn(row, 'harness_started'));
+    expect(started).toBeGreaterThan(-1);
+    expect(started).toBeLessThan(message);
+    expect(result).toBeGreaterThan(message);
+    expect(rows[result]!.harness_answers_step).toEqual({ position: rows.findIndex((row) => row.type === 'assistant') + 1 });
   });
 
   for (const kind of ['user', 'assistant_text', 'assistant_tool_step'] as const) {
-    it(`PR1 (${kind}): a host row recorded while the resolver runs an approved call is refused session_locked, writes nothing; the call has ONE outcome; the same row recorded after is accepted with no denial`, async () => {
+    it(`PR1 (${kind}, round 15): a host row recorded while the resolver runs an approved call is ACCEPTED, with no denial for the running call; the call has ONE outcome; the same row recorded after is accepted with no denial`, async () => {
       const r = new Rig();
       const [id] = await r.parked();
       await recordApproval(r.session(), id!, true);
@@ -314,29 +331,34 @@ describe('item 1: a supersede while an approved call is running (PR1, PR2)', () 
         count = (await r.rows()).length;
       };
       await r.runtime.send(r.session(), '');
-      expect(during).toBe('session_locked');
+      expect(during).toBe('recorded');
 
       const rows = await r.rows();
       expect(r.echoed).toEqual([1]);
       expect(echoOutcomes(rows, 1)).toEqual(['ran:1']);
       expect(supersededApprovals(rows).has(id!)).toBe(false);
-      expect(rows.some((candidate) => Object.hasOwn(candidate, 'harness_superseded'))).toBe(false);
+      // No replaced denial ever names the running call (a host tool-call step
+      // is itself replaced by the run's next row: its own call gets one).
+      const deniedC1 = (all: JsonObject[]): boolean => all.some((candidate) => Object.hasOwn(candidate, 'harness_superseded')
+        && ((candidate.tool_results ?? []) as JsonObject[]).some((entry) => entry.tool_call_id === 'c1'));
+      expect(deniedC1(rows)).toBe(false);
       expect(count).toBeGreaterThan(0);
       // After the resolution, the host's row is an ordinary row.
       expect(await r.session().thread().record([row]).then(() => 'recorded', code)).toBe('recorded');
-      expect((await r.rows()).some((candidate) => Object.hasOwn(candidate, 'harness_superseded'))).toBe(false);
+      expect(deniedC1(await r.rows())).toBe(false);
       expect(echoOutcomes(await r.rows(), 1)).toEqual(['ran:1']);
     });
   }
 
-  it('PR1 on a stream (streamDecision holds the lock for its whole turn): a host row during the call is refused the same way', async () => {
+  it('PR1 on a stream (streamDecision holds the lock for its whole turn, round 15): a host row during the call is accepted the same way, with no denial for it', async () => {
     const r = new Rig();
     const [id] = await r.parked();
     let during = '';
     r.duringEcho = async () => { during = await r.session().thread().record([{ type: 'user', content: 'Host row.' }]).then(() => 'recorded', code); };
     for await (const _step of r.runtime.streamDecision(r.session(), [{ approvalId: id!, approved: true }])) { /* drain */ }
-    expect(during).toBe('session_locked');
+    expect(during).toBe('recorded');
     expect(echoOutcomes(await r.rows(), 1)).toEqual(['ran:1']);
+    expect(supersededApprovals(await r.rows()).has(id!)).toBe(false);
   });
 });
 
@@ -351,51 +373,28 @@ describe('item 1: new channels', () => {
     throw new Error('no thread key');
   }
 
-  it('a claim whose time ran out (a resolver that died) no longer refuses: a host row supersedes the step as before', async () => {
+  it('round 15: a claim key an older build left (live, naming the step) refuses nothing: a host row supersedes the step as before', async () => {
     const r = new Rig();
     const [id] = await r.parked();
     const key = await threadKey(r);
     const position = (await r.session().thread().messages()).find((entry) => entry.message.type === 'assistant')!.position;
-    await r.durable.put(`${key}:in-flight`, { v: 1, position, token: 'dead', until: Date.now() - 1 });
-    await r.session().thread().record([{ type: 'user', content: 'Host row.' }]);
+    await r.durable.put(`${key}:in-flight`, { v: 1, position, token: 'old', until: Date.now() + 60_000 });
+    expect(await r.session().thread().record([{ type: 'user', content: 'Host row.' }]).then(() => 'recorded', code)).toBe('recorded');
     expect(supersededApprovals(await r.rows()).has(id!)).toBe(true);
-  });
-
-  it('a claim naming another step (left from an earlier one) refuses nothing', async () => {
-    const r = new Rig();
-    const [id] = await r.parked();
-    const key = await threadKey(r);
-    await r.durable.put(`${key}:in-flight`, { v: 1, position: 1, token: 'old', until: Date.now() + 60_000 });
-    await r.session().thread().record([{ type: 'user', content: 'Host row.' }]);
-    expect(supersededApprovals(await r.rows()).has(id!)).toBe(true);
-  });
-
-  it('a claim only ever REFUSES a superseding write: it never runs a call, never answers one, and is cleared by the resolution that holds it', async () => {
-    const r = new Rig();
-    const [id] = await r.parked();
-    const key = await threadKey(r);
-    const position = (await r.session().thread().messages()).find((entry) => entry.message.type === 'assistant')!.position;
-    // A forged live claim: a host row is refused, nothing runs, the call stays open.
-    await r.durable.put(`${key}:in-flight`, { v: 1, position, token: 'forged', until: Date.now() + 60_000 });
-    expect(await r.session().thread().record([{ type: 'user', content: 'Host row.' }]).then(() => 'recorded', code)).toBe('session_locked');
     expect(r.echoed).toEqual([]);
-    expect(pendingApprovalIds(await r.rows())).toEqual([id]);
-    // The runtime's resume claims the step itself and clears it with its results.
-    await recordApproval(r.session(), id!, true);
-    await r.runtime.send(r.session(), '');
-    expect(r.echoed).toEqual([1]);
-    expect(await r.durable.get(`${key}:in-flight`)).toBeNull();
-    expect(echoOutcomes(await r.rows(), 1)).toEqual(['ran:1']);
   });
 
-  it('a resolution whose result write fails releases its claim (nothing is left refusing writes)', async () => {
+  it('round 15: a resolution whose result write fails leaves the started row: the call is never run again (it reads interrupted), and no claim or key is left behind', async () => {
     const r = new Rig();
     const [id] = await r.parked();
     await recordApproval(r.session(), id!, true);
     r.durable.onWrite = { match: (message) => message.type === 'tool_result' && JSON.stringify(message).includes('ran:1'), run: async () => { throw new Error('STORE-SECRET write failed'); } };
     await expect(r.runtime.send(r.session(), '')).rejects.toThrow();
+    await r.runtime.send(r.session(), '');
+    expect(r.echoed).toEqual([1]);
     const key = await threadKey(r);
     expect(await r.durable.get(`${key}:in-flight`)).toBeNull();
+    expect((await r.rows()).filter((row) => Object.hasOwn(row, 'harness_started'))).toHaveLength(1);
   });
 
   it('a new message on a session with nothing open takes no session lock (a stream holding it does not block it)', async () => {

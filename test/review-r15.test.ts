@@ -117,8 +117,9 @@ class Rig {
     this.queue.push({ text: '', finishReason: 'tool_calls', toolCalls: calls.map(([name, args, id]) => ({ id, name, arguments: args })) });
   }
 
+  /** The thread as the harness's readers take it (only the harness's own rows carry its marks). */
   async rows(scope = 'chat'): Promise<JsonObject[]> {
-    return (await this.session(scope).thread().messages()).map((entry) => entry.message);
+    return await this.session(scope).thread().readerRows();
   }
 
   /** Parked on the given calls (default: one gated echo, c1); their approval ids. */
@@ -209,8 +210,22 @@ describe('item 1: a superseding write while an approved call runs', () => {
     });
   }
 
-  it('a tool-call step reusing the call\'s id, recorded mid-call: the result stays with its call, the later call is decided by ITS OWN approval and runs only when approved', async () => {
+  it('a tool-call step reusing the call\'s id, recorded mid-call, the run then continuing: the run\'s next row replaces the host\'s step (ONE denial for its call), and the earlier result never answers it', async () => {
     const r = new Rig();
+    const [id] = await r.parked();
+    await recordApproval(r.session(), id!, true);
+    r.duringEcho = async () => { await r.session().thread().record([hostStep('c1', 3, 'apr_later')]); };
+    await r.runtime.send(r.session(), '');
+    for (let i = 0; i < 2; i += 1) await r.runtime.send(r.session(), '');
+    const rows = await r.rows();
+    expect(r.echoed).toEqual([1]);
+    expect(echoOutcomes(rows, 1)).toEqual(['ran:1']);
+    expect(echoOutcomes(rows, 3)).toEqual([REPLACED]);
+    expect(await recordApproval(r.session(), 'apr_later', true).then(() => 'accepted', code)).toBe('approval_not_pending');
+  });
+
+  it('a tool-call step reusing the call\'s id, recorded mid-call on a SPENT run (no model step after): the result stays with its call, the later call is decided by ITS OWN approval and runs only when approved', async () => {
+    const r = new Rig(1);
     const [id] = await r.parked();
     await recordApproval(r.session(), id!, true);
     r.duringEcho = async () => { await r.session().thread().record([hostStep('c1', 3, 'apr_later')]); };
@@ -398,7 +413,7 @@ describe('item 3: the ended-by-start channel is the runtime\'s only', () => {
     const thread = new Thread(new MemorySessionStore(), 'shared:admin-review');
     await thread.record([{ type: 'user', content: 'Go' }, hostStep('c1', 1, 'a1')]);
     await thread.record([{ type: 'user', content: 'Next.' }]);
-    const rows = (await thread.messages()).map((entry) => entry.message);
+    const rows = await thread.readerRows();
     expect(rows.map((row) => row.type)).toEqual(['user', 'assistant', 'tool_result', 'user']);
     expect(echoOutcomes(rows, 1)).toEqual([REPLACED]);
   });
@@ -465,4 +480,42 @@ describe('item 2 (G-408): a copy of the paused step with non-object tool_calls',
     expect(pendingApprovalIds(rows)).toEqual([]);
     expect(await recordApproval(r.session(), id!, true).then(() => 'accepted', code)).toBe('approval_not_pending');
   });
+});
+
+// ---------------------------------------------------------------------------
+// Added (coordinator): an approval belongs ONLY to the step that FIRST asked
+// for it (TS 0.11.x #92). A recorded copy of the paused step that carries a
+// NEW call and keeps the OLD approval request never lets that approval run
+// the new call, decided before or after the copy.
+// ---------------------------------------------------------------------------
+
+describe('added: an approval belongs only to the step that first asked for it', () => {
+  const copies: Record<string, JsonValue> = {
+    'a mixed list (non-objects and a new call)': ['x', { id: 'c1', name: 'echo', arguments: { n: 5 }, result_id: null, reasoning_id: null, reasoning_summary: null }, null, 3],
+    'a valid step with a new call under the old call id': [{ id: 'c1', name: 'echo', arguments: { n: 5 }, result_id: null, reasoning_id: null, reasoning_summary: null }],
+  };
+  for (const [label, calls] of Object.entries(copies)) {
+    for (const when of ['before', 'after'] as const) {
+      for (const maxSteps of [8, 1]) {
+        it(`${label}, the old approval decided ${when} the copy, ${maxSteps === 1 ? 'spent' : 'open'} budget: the new call never runs on the old approval`, async () => {
+          const r = new Rig(maxSteps);
+          const [id] = await r.parked();
+          if (when === 'before') await recordApproval(r.session(), id!, true);
+          await r.session().thread().record([{
+            type: 'assistant', content: '', tool_calls: calls, additional_content: {},
+            tool_approval_requests: [{ approval_id: id!, tool_call_id: 'c1', arguments_format: ARGUMENTS_AS_SENT }],
+            harness_tool_names: ['echo', 'free'],
+          }]);
+          if (when === 'after') expect(await recordApproval(r.session(), id!, true).then(() => 'accepted', code)).toBe('approval_not_pending');
+          for (let i = 0; i < 3; i += 1) await r.runtime.send(r.session(), '').catch(() => undefined);
+          const rows = await r.rows();
+          expect(r.echoed).toEqual([]);
+          expect(echoOutcomes(rows, 1)).toEqual([REPLACED]);
+          expect(pendingApprovalIds(rows)).toEqual([]);
+          expect(pausedApprovalIds(rows)).toEqual([]);
+          expect(approvalDecisions(rows).get(id!)).not.toBe(true);
+        });
+      }
+    }
+  }
 });

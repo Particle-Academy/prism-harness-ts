@@ -9,6 +9,7 @@ import {
   recordDecisions,
   type AgentResponse,
   type JsonObject,
+  type JsonValue,
   type LlmRequest,
   type LlmResponse,
   type RunStep,
@@ -187,7 +188,50 @@ interface Case {
   spent: boolean;
   /** A later tool-call step after the park: it is the step decided, and the parked one is replaced. */
   later: LaterStep | null;
+  /**
+   * Round 15 (TS run18 F3): the index of a call appended as an IDENTICAL
+   * duplicate of an earlier one (same id, tool and arguments: the same
+   * token), or null. From a generator of its own (seed ^ 0x15150).
+   */
+  dup: number | null;
+  /**
+   * G-408 and its 0.11.x #92 follow-up: right before the first resume the
+   * host records an assistant row whose tool_calls are NOT a list of objects
+   * (a string, a number, null, a list of strings, a JSON string, a list
+   * MIXING objects with a NEW call, token 901), or a valid COPY step with a
+   * NEW call (token 902) that keeps the parked step's OLD approval
+   * requests. None is the parked step; none of their requests is theirs (an
+   * approval belongs to the step that first asked for it). From a generator
+   * of its own (seed ^ 0x408408).
+   */
+  junk: { kind: JunkKind; requests: boolean } | null;
 }
+
+type JunkKind = 'string' | 'number' | 'null' | 'strings' | 'scalar' | 'mixed' | 'copy';
+const JUNK_KINDS: readonly JunkKind[] = ['string', 'number', 'null', 'strings', 'scalar', 'mixed', 'copy'];
+
+/** The junk row's tool_calls: never a list of objects, except the valid copy. */
+function junkCalls(kind: JunkKind, id: string): JsonValue {
+  const call = (n: number): JsonObject => ({ id, name: 'echo', arguments: { n }, result_id: null, reasoning_id: null, reasoning_summary: null });
+  switch (kind) {
+    case 'string': return ['x'];
+    case 'number': return [7];
+    case 'null': return [null];
+    case 'strings': return [[id, 'echo'], JSON.stringify({ id, name: 'echo', arguments: { n: 901 } })];
+    case 'scalar': return JSON.stringify([{ id, name: 'echo', arguments: { n: 901 } }]);
+    case 'mixed': return ['x', call(901), null, 3];
+    case 'copy': return [call(902)];
+  }
+}
+
+/** A tool-call step by the one rule (G-408): an assistant row whose tool_calls are a non-empty list of objects. */
+function isStepRow(row: JsonObject): boolean {
+  return row.type === 'assistant' && Array.isArray(row.tool_calls) && row.tool_calls.length > 0
+    && row.tool_calls.every((call) => typeof call === 'object' && call !== null && !Array.isArray(call));
+}
+
+/** The fixed regression seeds keep the exact case they were found with: no duplicate, no junk row. */
+const REGRESSION_SEEDS = new Set([2034523272, 232174035, 2060958372, 2483776628]);
 
 type InsertKind = 'assistant_text' | 'assistant_call' | 'user' | 'new_message' | 'system' | 'tool_empty' | 'tool_result';
 const INSERT_KINDS: readonly InsertKind[] = ['assistant_text', 'assistant_call', 'user', 'new_message', 'system', 'tool_empty', 'tool_result'];
@@ -375,7 +419,7 @@ function generate(seed: number): Case {
   // A resume that failed after its resolution is always followed by another.
   if (failOnce && again.length === 0) again.push({ approveAll: rng.chance(0.5), path: rng.pick(PATHS) });
 
-  return {
+  const c: Case = {
     seed,
     source,
     calls,
@@ -391,7 +435,44 @@ function generate(seed: number): Case {
     failOnce,
     spent,
     later,
+    dup: null,
+    junk: null,
   };
+  // The G-399 / item-5 shapes (a non-superseding row after the decision,
+  // then a resume that runs a call) are kept exactly as drawn.
+  if (REGRESSION_SEEDS.has(seed) || ((c.insert?.kind === 'system' || c.insert?.kind === 'tool_empty') && c.insert.when === 'after_decision')) return c;
+  return withJunk(withDuplicate(c));
+}
+
+/**
+ * Round 15 (TS run18 F3, PHP run17 #5): an IDENTICAL duplicate of one call
+ * (same id, tool and token), appended, from a generator of its own so every
+ * other draw of the seed is unchanged. Not with a later step or a forged
+ * result (they name calls by index and token).
+ */
+function withDuplicate(c: Case): Case {
+  const rng = new Rng((c.seed ^ 0x15150) >>> 0);
+  if (!rng.chance(0.4) || c.later !== null || c.insert?.kind === 'tool_result') return c;
+  const original = rng.int(0, c.calls.length - 1);
+  const call = c.calls[original]!;
+  const calls = [...c.calls, { ...call }];
+  const index = calls.length - 1;
+  let requests = c.requests;
+  if (call.tool === 'echo' && (c.source === 'model' || rng.chance(0.6))) {
+    const v = rng.pick<Verdict>(['approve', 'approve', 'deny', 'none']);
+    requests = [...requests, { call: index, verdict: v, reason: v === 'deny' ? 'no-dup' : null }];
+  }
+  // An ungated call ran when its step was taken; so did its duplicate.
+  const prior = c.source === 'stored' && call.tool === 'free' ? [...c.prior, index] : c.prior;
+  const order = requests.length > c.requests.length ? [...c.order, requests.length - 1] : c.order;
+  return { ...c, calls, requests, prior, order, dup: index };
+}
+
+/** G-408 / #92: the junk row (see Case.junk), from a generator of its own. */
+function withJunk(c: Case): Case {
+  const rng = new Rng((c.seed ^ 0x408408) >>> 0);
+  if (!rng.chance(0.3) || c.later !== null || c.recorder === 'streamDecision') return c;
+  return { ...c, junk: { kind: rng.pick(JUNK_KINDS), requests: rng.chance(0.6) } };
 }
 
 // ---------------------------------------------------------------------------
@@ -402,8 +483,16 @@ interface Expected {
   repeated: boolean;
   /** Tokens of the gated calls that run, on the first resume and never again. */
   runs: Set<number>;
-  /** The one outcome every call ends with, by token. */
-  outcome: Map<number, string>;
+  /**
+   * Every call's ONE outcome, by token: a multiset (round 15), one entry per
+   * call carrying the token (identical duplicates share it).
+   */
+  outcome: Map<number, string[]>;
+}
+
+/** Add `result` to the outcomes of `token`. */
+function put(outcome: Map<number, string[]>, token: number, result: string): void {
+  outcome.set(token, [...(outcome.get(token) ?? []), result]);
 }
 
 function expected(c: Case): Expected {
@@ -414,9 +503,8 @@ function expected(c: Case): Expected {
   const forgedLater = target?.step === 'later' ? target.index : -1;
   const forgedText = target?.text ?? '';
   const answered = [...c.prior, ...(forged === -1 ? [] : [forged])];
-  if (!superseded(c)) {
-    const decided = decideStep(c.calls, c.requests, answered);
-    if (forged !== -1) decided.outcome.set(c.calls[forged]!.token, forgedText);
+  if (!superseded(c) && c.junk === null) {
+    const decided = decideStep(c.calls, c.requests, answered, forged === -1 ? undefined : [forged, forgedText]);
     return decided;
   }
   // Superseded (G-397, the release lines' rule): each gated call of the
@@ -424,48 +512,54 @@ function expected(c: Case): Expected {
   // nothing of it runs; a later tool-call step is decided by its own.
   // A later step superseded in its turn gives its open calls the same one
   // denial, and runs nothing.
-  const decided = c.later === null
-    ? { repeated: false, runs: new Set<number>(), outcome: new Map<number, string>() }
+  const decided: Expected = c.later === null
+    ? { repeated: false, runs: new Set<number>(), outcome: new Map<number, string[]>() }
     : laterSuperseded(c)
       ? { repeated: false, runs: new Set<number>(), outcome: new Map(c.later.calls.map((call, index) => [call.token,
-        call.tool === 'free' ? `free:${call.token}` : index === forgedLater ? forgedText : REPLACED])) }
-      : decideStep(c.later.calls, c.later.requests, forgedLater === -1 ? [] : [forgedLater]);
-  if (c.later !== null && forgedLater !== -1) decided.outcome.set(c.later.calls[forgedLater]!.token, forgedText);
+        [call.tool === 'free' ? `free:${call.token}` : index === forgedLater ? forgedText : REPLACED]])) }
+      : decideStep(c.later.calls, c.later.requests, forgedLater === -1 ? [] : [forgedLater], forgedLater === -1 ? undefined : [forgedLater, forgedText]);
   // The parked step's calls: an earlier call that a later-segment result
   // names still gets the replaced denial (segment ownership).
-  c.calls.forEach((call, index) => decided.outcome.set(call.token, call.tool === 'free' ? `free:${call.token}`
+  c.calls.forEach((call, index) => put(decided.outcome, call.token, call.tool === 'free' ? `free:${call.token}`
     : c.prior.includes(index) ? `prior:${call.token}` : index === forged ? forgedText : REPLACED));
+  // #92: a valid COPY step's new call owns none of the old requests: it is
+  // open with no approval, and its resume refuses it.
+  if (c.junk?.kind === 'copy') put(decided.outcome, 902, NO_RESPONSE);
   return decided;
 }
 
-function decideStep(calls: Call[], requests: Request[], prior: number[]): Expected {
+function decideStep(calls: Call[], requests: Request[], prior: number[], forged?: [number, string]): Expected {
   const dup = (ids: (string | number)[]): boolean => new Set(ids).size !== ids.length;
   const repeated = dup(calls.map((call) => call.id)) || dup(requests.map((request) => calls[request.call]!.id))
     || dup(requests.map((request, index) => request.approval ?? index));
   const runs = new Set<number>();
-  const outcome = new Map<number, string>();
+  const outcome = new Map<number, string[]>();
   calls.forEach((call, index) => {
     if (call.tool === 'free') {
-      outcome.set(call.token, `free:${call.token}`);
+      put(outcome, call.token, `free:${call.token}`);
+      return;
+    }
+    if (forged !== undefined && forged[0] === index) {
+      put(outcome, call.token, forged[1]);
       return;
     }
     if (prior.includes(index)) {
-      outcome.set(call.token, `prior:${call.token}`);
+      put(outcome, call.token, `prior:${call.token}`);
       return;
     }
     if (repeated) {
-      outcome.set(call.token, REPEATED);
+      put(outcome, call.token, REPEATED);
       return;
     }
     // Distinct ids: this call's own request, if it has one.
     const own = requests.find((request) => request.call === index);
     if (own?.verdict === 'approve') {
       runs.add(call.token);
-      outcome.set(call.token, `ran:${call.token}`);
+      put(outcome, call.token, `ran:${call.token}`);
     } else if (own?.verdict === 'deny') {
-      outcome.set(call.token, own.reason ?? DENIED);
+      put(outcome, call.token, own.reason ?? DENIED);
     } else {
-      outcome.set(call.token, NO_RESPONSE);
+      put(outcome, call.token, NO_RESPONSE);
     }
   });
 
@@ -573,21 +667,24 @@ async function outcomes(session: Session): Promise<[number, string][]> {
   const out: [number, string][] = [];
   let calls: JsonObject[] = [];
   let has: boolean[] = [];
-  const seen = new Set<string>();
+  // COUNTED (round 15, TS run18 F3): how many of each exact result the
+  // segment's EARLIER rows held. The resolution row carries the step's
+  // earlier results with it: a copy of one an earlier row held is that
+  // result, not another; two in one row are two outcomes.
+  const seen = new Map<string, number>();
   for (const row of await rows(session)) {
-    if (row.type === 'assistant' && Array.isArray(row.tool_calls) && row.tool_calls.length > 0) {
+    if (isStepRow(row)) {
       calls = row.tool_calls as JsonObject[];
       has = calls.map(() => false);
       seen.clear();
       continue;
     }
     if (row.type !== 'tool_result') continue;
+    const here = new Map<string, number>();
     for (const entry of (row.tool_results ?? []) as JsonObject[]) {
-      // The resolution row carries the step's earlier results with it: an
-      // exact copy of a result already read is that result, not another.
       const copy = JSON.stringify([entry.tool_call_id, entry.tool_name, entry.args, entry.result]);
-      if (seen.has(copy)) continue;
-      seen.add(copy);
+      here.set(copy, (here.get(copy) ?? 0) + 1);
+      if (here.get(copy)! <= (seen.get(copy) ?? 0)) continue;
       const open = (at: number): boolean => !has[at] && calls[at]!.id === entry.tool_call_id;
       let at = calls.findIndex((call, index) => open(index) && call.name === entry.tool_name && JSON.stringify(call.arguments) === JSON.stringify(entry.args));
       if (at === -1) at = calls.findIndex((call, index) => open(index) && call.name === entry.tool_name);
@@ -597,6 +694,7 @@ async function outcomes(session: Session): Promise<[number, string][]> {
       const token = Number((calls[at]!.arguments as JsonObject).n);
       if (token !== 900) out.push([token, String(entry.result)]);
     }
+    for (const [copy, count] of here) seen.set(copy, Math.max(seen.get(copy) ?? 0, count));
   }
   return out;
 }
@@ -752,6 +850,14 @@ async function runCase(c: Case): Promise<void> {
   }
   // G-397 / G-399: a row recorded between the decision and the resume.
   if (c.insert?.when === 'after_decision') await insertRow(r, c);
+  // G-408 / #92: the host's junk row, right before the resume, keeping the
+  // parked step's OLD approval requests or none.
+  if (c.junk !== null) {
+    const requests = c.junk.requests
+      ? c.requests.map((q, index) => ({ approval_id: approvalIds[index]!, tool_call_id: c.calls[q.call]!.id, arguments_format: ARGUMENTS_AS_SENT }))
+      : [];
+    await r.session.thread().record([{ type: 'assistant', content: '', tool_calls: junkCalls(c.junk.kind, c.calls[0]!.id), additional_content: {}, tool_approval_requests: requests, harness_tool_names: ['echo', 'free'] }]);
+  }
   if (!resumedYet) first = await resumed(async () => await turn(r, c.resume, ''));
 
   // Invariants 1-4, then full equality with the oracle.
@@ -762,6 +868,10 @@ async function runCase(c: Case): Promise<void> {
   const approves = all.filter(({ q }) => q.verdict === 'approve');
   check(r.ran.every((token) => approves.some(({ call }) => call.token === token)), '2: each run call has its own approve', r.ran);
   check(r.ran.length <= approves.length, '2: one decision decides at most one call', { ran: r.ran.length, approves: approves.length });
+  // Invariant 1, with no exemption (round 15): no call runs without its OWN
+  // approval, the junk row's and the copy's new calls (901, 902) included:
+  // an approval belongs only to the step that first asked for it (#92).
+  check(!r.ran.includes(901) && !r.ran.includes(902), '1: no call runs without its own approval (a copy\'s new call)', r.ran);
   if (c.later !== null) check(r.ran.every((token) => token >= 200), 'a replaced step\'s approvals never run anything', r.ran);
   if (oracle.repeated) check(r.ran.length === 0, '4: a step with repeated ids runs none of its gated calls', r.ran);
   check(sameSet(r.ran, oracle.runs), 'the calls that ran are exactly the oracle\'s', { ran: r.ran, expected: [...oracle.runs] });
@@ -775,9 +885,11 @@ async function runCase(c: Case): Promise<void> {
     check(sameSet(ok, r.ran) && ok.length === r.ran.length, '6: the ok tool_result steps are the calls that ran', ok);
     const hit = forgedTarget(c);
     const forgedToken = hit === null ? -1 : (hit.step === 'later' ? c.later!.calls : c.calls)[hit.index]!.token;
-    const open = c.later !== null ? (laterSuperseded(c) ? [] : c.later.calls.filter((call) => call.tool === 'echo' && call.token !== forgedToken).map((call) => call.token))
+    const open = c.junk !== null ? (c.junk.kind === 'copy' ? [902] : [])
+      : c.later !== null ? (laterSuperseded(c) ? [] : c.later.calls.filter((call) => call.tool === 'echo' && call.token !== forgedToken).map((call) => call.token))
       : superseded(c) ? []
-        : gatedTokens.filter((token) => token !== forgedToken && !c.prior.includes(c.calls.findIndex((call) => call.token === token)));
+        // By call, never by token: an identical duplicate shares its token (round 15).
+        : c.calls.flatMap((call, index) => (call.tool === 'echo' && call.token !== forgedToken && !c.prior.includes(index) ? [call.token] : []));
     check(results.length === open.length, '6: one tool_result step per open gated call', { steps: results.length, open: open.length });
   }
 
@@ -785,9 +897,15 @@ async function runCase(c: Case): Promise<void> {
   await replayShowsEachResultOnce(r.session, '7');
 
   // Repeat resumes, with later decisions in between: nothing runs twice and
-  // no outcome changes.
+  // no outcome changes, and no result entry is written again (round 15).
   const ranBefore = [...r.ran];
-  for (const again of c.again) {
+  const entries = async (): Promise<number> => (await rows(r.session)).reduce((sum, row) => sum + (row.type === 'tool_result' ? ((row.tool_results ?? []) as JsonObject[]).length : 0), 0);
+  let entriesBefore = await entries();
+  for (const [index, again] of c.again.entries()) {
+    // A first resume that failed after its resolution wrote nothing after
+    // it: the repeat that completes it may (a model row that replaces a
+    // host's step); from then on, nothing.
+    if (index === 1 && c.failOnce) entriesBefore = await entries();
     if (again.approveAll) {
       for (const id of approvalIds) await recordApproval(r.session, id, true).catch(() => undefined);
     }
@@ -796,6 +914,7 @@ async function runCase(c: Case): Promise<void> {
     if (next.steps !== null) check(!next.steps.some((step) => step.type === 'tool_result'), '3: a repeat resume answers no call again');
   }
   check(JSON.stringify(r.ran) === JSON.stringify(ranBefore), '3: a call runs at most once across any resume sequence', { before: ranBefore, after: r.ran });
+  if (!c.failOnce || c.again.length > 1) check(await entries() === entriesBefore, '5: a repeat resume writes no result entry', { before: entriesBefore, after: await entries() });
   check(r.freeRan.length === c.calls.filter((call) => call.tool === 'free').length || c.source === 'stored', '3: an ungated call runs once', r.freeRan);
   if (c.source === 'stored') check(r.freeRan.length === 0, 'a stored ungated call with a result never runs', r.freeRan);
   await settledOutcomes(r, c, oracle, '5 (after repeat resumes)');
@@ -814,7 +933,7 @@ async function runCase(c: Case): Promise<void> {
  */
 async function replayShowsEachResultOnce(session: Session, label: string): Promise<void> {
   const stored = await rows(session);
-  const isStep = (row: JsonObject): boolean => row.type === 'assistant' && Array.isArray(row.tool_calls) && row.tool_calls.length > 0;
+  const isStep = isStepRow;
   const segments = (list: JsonObject[], view: boolean): Map<string, number>[] => {
     const out: Map<string, number>[] = [new Map()];
     for (const row of list) {
@@ -846,15 +965,13 @@ async function replayShowsEachResultOnce(session: Session, label: string): Promi
 
 /** Invariants 5 and 6 on the thread rows: every call has exactly one outcome, the oracle's. */
 async function settledOutcomes(r: Rig, _c: Case, oracle: Expected, label: string): Promise<void> {
-  const seen = new Map<number, Set<string>>();
-  for (const [token, result] of await outcomes(r.session)) {
-    if (!seen.has(token)) seen.set(token, new Set());
-    seen.get(token)!.add(result);
-  }
+  // A MULTISET (round 15): every outcome counted, never folded into a set.
+  const seen = new Map<number, string[]>();
+  for (const [token, result] of await outcomes(r.session)) put(seen, token, result);
   for (const [token, want] of oracle.outcome) {
-    const got = [...(seen.get(token) ?? [])];
-    check(got.length === 1, `${label}: every call gets exactly one recorded outcome`, { token, got });
-    check(got[0] === want, `6: the recorded outcome matches what ran`, { token, got: got[0], want });
+    const got = [...(seen.get(token) ?? [])].sort();
+    check(got.length === want.length, `${label}: every call gets exactly one recorded outcome`, { token, got, calls: want.length });
+    check(JSON.stringify(got) === JSON.stringify([...want].sort()), `6: the recorded outcome matches what ran`, { token, got, want });
   }
   check([...seen.keys()].every((token) => oracle.outcome.has(token)), `${label}: no outcome for a call that is not in the step`, [...seen.keys()]);
 }
@@ -893,6 +1010,7 @@ function withoutRequest(c: Case, drop: number): Case | null {
 }
 
 function smaller(c: Case): Case[] {
+  if (c.junk !== null || c.dup !== null) return [{ ...c, junk: null }, ...(c.dup === null ? [] : [{ ...c, dup: null, calls: c.calls.slice(0, c.dup), requests: c.requests.filter((q) => q.call !== c.dup), order: c.order.filter((index) => c.requests[index]!.call !== c.dup).map((index) => index - c.requests.slice(0, index).filter((q) => q.call === c.dup).length), prior: c.prior.filter((index) => index !== c.dup) }])];
   const out: Case[] = [];
   if (c.again.length > (c.failOnce ? 1 : 0)) out.push({ ...c, again: c.again.slice(0, -1) });
   if (c.insert !== null) out.push({ ...c, insert: null });
@@ -1049,5 +1167,18 @@ describe('G-392 property: approval pairing invariants over generated steps', () 
     expect(has((c) => c.source === 'model' && c.initial === 'structured'), 'G-405: a parked structured turn').toBe(true);
     // G-397: stored requests that repeat an APPROVAL id, with an approval recorded.
     expect(has((c) => c.requests.some((q) => q.approval !== undefined) && c.requests.some((q) => q.verdict === 'approve')), 'repeated approval id').toBe(true);
+    // Round 15 (TS run18 F3): IDENTICAL duplicate calls, gated and ungated,
+    // from each source, with a spent budget, and over repeat resumes.
+    for (const tool of ['echo', 'free'] as const) {
+      for (const source of ['model', 'stored'] as const) expect(has((c) => c.dup !== null && c.calls[c.dup]!.tool === tool && c.source === source), `identical ${tool} duplicates (${source})`).toBe(true);
+    }
+    expect(has((c) => c.dup !== null && c.spent), 'identical duplicates on a spent run').toBe(true);
+    expect(has((c) => c.dup !== null && c.calls[c.dup]!.tool === 'echo' && c.again.length > 0 && c.requests.some((q) => q.verdict === 'approve')), 'identical gated duplicates over repeat resumes').toBe(true);
+    // G-408 and #92: every junk shape, with and without the old requests,
+    // after an approve; and on a spent run.
+    for (const kind of JUNK_KINDS) {
+      for (const requests of [true, false]) expect(has((c) => c.junk?.kind === kind && c.junk.requests === requests && c.requests.some((q) => q.verdict === 'approve')), `junk ${kind} requests ${String(requests)} after an approve`).toBe(true);
+    }
+    expect(has((c) => c.junk !== null && c.junk.requests && c.spent && c.requests.some((q) => q.verdict === 'approve')), 'junk with the old requests on a spent run after an approve').toBe(true);
   });
 });
