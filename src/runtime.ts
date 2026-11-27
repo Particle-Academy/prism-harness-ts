@@ -2,6 +2,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { validateAgent } from './address.js';
 import type { JsonObject, JsonValue } from './json.js';
+import { recordingInRun } from './thread.js';
 import {
   assistantRow,
   approvalToolScope, approvalRunSteps, pausedRunState, turnDecisions,
@@ -1166,7 +1167,9 @@ export class AgentRuntime {
           ? new HarnessError(PLAN_BUDGET_EXHAUSTED, 'This plan step may not proceed (plan_budget_exhausted): the shared plan budget has nothing left for it.')
           : HarnessError.runNotPermitted('This run may not start: its step budget has nothing left (its own ceiling, its run tree or a cost budget is spent).');
       }
-      if (scope !== null) {
+      // A new message supersedes the paused step (below): its approved scope
+      // does not narrow the new turn's tools.
+      if (scope !== null && !(started === null && prompt !== '')) {
         if (scope.legacy) console.warn('Pending approval has no valid stored tool scope; offering approved requests only.');
         offered = offered.filter(tool => scope.names.includes(tool.name)
           && (mode.tools.includes('*') || mode.tools.includes(tool.name) || planApprovalGate(tool) !== null));
@@ -1180,9 +1183,10 @@ export class AgentRuntime {
       // depth and on the budget of the context the host wired its tool with.
       const turn = run;
       return await activeTurns.run({ sessionKey: session.key(), runId, run: turn }, async () => {
-        // Decisions recorded since the run stopped are acted on FIRST, before a
-        // new prompt is recorded, so the results land after the calls they answer
-        // rather than after the new turn. Never in a run tree that was
+        // A RESUME (an empty prompt) acts on the decisions recorded since the
+        // run stopped, before any model call, so the results land after the
+        // calls they answer. A new prompt supersedes the step instead
+        // (DECISION B, below). Never in a run tree that was
         // cancelled, nor under a context whose time is spent: an approved
         // call does not run after its tree was stopped or its time ran out
         // (the loop then stops the run before any model step), and the
@@ -1195,7 +1199,13 @@ export class AgentRuntime {
         // pending call is recorded as not run, in the same write as the task.
         const outOfTime = turn.budget.maxSeconds !== null && turn.ledger.elapsedSeconds() >= turn.budget.maxSeconds;
         const ended = started !== null ? await this.#endApprovals(session, mode, runId, steps) : null;
-        if (started === null && !turn.ledger.cancelled && !outOfTime) offered = await this.#resolveApprovals(session, mode, offered, runId, called, scope?.legacy === true, steps, stepping?.locked === true);
+        // A NEW message supersedes the paused step (DECISION B, G-387 round
+        // 13, as the PHP reference does): each of its open calls is denied
+        // first, whatever was decided on it, so nothing from it runs and no
+        // later decision is accepted for it. Only a resume (an empty prompt)
+        // acts on recorded decisions.
+        if (started === null && prompt !== '') await thread.supersedePausedStep();
+        else if (started === null && !turn.ledger.cancelled && !outOfTime) offered = await this.#resolveApprovals(session, mode, offered, runId, called, scope?.legacy === true, steps, stepping?.locked === true);
 
         if (prompt !== '') {
           // With attachments, the shape prism-ts's UserMessage.toObject() writes:
@@ -1206,7 +1216,7 @@ export class AgentRuntime {
               ? { type: 'user', content: prompt }
               : { type: 'user', content: prompt, additional_content: [...attachments, { text: prompt }], additional_attributes: {} };
 
-          await thread.record([...(ended?.rows ?? []), message], runId);
+          await recordingInRun(runId, () => thread.record([...(ended?.rows ?? []), message], runId));
           // Recorded the moment its row is (round 11), before any event: a
           // listener that throws or re-enters never sees a recorded task as
           // unrecorded, and a start whose task row exists is never undone.
@@ -1434,7 +1444,7 @@ export class AgentRuntime {
           if (refs?.planLedger != null) row.harness_plan_ledger = { ...refs.planLedger };
         }
       }
-      await thread.record([row], runId);
+      await recordingInRun(runId, () => thread.record([row], runId));
 
       if (failedFinish !== null) {
         // The code travels; nothing the provider said does.
@@ -1442,8 +1452,8 @@ export class AgentRuntime {
         // Complete the transcript with refusals, never approval requests, so a
         // later resume cannot dispatch calls from this failed response.
         if (toolCalls.length > 0) {
-          await thread.record([toolResultRow(toolCalls.map(call =>
-            toolResultEntry(call, `Not run: model step failed (${failedFinish}).`)))], runId);
+          await recordingInRun(runId, () => thread.record([toolResultRow(toolCalls.map(call =>
+            toolResultEntry(call, `Not run: model step failed (${failedFinish}).`)))], runId));
         }
         throw HarnessError.modelStepFailed(failedFinish);
       }
@@ -1500,7 +1510,7 @@ export class AgentRuntime {
       }
 
       if (results.length > 0) {
-        await thread.record([toolResultRow(results)], runId);
+        await recordingInRun(runId, () => thread.record([toolResultRow(results)], runId));
       }
 
       // After the results, as core yields them: the calls that ran, then the
@@ -1655,7 +1665,7 @@ export class AgentRuntime {
         }
       }
 
-      await live.thread().record([toolResultRow([...work.results.values(), ...resolved], [...work.decisions.values()])], runId);
+      await recordingInRun(runId, () => live.thread().record([toolResultRow([...work.results.values(), ...resolved], [...work.decisions.values()])], runId));
       return bounded;
     };
 

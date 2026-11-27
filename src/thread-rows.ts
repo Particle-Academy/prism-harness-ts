@@ -338,6 +338,84 @@ export function endedByStartRow(calls: readonly ToolCallInput[], approvalIds: re
 }
 
 /**
+ * The key of the mark on the row that denies a superseded step's calls
+ * (DECISION B, G-387 round 13): `{approval_ids: [...]}`, the approvals of the
+ * denied calls in call order, the LAST key of the row, as the ended mark is.
+ * Only the harness writes it (Thread.record()). The PHP reference's key.
+ *
+ * @internal
+ */
+export const SUPERSEDED_KEY = 'harness_superseded';
+
+/** The result each open call of a superseded step is given; the same in every language (DECISION B). @internal */
+export const SUPERSEDED_RESULT = 'Not run: a later step replaced it.';
+
+/**
+ * Whether `message` supersedes the paused step (DECISION B, refined): any
+ * assistant row WITH tool calls, always; an assistant text row or a user row
+ * only when it is recorded OUTSIDE the run that owns the step.
+ *
+ * @internal
+ */
+export function supersedes(message: JsonObject, outside: boolean): boolean {
+  if (message.type === 'assistant' && list(message.tool_calls).length > 0) return true;
+
+  return outside && (message.type === 'assistant' || message.type === 'user');
+}
+
+/**
+ * The row that denies the paused step's open calls when it is superseded
+ * (DECISION B), or null when nothing is paused or nothing of it is open.
+ * `alsoResults` are result rows about to be recorded before the superseding
+ * row (in the same batch). A call is open when no result is paired with it
+ * by position: a call that ran has one, so the rest were waiting on a person.
+ * Each open call gets ONE result, SUPERSEDED_RESULT, in call order; the row
+ * is marked with the approvals they were asked under.
+ *
+ * @internal Written by Thread.record(); the harness-approval-pairing corpus pins it.
+ */
+export function supersededRow(rows: readonly JsonObject[], alsoResults: readonly JsonObject[] = []): (ToolResultRow & { harness_superseded: { approval_ids: string[] } }) | null {
+  const step = pausedStepIndex(rows);
+  if (step === null) return null;
+  const calls = list(rows[step]!.tool_calls);
+  if (calls.length === 0) return null;
+  const answered = stepResultsByPosition([...rows, ...alsoResults], step);
+  const open = calls.map((_call, position) => position).filter((position) => !answered[position]);
+  if (open.length === 0) return null;
+  const paired = pairStepApprovals(calls, list(rows[step]!.tool_approval_requests), (_call, position) => !answered[position]).approvalIds;
+  const approvals: string[] = [];
+  for (const position of open) {
+    const id = paired[position];
+    if (typeof id === 'string' && !approvals.includes(id)) approvals.push(id);
+  }
+
+  return {
+    ...toolResultRow(open.map((position) => {
+      const call = calls[position]!;
+      return {
+        tool_call_id: text(call.id),
+        tool_name: text(call.name),
+        args: usableArguments(call.arguments) ?? {},
+        result: SUPERSEDED_RESULT,
+        tool_call_result_id: nullableText(call.result_id),
+        artifacts: [],
+      };
+    })),
+    [SUPERSEDED_KEY]: { approval_ids: approvals },
+  };
+}
+
+/**
+ * The approval ids a later step superseded with their call open (DECISION
+ * B): read by the same rule as endedByStart(), from the harness's own mark.
+ *
+ * @internal
+ */
+export function supersededApprovals(rows: readonly JsonObject[]): Set<string> {
+  return markedApprovals(rows, SUPERSEDED_KEY);
+}
+
+/**
  * The approval ids whose call a runner start's task row ended as not run
  * (G-387 round 10): their decision, if any, was never acted on, so it reads
  * as ended, never as approved.
@@ -357,6 +435,11 @@ export function endedByStartRow(calls: readonly ToolCallInput[], approvalIds: re
  * @internal
  */
 export function endedByStart(rows: readonly JsonObject[]): Set<string> {
+  return markedApprovals(rows, ENDED_BY_START_KEY);
+}
+
+/** The approvals a harness mark under `key` names, each within its own request's turn (the endedByStart() rule). */
+function markedApprovals(rows: readonly JsonObject[], key: string): Set<string> {
   const requests = new Map<string, number>();
   for (const [index, row] of rows.entries()) {
     if (row.type !== 'assistant') continue;
@@ -369,7 +452,7 @@ export function endedByStart(rows: readonly JsonObject[]): Set<string> {
     for (const row of rows.slice(index + 1)) {
       if (row.type === 'assistant') break;
       if (row.type !== 'tool_result') continue;
-      const mark = row[ENDED_BY_START_KEY];
+      const mark = row[key];
       if (isObject(mark) && Array.isArray(mark.approval_ids) && mark.approval_ids.includes(approval)) {
         ended.add(approval);
         break;
@@ -672,7 +755,7 @@ export function repeatedStepSettled(rows: readonly JsonObject[], index: number):
   for (const row of rows.slice(index + 1)) {
     if (row.type !== 'tool_result') continue;
     const entries = list(row.tool_results);
-    if (isObject(row[ENDED_BY_START_KEY]) || entries.some((entry) => entry[NOT_RUN_KEY] === REPEATED_CALL_ID)) return true;
+    if (isObject(row[ENDED_BY_START_KEY]) || isObject(row[SUPERSEDED_KEY]) || entries.some((entry) => entry[NOT_RUN_KEY] === REPEATED_CALL_ID)) return true;
     const here = new Map<string, number>();
     for (const entry of entries) here.set(text(entry.tool_call_id), (here.get(text(entry.tool_call_id)) ?? 0) + 1);
     for (const [id, count] of here) counts.set(id, Math.max(counts.get(id) ?? 0, count));

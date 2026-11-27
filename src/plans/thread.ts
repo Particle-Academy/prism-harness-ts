@@ -1,5 +1,5 @@
 import type { JsonObject, JsonValue } from '../json.js';
-import { endedByStart, pairStepApprovals, pausedStepIndex, pendingApprovalIds, repeatedIdDenials, stepResultsByPosition } from '../thread-rows.js';
+import { endedByStart, pairStepApprovals, pausedStepIndex, pendingApprovalIds, repeatedIdDenials, stepResultsByPosition, supersededApprovals } from '../thread-rows.js';
 import { argsDigest } from '../tool-policy.js';
 import type { PendingCall } from './machine.js';
 
@@ -55,7 +55,8 @@ export function approvalDecisions(rows: readonly JsonObject[]): Map<string, bool
   const decided = new Map<string, boolean>();
   // Calls denied because their step repeats a call id (G-392) were never
   // acted on either: never approved work.
-  const ended = new Set([...endedByStart(rows), ...repeatedIdDenials(rows)]);
+  // Superseded by a later step with the call open (DECISION B): never acted on.
+  const ended = new Set([...endedByStart(rows), ...repeatedIdDenials(rows), ...supersededApprovals(rows)]);
   for (const row of rows) {
     if (row.type !== 'tool_result') continue;
     for (const response of list(row.tool_approval_responses)) {

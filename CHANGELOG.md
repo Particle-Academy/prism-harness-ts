@@ -38,6 +38,16 @@
   follows it). A row recorded after the park can no longer make one of them
   read another step: a decision on a step a later assistant or user row
   superseded is refused on every path, and the resume acts on nothing of it.
+- A parked step is superseded by any later assistant row with tool calls,
+  or by an assistant text row or user row recorded outside the run that owns
+  it (a host's `thread().record()`, whatever run id it passes, or a new
+  message). Each of its calls that has no result then gets ONE result, `Not
+  run: a later step replaced it.`, in a row the harness writes before the
+  superseding row and marks `harness_superseded: {approval_ids}`. Nothing
+  from the step runs, whatever was decided on it, and a later decision is
+  refused. **Behaviour change:** a new message no longer acts on approvals
+  recorded for the paused step first; resume with an empty prompt to act on
+  them. The same in every language (harness-approval-pairing apr-0016..0019).
 - A step's results are read from every result row after it, up to the next
   assistant row, so a row of another kind between them (a system row, an
   empty result row, a host's own row) can no longer hide a call's result and

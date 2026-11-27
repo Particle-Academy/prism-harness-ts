@@ -1,5 +1,7 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import type { JsonObject, JsonValue } from './json.js';
 import { isJsonObject } from './json.js';
+import { pausedStepIndex, supersededRow, supersedes } from './thread-rows.js';
 import { HarnessError } from './errors.js';
 import type { AppendLogStore, SessionStore } from './stores/session-store.js';
 import { supportsAppendLog } from './stores/session-store.js';
@@ -76,16 +78,20 @@ export class Thread {
    *
    * Read-and-write inside ONE lock. See the class docblock.
    */
-  async record(messages: readonly JsonObject[], runId: string | null = null): Promise<ThreadMessage[]> {
+  async record(messages: readonly JsonObject[], runId: string | null = null, denialsOnly = false): Promise<ThreadMessage[]> {
     if (messages.length === 0) return [];
 
     const store = this.store;
+    // Inside the run that owns a step is only what the RUNTIME records for
+    // that run (recordingInRun): a run id a caller passes here proves nothing.
+    const inRun = recording.getStore() === runId ? runId : null;
 
     if (supportsAppendLog(store)) {
       return store.withLock(this.key, async () => {
         const length = (await store.logLength(this.key)) ?? (await this.#migrate(store));
-        const appended = this.#entries(messages, length, runId);
-        await store.appendLog(this.key, appended);
+        const existing = ((await store.readLog(this.key)) ?? []).map((entry) => this.#toMessage(entry));
+        const appended = this.#entries(planned(existing, messages, inRun, denialsOnly), length, runId);
+        if (appended.length > 0) await store.appendLog(this.key, appended);
 
         return appended.map((entry) => this.#toMessage(entry));
       });
@@ -95,7 +101,8 @@ export class Thread {
       const stored = (await store.get(this.key)) ?? {};
       const existing = Array.isArray(stored.messages) ? stored.messages.filter(isJsonObject) : [];
 
-      const appended = this.#entries(messages, existing.length, runId);
+      const appended = this.#entries(planned(existing.map((entry) => this.#toMessage(entry)), messages, inRun, denialsOnly), existing.length, runId);
+      if (appended.length === 0) return [];
 
       await store.put(this.key, {
         ...stored,
@@ -104,6 +111,18 @@ export class Thread {
 
       return appended.map((entry) => this.#toMessage(entry));
     });
+  }
+
+  /**
+   * Supersede the paused step now (DECISION B): ONE denial for each of its
+   * open calls, in a row of its own recorded outside any run. What a new
+   * message does before its turn: nothing from the step runs, whatever was
+   * decided on it, and no decision is accepted for it afterwards.
+   *
+   * @internal Called by the runtime when a new message starts a turn.
+   */
+  async supersedePausedStep(): Promise<void> {
+    await this.record([{ type: 'user', content: '' }], null, true);
   }
 
   /**
@@ -169,4 +188,41 @@ export class Thread {
       recordedAt: typeof entry.recorded_at === 'string' ? entry.recorded_at : '',
     };
   }
+}
+
+/** The run the runtime is recording rows for, set only around its own record() calls (DECISION B). */
+const recording = new AsyncLocalStorage<string>();
+
+/**
+ * Record rows as the harness's own, inside `runId` (DECISION B): the only way
+ * a row counts as written inside the run that owns a paused step.
+ *
+ * @internal Called by the runtime around its own record() calls.
+ */
+export function recordingInRun<T>(runId: string, record: () => T): T {
+  return recording.run(runId, record);
+}
+
+/**
+ * The rows to append: `messages`, with the paused step's denials before the
+ * first row that supersedes it (DECISION B), or only those denials
+ * (`denialsOnly`, a new message superseding the step before its turn).
+ * Superseded by any later assistant row with tool calls; or a later
+ * assistant text row or user row recorded outside the run that owns the
+ * step (its run id null, another run, or a run id the caller merely passed).
+ */
+function planned(existing: readonly ThreadMessage[], messages: readonly JsonObject[], inRun: string | null, denialsOnly: boolean): JsonObject[] {
+  const rows = existing.map((entry) => entry.message);
+  // The paused step, by the one selector (G-397), and the run that owns it.
+  const step = pausedStepIndex(rows);
+  const owner = step === null ? null : existing[step]!.runId;
+  const outside = denialsOnly || inRun === null || owner === null || inRun !== owner;
+  const at = messages.findIndex((message) => supersedes(message, outside));
+  if (at === -1) return denialsOnly ? [] : [...messages];
+  const before = messages.slice(0, at).filter((message) => message.type === 'tool_result');
+  const denial = supersededRow(rows, before);
+  if (denialsOnly) return denial === null ? [] : [denial as unknown as JsonObject];
+  if (denial === null) return [...messages];
+
+  return [...messages.slice(0, at), denial as unknown as JsonObject, ...messages.slice(at)];
 }

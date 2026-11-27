@@ -344,7 +344,11 @@ decision recorded on a step whose calls repeat a tool call id is recorded
 as a denial ("another call in this step has the same id"): none of that
 step's gated calls runs, so the thread never says one was approved, and a
 call's result is matched to it by its position in the step, never by its
-id. A decision applies only to the step whose approvals were requested, taken
+id. A paused step that a later step replaces (any later assistant row with tool
+calls, or an assistant or user row recorded outside its run, a new message
+included) gives each call still waiting ONE result, "Not run: a later step
+replaced it.", and nothing from it runs: to act on recorded decisions, resume
+with an empty prompt before sending a new message. A decision applies only to the step whose approvals were requested, taken
 by one selector everywhere (the last assistant row, unless a user row follows
 it); and that step's results are read from every result row after it, up to
 the next assistant row, so no other row can hide one. A start that completed is never undone by its own cleanup: a store
