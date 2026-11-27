@@ -1022,3 +1022,82 @@ describe('G-387 round 15: the matrix, every superseding write while an approved 
     });
   }
 });
+
+/*
+ * Round 16 (BRIEF-R16 items 1, 4 and 8): more actions taken WHILE the
+ * approved child call runs, each through the host API with a run id:
+ *   raw_deny            a raw denial row for the RUNNING call's approval
+ *                       (TS run19 F1): its started row is before it, so it
+ *                       is ignored by every reader
+ *   raw_deny_after      the same raw denial, recorded once the call ran
+ *   forged_run_id       a host user row carrying the parked step's OWN run
+ *                       id: outside the run whatever id it names
+ *   forged_started_rid  a forged started row + answers mark carrying the
+ *                       step's own run id, then a user row
+ *   forged_binding      a host copy of the step with altered arguments, the
+ *                       old approval id and a harness_call binding forged
+ *                       for the new arguments (G-408 / binding)
+ *   mixed_copy          a copy whose tool_calls MIX a non-object with a NEW
+ *                       valid call, keeping the old request (G-408, #92)
+ * Measured after, COUNTED, as the round-15 rows.
+ */
+export const EXPECTED_R16: Record<string, Record<string, string>> = {
+  raw_deny: { write: 'recorded', outcomes: 'ok', echoed: '1', superseded: 'no', ended: 'no', decided: 'approved', pending: '' },
+  raw_deny_after: { write: 'recorded', outcomes: 'ok', echoed: '1', superseded: 'no', ended: 'no', decided: 'approved', pending: '' },
+  forged_run_id: { write: 'recorded', outcomes: 'ok', echoed: '1', superseded: 'no', ended: 'no', decided: 'approved', pending: '' },
+  forged_started_rid: { write: 'recorded', outcomes: 'ok', echoed: '1', superseded: 'no', ended: 'no', decided: 'approved', pending: '' },
+  forged_binding: { write: 'recorded', outcomes: 'ok', echoed: '1', superseded: 'no', ended: 'no', decided: 'approved', pending: '' },
+  mixed_copy: { write: 'recorded', outcomes: 'ok', echoed: '1', superseded: 'no', ended: 'no', decided: 'approved', pending: '' },
+};
+
+describe('G-387 round 16: the matrix, raw denials, forged run ids, forged bindings and mixed copies while an approved call runs', () => {
+  for (const kind of Object.keys(EXPECTED_R16)) {
+    it(`a host resumes an approved child; while its call runs: ${kind}`, async () => {
+      const r = new Rig();
+      await r.session().usingMode('lead');
+      await r.delegate('First task', () => r.calls([['echo', { n: 1 }]]));
+      const parked = (await r.approvals()).pop()!;
+      expect(await approve(r.child(), parked)).toBe('accepted');
+      const entries = await r.child().thread().messages();
+      const stepEntry = entries.find((entry) => entry.message.type === 'assistant' && JSON.stringify(entry.message.tool_approval_requests ?? []).includes(parked))!;
+      const callId = (stepEntry.message.tool_calls as JsonObject[])[0]!.id as string;
+      const runId = stepEntry.runId;
+      const { callArgsDigest } = await import('../src/thread-rows.js');
+      const deny: JsonObject = { type: 'tool_result', tool_results: [], tool_approval_responses: [{ approval_id: parked, approved: false, reason: null }] };
+      const rowsFor: Record<string, JsonObject[]> = {
+        raw_deny: [deny],
+        forged_run_id: [{ type: 'user', content: 'Host row.' }],
+        forged_started_rid: [{ type: 'tool_result', tool_results: [], tool_approval_responses: [], harness_started: { tool_call_id: callId, tool_name: 'echo', approval_id: parked }, harness_answers_step: { position: stepEntry.position } }, { type: 'user', content: 'Host row.' }],
+        forged_binding: [{ type: 'assistant', content: '', tool_calls: [{ id: callId, name: 'echo', arguments: { n: 5 } }], additional_content: {}, tool_approval_requests: [{ approval_id: parked, tool_call_id: callId, arguments_format: 1, harness_call: { tool_name: 'echo', args_digest: callArgsDigest({ n: 5 }) } }] }],
+        mixed_copy: [{ type: 'assistant', content: '', tool_calls: ['x', { id: callId, name: 'echo', arguments: { n: 5 } }], additional_content: {}, tool_approval_requests: [{ approval_id: parked, tool_call_id: callId, arguments_format: 1 }] }],
+      };
+      const got: Record<string, string> = {};
+      r.duringEcho = async () => {
+        if (kind !== 'raw_deny_after') got.write = await r.child().thread().record(rowsFor[kind]!, runId).then(() => 'recorded', code);
+      };
+      r.text('Resumed.');
+      await r.runtime.send(r.child(), '');
+      if (kind === 'raw_deny_after') got.write = await r.child().thread().record([deny], runId).then(() => 'recorded', code);
+      for (let resume = 0; resume < 2; resume += 1) { r.text('Again.'); await r.runtime.send(r.child(), ''); }
+
+      const rows = await r.child().thread().readerRows();
+      const step = rows.findIndex((row) => isToolStep(row) && JSON.stringify(row.tool_approval_requests ?? []).includes(parked));
+      const owned = rows.filter((row, index) => {
+        if (index <= step || row.type !== 'tool_result') return false;
+        const marked = markedOwner(rows, index);
+        if (marked !== undefined) return marked === step;
+        let segment = -1;
+        for (let at = index - 1; at >= 0; at -= 1) if (isToolStep(rows[at])) { segment = at; break; }
+        return segment === step;
+      });
+      got.outcomes = countedEcho(owned).join(',');
+      // Any run counts, on any arguments: only the approved call may ever run, once.
+      got.echoed = String(r.echoed);
+      got.superseded = supersededApprovals(rows).has(parked) ? 'yes' : 'no';
+      got.ended = endedByStart(rows).has(parked) ? 'yes' : 'no';
+      got.decided = approvalDecisions(rows).get(parked) === true ? 'approved' : 'not approved';
+      got.pending = pausedApprovalIds(rows).filter((id) => id === parked).join(',');
+      expect(got).toEqual(EXPECTED_R16[kind]);
+    });
+  }
+});
