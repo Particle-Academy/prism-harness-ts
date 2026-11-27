@@ -609,6 +609,8 @@ interface Rig {
   /** Token of every gated call that ran, in order, across the whole case. */
   ran: number[];
   freeRan: number[];
+  /** Every request the fake model received, across the whole case. */
+  modelCalls: () => number;
 }
 
 function rig(c: Case): Rig {
@@ -624,7 +626,9 @@ function rig(c: Case): Rig {
     .register({ name: 'free', handle: (args: JsonObject) => { freeRan.push(Number(args.n)); return `free:${String(args.n)}`; } });
   let served = c.source === 'stored';
   let failing = c.failOnce;
+  let calls = 0;
   const client = async (request: LlmRequest): Promise<LlmResponse> => {
+    calls += 1;
     if (!served) {
       served = true;
       return { text: '', finishReason: 'tool_calls', toolCalls: c.calls.map((call) => ({ id: call.id, name: call.tool, arguments: { n: call.token } })) };
@@ -638,7 +642,7 @@ function rig(c: Case): Rig {
       : { text: '{"ok":true}', finishReason: 'stop', structured: { ok: true } };
   };
 
-  return { session, agent: new AgentRuntime({ client, modes: c.spent ? spentModes : modes, tools }), ran, freeRan };
+  return { session, agent: new AgentRuntime({ client, modes: c.spent ? spentModes : modes, tools }), ran, freeRan, modelCalls: () => calls };
 }
 
 async function drain(stream: AsyncGenerator<RunStep, AgentResponse, undefined>): Promise<{ steps: RunStep[]; response: AgentResponse }> {
@@ -879,11 +883,14 @@ async function runCase(c: Case): Promise<void> {
       .map((entry, index) => ({ key: `k${index}`, id: String(entry.id), name: 'echo', args: entry.arguments as JsonObject })) });
     oldSuperseded = true;
   }
+  let callsAtTurn = 0;
   const plan = actions(c);
   for (const [at, action] of plan.entries()) {
     if (action === 'insert') {
       const row = insertedRow(c);
       await r.session.thread().record([row]);
+      // A user row begins a new turn, with a step budget of its own.
+      if (row.type === 'user') callsAtTurn = r.modelCalls();
       if (c.insert!.kind === 'assistant_call') recorded.push({ calls: (row.tool_calls as JsonObject[]).map((call) => ({ key: 'x0', id: String(call.id), name: 'free', args: { n: 900 } })) });
       if (supersedes) {
         if (laterRecorded) newSuperseded = true;
@@ -976,17 +983,21 @@ async function runCase(c: Case): Promise<void> {
   await replayKeepsEveryResult(r.session, '6');
 
   // Repeat resumes, with later decisions in between: nothing runs twice and
-  // no outcome changes.
+  // no outcome changes. And the turn's step budget holds across them: no
+  // empty resume reopens it (counted from the turn's last user row).
+  const maxSteps = c.spent ? 1 : 6;
   const ranBefore = [...r.ran];
   for (const again of c.again) {
     if (again.approveAll) {
       for (const id of approvalIds) await recordApproval(r.session, id, true).catch(() => undefined);
     }
     const next = await turn(r, again.path, '');
+    check(next.response.steps <= maxSteps, 'the step budget: an empty resume never takes the turn past max_steps', { steps: next.response.steps, maxSteps });
     check(next.response.toolCalls.filter((name) => name === 'echo').length === 0, '3/6: a repeat resume reports no run', next.response.toolCalls);
     if (next.steps !== null) check(!next.steps.some((step) => step.type === 'tool_result'), '3: a repeat resume answers no call again');
   }
   check(JSON.stringify(r.ran) === JSON.stringify(ranBefore), '3: a call runs at most once across any resume sequence', { before: ranBefore, after: r.ran });
+  check(r.modelCalls() - callsAtTurn <= maxSteps, 'the step budget: model calls in a turn never exceed max_steps, across any number of empty resumes', { calls: r.modelCalls() - callsAtTurn, maxSteps });
   check(r.freeRan.length === c.calls.filter((call) => call.tool === 'free').length || c.source === 'stored', '3: an ungated call runs once', r.freeRan);
   if (c.source === 'stored') check(r.freeRan.length === 0, 'a stored ungated call with a result never runs', r.freeRan);
   await settledOutcomes(r, recorded, oracle, '5 (after repeat resumes)');
