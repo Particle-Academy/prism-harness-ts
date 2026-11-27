@@ -134,3 +134,51 @@ describe('G-408: an assistant row whose tool_calls hold no objects is not a tool
     expect(await outcomes(r.session)).toEqual(['ran:1']);
   });
 });
+
+describe('G-408: a parked step the runtime recorded, then a host row, then resumes', () => {
+  /** The runtime parks on its own step; the person approves; then `after` runs; then three resumes. */
+  async function parkApprove(options: { maxSteps: number; failAfter: boolean }, after: (session: Session) => Promise<void>): Promise<{ ran: number[]; got: string[] }> {
+    const harness = new PrismHarness({
+      drivers: { memory: () => new MemorySessionStore(), durable: () => new DurableMemory() },
+      stores: { ephemeral: 'memory', durable: 'durable' },
+    });
+    const session = harness.for({ type: 'User', id: 1 }).session('runtime-park');
+    const ran: number[] = [];
+    let model = 0;
+    const agent = new AgentRuntime({
+      modes: new ModeRegistry({ default: 'guarded', modes: { guarded: { system_prompt: 'Careful.', tools: ['echo'], max_steps: options.maxSteps, requires_approval: ['echo'] } } }),
+      tools: new ToolRegistry().register({ name: 'echo', handle: (args: JsonObject) => { ran.push(Number(args.n)); return `ran:${String(args.n)}`; } }),
+      client: async (): Promise<LlmResponse> => {
+        model += 1;
+        if (model === 1) return { text: '', finishReason: 'tool_calls', toolCalls: [{ id: 'c1', name: 'echo', arguments: { n: 1 } }] };
+        if (options.failAfter) throw new Error('The provider is down (scripted).');
+        return { text: 'done', finishReason: 'stop' };
+      },
+    });
+    const [pending] = (await agent.send(session, 'go')).pendingApprovals;
+    await recordApproval(session, pending!.id, true);
+    await after(session);
+    for (let i = 0; i < 3; i += 1) await agent.send(session, '').catch(() => undefined);
+    return { ran, got: await outcomes(session) };
+  }
+
+  const plain = async (session: Session): Promise<void> => { await session.thread().record([{ type: 'assistant', content: 'A note from the app.' }]); };
+  const copy = async (session: Session): Promise<void> => {
+    const parked = (await session.thread().messages()).map((entry) => entry.message).find((row) => row.type === 'assistant')!;
+    await session.thread().record([{ ...parked, tool_calls: ['x'] }]);
+  };
+
+  for (const [label, options] of [['the run\'s steps spent', { maxSteps: 1, failAfter: false }], ['the model failing after each resolution', { maxSteps: 6, failAfter: true }]] as [string, { maxSteps: number; failAfter: boolean }][]) {
+    it(`a plain assistant row between the approval and the resume, ${label}: the call is replaced once and never runs`, async () => {
+      expect(await parkApprove(options, plain)).toEqual({ ran: [], got: [REPLACED] });
+    });
+
+    it(`a copy of the parked step with non-object tool_calls that keeps its request, ${label}: the call is replaced once and never runs`, async () => {
+      expect(await parkApprove(options, copy)).toEqual({ ran: [], got: [REPLACED] });
+    });
+
+    it(`no row in between, ${label}: the approved call runs once and keeps its one outcome`, async () => {
+      expect(await parkApprove(options, async () => {})).toEqual({ ran: [1], got: ['ran:1'] });
+    });
+  }
+});
