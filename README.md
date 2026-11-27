@@ -351,7 +351,12 @@ later step replaced it", and nothing from it runs: to act on recorded decisions,
 with an empty prompt before sending a new message. A decision applies only to the step whose approvals were requested, taken
 by one selector everywhere (the last assistant row, unless a user row follows
 it); and that step's results are read from every result row after it, up to
-the next assistant row, so no other row can hide one. A start that completed is never undone by its own cleanup: a store
+the next assistant row, so no other row can hide one. A result counts
+only for the calls of the step whose rows it sits in, matched by exact
+arguments, then id and tool name, then id: one stored after a later step
+answers that later step's call (or nothing), never an earlier step's, so a
+result whose stored arguments happen to equal an earlier same-id call's
+cannot make an approved call run again. A start that completed is never undone by its own cleanup: a store
 read that fails after its task row only ends its own view. A decision a person recorded that a resume
 could still act on refuses the start, as an approval waiting on a person
 does, so a re-delegation never ends a call a person decided. While its
