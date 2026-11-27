@@ -11,7 +11,7 @@ import {
   type LlmResponse,
   type Session,
 } from '../src/index.js';
-import { ARGUMENTS_AS_SENT } from '../src/thread-rows.js';
+import { ARGUMENTS_AS_SENT, toolResultRow } from '../src/thread-rows.js';
 
 // G-408: one rule decides which rows are tool-call steps, for every reader:
 // an assistant row with at least one tool call that is an object. A row whose
@@ -48,7 +48,7 @@ function spent(): Rig {
   const ran: number[] = [];
   const agent = new AgentRuntime({
     modes: new ModeRegistry({ default: 'guarded', modes: { guarded: { system_prompt: 'Careful.', tools: ['echo', 'free'], max_steps: 1, requires_approval: ['echo'] } } }),
-    tools: new ToolRegistry().register({ name: 'echo', handle: (args: JsonObject) => { ran.push(Number(args.n)); return `ran:${String(args.n)}`; } }).register({ name: 'free', handle: () => 'free' }),
+    tools: new ToolRegistry().register({ name: 'echo', handle: (args: JsonObject) => { ran.push(Number(args.n)); return `ran:${String(args.n)}`; } }).register({ name: 'free', handle: (args: JsonObject) => { ran.push(Number(args.n)); return 'free'; } }),
     client: async (): Promise<LlmResponse> => ({ text: 'done', finishReason: 'stop' }),
   });
   return { session: harness.for({ type: 'User', id: 1 }).session('non-object'), agent, ran };
@@ -106,6 +106,23 @@ describe('G-408: an assistant row whose tool_calls hold no objects is not a tool
       });
     }
   }
+
+  it('a host copy of the parked step that mixes non-objects with a NEW call and keeps the approval request: the request asks for nothing, so the approval never runs the new call', async () => {
+    const r = spent();
+    await r.session.thread().record([{ type: 'user', content: 'go' }, parkedStep], 'run_x');
+    await recordApproval(r.session, 'apr_s', true);
+    await r.session.thread().record([{
+      type: 'assistant', content: '', additional_content: {}, harness_tool_names: ['echo', 'free'],
+      tool_calls: ['x', { id: 'c1', name: 'free', arguments: { n: 9 }, result_id: null, reasoning_id: null, reasoning_summary: null }, null],
+      tool_approval_requests: [{ approval_id: 'apr_s', tool_call_id: 'c1', arguments_format: ARGUMENTS_AS_SENT }],
+    }]);
+    // The approval again, written straight to the thread after the copy.
+    await r.session.thread().record([toolResultRow([], [{ approval_id: 'apr_s', approved: true, reason: null }])]);
+    for (let i = 0; i < 3; i += 1) await r.agent.send(r.session, '').catch(() => undefined);
+
+    expect(r.ran).toEqual([]);
+    expect(await outcomes(r.session)).toEqual([REPLACED]);
+  });
 
   it('a parked step whose tool_calls mix an object call with non-objects is a step: its object call is decided, once', async () => {
     const r = spent();
