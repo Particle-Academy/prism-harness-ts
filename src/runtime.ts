@@ -14,6 +14,8 @@ import {
   type ToolResultRow,
   unusableStoredCalls,
   ambiguousCalls,
+  repeatsCallIds,
+  REPEATED_CALL_ID_RESULT,
   ARGUMENTS_AS_SENT,
 } from './thread-rows.js';
 import { usableArguments } from './tool-arguments.js';
@@ -840,7 +842,13 @@ export class AgentRuntime {
         const approvalId = work.approvalIds.get(call.id);
         const decision = approvalId === undefined ? undefined : work.decisions.get(approvalId);
 
-        if (decision?.approved === true && work.unusable.has(call.id)) {
+        if (work.repeated) {
+          // The step repeats a call id, so no decision can be told apart from
+          // another (G-392): none of its gated calls runs, whatever was decided.
+          const entry = toolResultEntry(input, REPEATED_CALL_ID_RESULT);
+          steps?.toolResult(call.id, entry.result, { ok: false, code: 'approval_denied', refused: true });
+          resolved.push(entry);
+        } else if (decision?.approved === true && work.unusable.has(call.id)) {
           const entry = toolResultEntry(input, `Not run: the arguments for ${call.name} are not a JSON object.`);
           steps?.toolResult(call.id, entry.result, { ok: false, code: 'tool_failed', refused: false });
           resolved.push(entry);
@@ -895,6 +903,8 @@ export class AgentRuntime {
     results: Map<string, ToolResultEntry>;
     decisions: Map<string, ApprovalDecisionEntry>;
     approvalIds: Map<string, string>;
+    /** The step repeats a tool call id: none of its gated calls may run (G-392). */
+    repeated: boolean;
     scope: ReturnType<typeof approvalToolScope>;
     unusable: Set<string>;
     ambiguous: Set<string>;
@@ -915,13 +925,28 @@ export class AgentRuntime {
     const decisions = new Map((answered?.tool_approval_responses ?? []).map((entry) => [entry.approval_id, entry]));
     const approvalIds = new Map(assistant.tool_approval_requests.map((request) => [request.tool_call_id, request.approval_id]));
 
-    // A call that has a result is DONE, whatever its decision says. A call that
-    // needs nobody is not this method's to run.
-    const calls = assistant.tool_calls.filter(
-      (call) => !results.has(call.id) && (approvalIds.has(call.id) || mode.needsApproval(call.name)),
-    );
+    // Read before any decision is used: a map keyed by a repeated call id
+    // would hand one approval to every call carrying it (G-392).
+    const repeated = repeatsCallIds(assistant.tool_calls as unknown as JsonObject[], assistant.tool_approval_requests as unknown as JsonObject[]);
 
-    return calls.length === 0 ? null : { calls, results, decisions, approvalIds, scope: approvalToolScope(rows), unusable: unusableStoredCalls(rows), ambiguous: ambiguousCalls(assistant) };
+    // A call that has a result is DONE, whatever its decision says. A call that
+    // needs nobody is not this method's to run. In a step that repeats a call
+    // id a result by id cannot say whose it is, so its gated calls stay open
+    // until there are as many results for the id as calls carrying it.
+    // Counted on the rows as stored: the replay view folds results by id.
+    let stored = rows.length - 1;
+    while (stored >= 0 && !(rows[stored]!.type === 'assistant' && Array.isArray(rows[stored]!.tool_calls) && (rows[stored]!.tool_calls as JsonValue[]).length > 0)) stored -= 1;
+    const storedResults = rows.slice(stored + 1).filter((row) => row.type === 'tool_result')
+      .flatMap((row) => (Array.isArray(row.tool_results) ? row.tool_results : []) as JsonObject[]);
+    const settled = (id: string): boolean => storedResults.filter((entry) => entry.tool_call_id === id).length
+      >= assistant.tool_calls.filter((call) => call.id === id).length;
+    const calls = repeated
+      ? assistant.tool_calls.filter((call) => mode.needsApproval(call.name) && !settled(call.id))
+      : assistant.tool_calls.filter(
+        (call) => !results.has(call.id) && (approvalIds.has(call.id) || mode.needsApproval(call.name)),
+      );
+
+    return calls.length === 0 ? null : { calls, results, decisions, approvalIds, repeated, scope: approvalToolScope(rows), unusable: unusableStoredCalls(rows), ambiguous: ambiguousCalls(assistant) };
   }
 
   /**
