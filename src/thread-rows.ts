@@ -330,7 +330,7 @@ function normalise(row: JsonObject, view: JsonObject[]): JsonObject | null {
     case 'tool_result':
       // The answer to a replaced step is stored after the step that replaced
       // it: never shown as that step's results (G-397).
-      if (isReplacedStepRow(row)) return null;
+      if (isReplacedStepRow(row) || isStartedRow(row)) return null;
       if (Array.isArray(row.tool_results) || Array.isArray(row.tool_approval_responses)) {
         return toolResultRow(
           list(row.tool_results).map((entry) => ({
@@ -488,6 +488,67 @@ function answeredStep(row: JsonObject): number | undefined {
   return isObject(mark) && typeof mark.position === 'number' ? mark.position : undefined;
 }
 
+/**
+ * G-410: the result a started call with no result reads: it may have run, and
+ * it is never run again.
+ *
+ * @internal
+ */
+export const INTERRUPTED_RESULT = 'Tool call was interrupted, it may have run';
+
+/** G-410: an approved call that was no longer open when the resolver came to start it. @internal */
+export const NOT_OPEN_RESULT = 'Not run: this call is not the one that was approved, or it is no longer open.';
+
+/**
+ * G-410: the key of the started row the harness records BEFORE it runs one
+ * approved call: `{tool_call_id, tool_name, approval_id}`, followed by the
+ * row's `harness_answers_step {position}`. The shared bytes (harness-thread-rows
+ * thr-0022): {"type":"tool_result","tool_results":[],"tool_approval_responses":[],
+ * "harness_started":{"tool_call_id":"call_paris","tool_name":"weather","approval_id":"apr_1"},
+ * "harness_answers_step":{"position":2}}. Kept out of the replay view.
+ *
+ * @internal
+ */
+export const STARTED_KEY = 'harness_started';
+
+/** The started row for `call` of the step at `position`, run under `approvalId`. @internal */
+export function startedRow(call: { id: string; name: string }, approvalId: string, position: number): JsonObject {
+  return {
+    ...toolResultRow([]),
+    [STARTED_KEY]: { tool_call_id: call.id, tool_name: call.name, approval_id: approvalId },
+    [ANSWERS_STEP_KEY]: { position },
+  };
+}
+
+/** Whether a stored row carries a started mark. @internal */
+export function isStartedRow(row: JsonObject): boolean {
+  return row.type === 'tool_result' && isObject(row[STARTED_KEY]);
+}
+
+/**
+ * The positions, in the step at `index`, of the calls a started row names:
+ * only a row the harness recorded, naming this step by position, and a call
+ * of it with the started row's id and tool name (the first such call not
+ * already named, occurrence by occurrence). Any other started mark is read as
+ * absent.
+ *
+ * @internal
+ */
+export function startedCalls(messages: readonly StoredRow[], index: number): Set<number> {
+  const position = messages[index]?.position;
+  const calls = list(messages[index]?.message.tool_calls);
+  const started = new Set<number>();
+  for (const { message, harness } of messages.slice(index + 1)) {
+    if (harness !== true || !isStartedRow(message)) continue;
+    const answers = message[ANSWERS_STEP_KEY];
+    if (!isObject(answers) || answers.position !== position) continue;
+    const mark = message[STARTED_KEY] as JsonObject;
+    const at = calls.findIndex((call, place) => !started.has(place) && text(call.id) === text(mark.tool_call_id) && text(call.name) === text(mark.tool_name));
+    if (at !== -1) started.add(at);
+  }
+  return started;
+}
+
 /** Whether a stored row is the answer to a replaced step (G-397). @internal */
 export function isReplacedStepRow(row: JsonObject): boolean {
   const mark = row[REPLACED_STEP_KEY];
@@ -624,19 +685,22 @@ export function resultOwners(messages: readonly StoredRow[]): Map<number, Set<nu
 export function replacedStepCalls(
   messages: readonly StoredRow[],
   gated: (name: string) => boolean,
-): { position: number; calls: JsonObject[] }[] {
+): { position: number; calls: JsonObject[]; started: boolean[] }[] {
   const rows = messages.map(({ message }) => message);
   const owners = resultOwners(messages);
-  const replaced: { position: number; calls: JsonObject[] }[] = [];
+  const replaced: { position: number; calls: JsonObject[]; started: boolean[] }[] = [];
   for (const [index, step] of rows.entries()) {
     if (!isToolCallStep(step)) continue;
     if (supersededAt(messages, index) === -1) continue;
     const done = owners.get(index)!;
     const calls = list(step.tool_calls);
     const requested = new Set(list(step.tool_approval_requests).map((request) => text(request.tool_call_id)));
-    const open = calls.filter((call, at) => !done.has(at) && (gated(text(call.name))
+    // A started call with no result is answered as interrupted (G-410), never
+    // denied as replaced.
+    const started = startedCalls(messages, index);
+    const open = calls.map((call, at) => ({ call, at })).filter(({ call, at }) => !done.has(at) && (started.has(at) || gated(text(call.name))
       || (requested.has(text(call.id)) && !calls.some((other) => other.id === call.id && gated(text(other.name))))));
-    if (open.length > 0) replaced.push({ position: messages[index]!.position, calls: open });
+    if (open.length > 0) replaced.push({ position: messages[index]!.position, calls: open.map(({ call }) => call), started: open.map(({ at }) => started.has(at)) });
   }
 
   return replaced;

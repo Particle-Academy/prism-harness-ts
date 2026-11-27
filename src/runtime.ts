@@ -23,6 +23,10 @@ import {
   REPLACED_STEP_KEY,
   answeringStep,
   isToolCallStep,
+  startedRow,
+  startedCalls,
+  INTERRUPTED_RESULT,
+  NOT_OPEN_RESULT,
   turnStepsSoFar,
   REPLACED_STEP_RESULT,
   ARGUMENTS_AS_SENT,
@@ -855,12 +859,18 @@ export class AgentRuntime {
 
       const resolved: ToolResultEntry[] = [];
 
-      for (const call of work.calls) {
+      for (const [offset, call] of work.calls.entries()) {
         const input = { id: call.id, name: call.name, arguments: call.arguments, resultId: call.result_id };
         const approvalId = work.approvalIds.get(call.id);
         const decision = approvalId === undefined ? undefined : work.decisions.get(approvalId);
+        const at = work.indices[offset]!;
 
-        if (work.repeated) {
+        if (work.started.has(at)) {
+          // Started before, with no result (G-410): it may have run; never again.
+          const entry = toolResultEntry(input, INTERRUPTED_RESULT);
+          steps?.toolResult(call.id, entry.result, { ok: false, code: 'approval_denied', refused: true });
+          resolved.push(entry);
+        } else if (work.repeated) {
           // The step repeats a call id, so no decision can be told apart from
           // another (G-392): none of its gated calls runs, whatever was decided.
           const entry = toolResultEntry(input, REPEATED_CALL_ID_RESULT);
@@ -887,6 +897,17 @@ export class AgentRuntime {
           steps?.toolResult(call.id, entry.result, { ok: false, code: 'approval_denied', refused: true });
           resolved.push(entry);
         } else if (decision?.approved === true) {
+          // G-410: started only while the call is still open, read again now:
+          // no result, no started row, and its approval still standing. Then
+          // the started row is recorded BEFORE the tool runs, so a result that
+          // is never written can never make it run again.
+          if (!(await this.#stillOpen(live, work.stepIndex, at, approvalId!)) || work.position === undefined) {
+            const entry = toolResultEntry(input, NOT_OPEN_RESULT);
+            steps?.toolResult(call.id, entry.result, { ok: false, code: 'approval_denied', refused: true });
+            resolved.push(entry);
+            continue;
+          }
+          await live.thread().record([startedRow(call, approvalId!, work.position)], runId, HARNESS_RECORDING);
           // Reported as called only when it is offered to run: a call refused
           // as not available did not run (G-399).
           if (bounded.some((tool) => tool.name === call.name)) called.push(call.name);
@@ -903,8 +924,8 @@ export class AgentRuntime {
 
       // A replaced step's calls are answered with their own rows, kept out of
       // this step's results (G-397).
-      const replaced = work.replaced.map(({ position, calls }) => ({
-        ...toolResultRow(calls.map((call) => toolResultEntry(
+      const replaced = work.replaced.map(({ position, calls, started }) => ({
+        ...toolResultRow(calls.map((call, index) => toolResultEntry(
           {
             id: typeof call.id === 'string' ? call.id : '',
             name: typeof call.name === 'string' ? call.name : '',
@@ -912,7 +933,7 @@ export class AgentRuntime {
             arguments: usableArguments(call.arguments) ?? {},
             resultId: typeof call.result_id === 'string' ? call.result_id : null,
           },
-          REPLACED_STEP_RESULT,
+          started[index] ? INTERRUPTED_RESULT : REPLACED_STEP_RESULT,
         ))),
         [REPLACED_STEP_KEY]: { position },
       }) as JsonObject);
@@ -946,7 +967,12 @@ export class AgentRuntime {
     /** The step repeats a tool call id: none of its gated calls may run (G-392). */
     repeated: boolean;
     /** Earlier parked steps a later tool-call step replaced, with their unanswered gated calls (G-397). */
-    replaced: { position: number; calls: JsonObject[] }[];
+    replaced: { position: number; calls: JsonObject[]; started: boolean[] }[];
+    /** The step's stored index, and the step position of each call in `calls`. */
+    stepIndex: number;
+    indices: number[];
+    /** Step positions of the calls a started row names with no result (G-410). */
+    started: Set<number>;
     /** The thread position of the step resolved here (its result row names it). */
     position: number | undefined;
     scope: ReturnType<typeof approvalToolScope>;
@@ -1007,15 +1033,34 @@ export class AgentRuntime {
     const done = stored >= 0 ? resultOwners(messages).get(stored) ?? new Set<number>() : new Set<number>();
     // A superseded step is never resolved here: it is answered as replaced
     // (G-397), and nothing of it runs.
-    const calls = stored >= 0 && supersededAt(messages, stored) !== -1
+    // A call a started row names with no result is answered as interrupted
+    // (G-410): it may have run, and it is never run again.
+    const started = startedCalls(messages, stored);
+    const open = stored >= 0 && supersededAt(messages, stored) !== -1
       ? []
-      : repeated
-        ? assistant.tool_calls.filter((call, at) => mode.needsApproval(call.name) && !done.has(at))
-        : assistant.tool_calls.filter(
-          (call, at) => !done.has(at) && (approvalIds.has(call.id) || mode.needsApproval(call.name)),
-        );
+      : assistant.tool_calls.map((call, at) => ({ call, at })).filter(({ call, at }) => !done.has(at) && (started.has(at) || (repeated
+        ? mode.needsApproval(call.name)
+        : approvalIds.has(call.id) || mode.needsApproval(call.name))));
+    const calls = open.map(({ call }) => call);
+    const indices = open.map(({ at }) => at);
 
-    return calls.length === 0 && replaced.length === 0 ? null : { calls, results, decisions, approvalIds, repeated, replaced, position: messages[stored]?.position, scope: approvalToolScope(rows), unusable: unusableStoredCalls(rows), ambiguous: ambiguousCalls(assistant) };
+    return calls.length === 0 && replaced.length === 0 ? null : { calls, results, decisions, approvalIds, repeated, replaced, stepIndex: stored, indices, started, position: messages[stored]?.position, scope: approvalToolScope(rows), unusable: unusableStoredCalls(rows), ambiguous: ambiguousCalls(assistant) };
+  }
+
+  /**
+   * Whether the call at `at` of the step at `stepIndex` is still open, read
+   * from the thread as it is now (G-410): no result of its own, no started row,
+   * and its approval's decision still an approval.
+   */
+  async #stillOpen(session: Session, stepIndex: number, at: number, approvalId: string): Promise<boolean> {
+    const messages = await session.thread().messages();
+    if (resultOwners(messages).get(stepIndex)?.has(at) === true || startedCalls(messages, stepIndex).has(at)) return false;
+    let approved = false;
+    for (const row of threadView(messages.slice(stepIndex + 1).map((entry) => entry.message))) {
+      if (row.type !== 'tool_result') continue;
+      for (const entry of (row as ToolResultRow).tool_approval_responses) if (entry.approval_id === approvalId) approved = entry.approved;
+    }
+    return approved;
   }
 
   /**
