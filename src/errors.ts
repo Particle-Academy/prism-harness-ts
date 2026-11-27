@@ -18,6 +18,8 @@ export type HarnessErrorCode =
   | 'tool_not_available'
   /** A run was refused — by budget, by depth, or by a cancelled ledger. */
   | 'run_not_permitted'
+  /** A decision named an approval whose step was superseded: it can no longer be acted on. */
+  | 'approval_not_pending'
   /** A model returned a terminal error/unknown finish; its tools must not run. */
   | 'model_step_failed'
   /** A stored payload could not be mapped back into a value object. */
@@ -150,6 +152,13 @@ export class HarnessError extends Error {
     return new HarnessError(
       'tool_not_available',
       `The tool [${name}] is not available to this session (has: ${available.join(', ') || 'none'}).`,
+    );
+  }
+
+  static approvalNotPending(approvalId: string): HarnessError {
+    return new HarnessError(
+      'approval_not_pending',
+      `The approval [${approvalId}] is no longer pending: a later row replaced the step that asked for it, so a decision on it is not recorded.`,
     );
   }
 

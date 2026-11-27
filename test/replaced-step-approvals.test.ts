@@ -61,9 +61,10 @@ function rig(calls: LlmToolCall[]): Rig {
     .register({ name: 'echo', handle: (args: JsonObject) => { r.ran.push(Number(args.n)); return `ran:${String(args.n)}`; } })
     .register({ name: 'free', handle: (args: JsonObject) => `free:${String(args.n)}` });
   r.agent = new AgentRuntime({
-    modes, tools, client: async (): Promise<LlmResponse> => {
+    modes, tools, client: async (request): Promise<LlmResponse> => {
       r.requests += 1;
-      return r.requests === 1 && calls.length > 0 ? { text: '', finishReason: 'tool_calls', toolCalls: calls } : { text: 'done', finishReason: 'stop' };
+      if (r.requests === 1 && calls.length > 0) return { text: '', finishReason: 'tool_calls', toolCalls: calls };
+      return request.schema === undefined ? { text: 'done', finishReason: 'stop' } : { text: '{}', finishReason: 'stop', structured: {} };
     },
   });
   return r;
@@ -118,13 +119,15 @@ describe('G-397: a parked step a later tool-call step replaced', () => {
       const [one, two] = (await r.agent.send(r.session, 'go')).pendingApprovals;
       await recordStep(r.session, [[echo('c3', 3), 'apr_later']]);
 
-      await decide(r, how, [
-        { approvalId: one!.id, approved: true },
-        { approvalId: two!.id, approved: true },
-        { approvalId: 'apr_later', approved: true },
-      ]);
-      // Approving the old step again, and resuming again, still runs nothing of it.
-      await recordApproval(r.session, one!.id, true);
+      // A decision for the replaced step, recorded after the later step, is
+      // refused on every path; the later step's own decision is not.
+      await expect(how === 'streamDecision'
+        ? drain(r.agent.streamDecision(r.session, [{ approvalId: one!.id, approved: true }, { approvalId: two!.id, approved: true }]))
+        : how === 'recordDecisions'
+          ? recordDecisions(r.session, [{ approvalId: one!.id, approved: true }, { approvalId: two!.id, approved: true }])
+          : recordApproval(r.session, one!.id, true)).rejects.toMatchObject({ code: 'approval_not_pending' });
+      await decide(r, how, [{ approvalId: 'apr_later', approved: true }]);
+      await expect(recordApproval(r.session, two!.id, true)).rejects.toMatchObject({ code: 'approval_not_pending' });
       await r.agent.send(r.session, '');
       await drain(r.agent.streamSteps(r.session, ''));
 
@@ -135,16 +138,34 @@ describe('G-397: a parked step a later tool-call step replaced', () => {
     });
   }
 
+  it('a decision recorded BEFORE the later step is accepted, and still runs nothing of the replaced step', async () => {
+    const r = rig([echo('c1', 1)]);
+    const [only] = (await r.agent.send(r.session, 'go')).pendingApprovals;
+    await recordApproval(r.session, only!.id, true);
+    await recordStep(r.session, [[echo('c3', 3), 'apr_later']]);
+    await recordApproval(r.session, 'apr_later', false);
+    await r.agent.send(r.session, '');
+    await r.agent.send(r.session, '');
+
+    expect(r.ran).toEqual([]);
+    expect(await outcomesOf(r.session, 1)).toEqual([REPLACED]);
+    expect(await outcomesOf(r.session, 3)).toEqual(['User denied tool execution']);
+  });
+
   it('the later step reuses the old call ids: the old calls are denied as replaced, the later calls are decided by their own approvals', async () => {
     const r = rig([echo('a', 1), echo('b', 2)]);
     const [one, two] = (await r.agent.send(r.session, 'go')).pendingApprovals;
     await recordStep(r.session, [[echo('a', 3), 'apr_a'], [echo('b', 4), 'apr_b']]);
-    await recordDecisions(r.session, [
+    // One refused decision refuses the whole batch: nothing is recorded.
+    await expect(recordDecisions(r.session, [
       { approvalId: one!.id, approved: true },
-      { approvalId: two!.id, approved: true },
+      { approvalId: 'apr_b', approved: true },
+    ])).rejects.toMatchObject({ code: 'approval_not_pending' });
+    await recordDecisions(r.session, [
       { approvalId: 'apr_a', approved: false, reason: 'not this one' },
       { approvalId: 'apr_b', approved: true },
     ]);
+    await expect(recordApproval(r.session, two!.id, true)).rejects.toMatchObject({ code: 'approval_not_pending' });
     await r.agent.send(r.session, '');
     await r.agent.send(r.session, '');
 
@@ -159,7 +180,8 @@ describe('G-397: a parked step a later tool-call step replaced', () => {
     const r = rig([{ id: 'f', name: 'free', arguments: { n: 1 } }, echo('e', 2)]);
     const [only] = (await r.agent.send(r.session, 'go')).pendingApprovals;
     await recordStep(r.session, [[echo('x', 3), 'apr_x']]);
-    await recordDecisions(r.session, [{ approvalId: only!.id, approved: true }, { approvalId: 'apr_x', approved: false }]);
+    await expect(recordApproval(r.session, only!.id, true)).rejects.toMatchObject({ code: 'approval_not_pending' });
+    await recordDecisions(r.session, [{ approvalId: 'apr_x', approved: false }]);
     await r.agent.send(r.session, '');
 
     expect(r.ran).toEqual([]);
@@ -173,7 +195,7 @@ describe('G-397: a parked step a later tool-call step replaced', () => {
     const [only] = (await r.agent.send(r.session, 'go')).pendingApprovals;
     await recordStep(r.session, [[{ id: 'f', name: 'free', arguments: { n: 9 } }, null]]);
     await r.session.thread().record([toolResultRow([toolResultEntry({ id: 'f', name: 'free', arguments: { n: 9 } }, 'free:9')])]);
-    await recordApproval(r.session, only!.id, true);
+    await expect(recordApproval(r.session, only!.id, true)).rejects.toMatchObject({ code: 'approval_not_pending' });
     await r.agent.send(r.session, '');
     await r.agent.send(r.session, '');
 
@@ -185,13 +207,93 @@ describe('G-397: a parked step a later tool-call step replaced', () => {
     const r = rig([echo('a', 1)]);
     const [only] = (await r.agent.send(r.session, 'go')).pendingApprovals;
     await recordStep(r.session, [[echo('a', 3), 'apr_a']]);
-    await recordDecisions(r.session, [{ approvalId: only!.id, approved: true }, { approvalId: 'apr_a', approved: true }]);
+    await recordDecisions(r.session, [{ approvalId: 'apr_a', approved: true }]);
     await r.agent.send(r.session, '');
 
+    expect(only).toBeDefined();
     expect(r.ran).toEqual([3]);
     const view = threadView((await r.session.thread().messages()).map((entry) => entry.message));
     const results = view.filter((row) => row.type === 'tool_result').flatMap((row) => row.tool_results as JsonObject[]);
     expect(results.filter((entry) => entry.tool_call_id === 'a').map((entry) => entry.result)).toEqual(['ran:3']);
+  });
+});
+
+describe('G-397: what supersedes a parked step, and what does not', () => {
+  for (const [label, row] of [['a text row', { type: 'assistant', content: 'A note.', tool_calls: [], tool_approval_requests: [] }], ['a user row', { type: 'user', content: 'Something else.' }]] as [string, JsonObject][]) {
+    it(`${label} the host records (no run id) supersedes: the calls are denied as replaced, nothing runs, a later decision is refused`, async () => {
+      const r = rig([echo('c1', 1), echo('c2', 2)]);
+      const [one, two] = (await r.agent.send(r.session, 'go')).pendingApprovals;
+      await recordApproval(r.session, one!.id, true);
+      await r.session.thread().record([row]);
+      await expect(recordApproval(r.session, two!.id, true)).rejects.toMatchObject({ code: 'approval_not_pending' });
+      await r.agent.send(r.session, '');
+      await r.agent.send(r.session, '');
+
+      expect(r.ran).toEqual([]);
+      expect(await outcomesOf(r.session, 1)).toEqual([REPLACED]);
+      expect(await outcomesOf(r.session, 2)).toEqual([REPLACED]);
+    });
+
+    it(`${label} the host records under ANOTHER run's id supersedes too`, async () => {
+      const r = rig([echo('c1', 1)]);
+      const [only] = (await r.agent.send(r.session, 'go')).pendingApprovals;
+      await r.session.thread().record([row], 'run_someone_else');
+      await expect(recordApproval(r.session, only!.id, true)).rejects.toMatchObject({ code: 'approval_not_pending' });
+      await r.agent.send(r.session, '');
+
+      expect(r.ran).toEqual([]);
+      expect(await outcomesOf(r.session, 1)).toEqual([REPLACED]);
+    });
+  }
+
+  for (const path of ['send', 'structured', 'streamSteps', 'streamDecision'] as const) {
+    it(`the runtime's own answer row after a resume (${path}) does not supersede: the step stays decided, and a later decision is accepted and runs nothing`, async () => {
+      const r = rig([echo('c1', 1)]);
+      const [only] = (await r.agent.send(r.session, 'go')).pendingApprovals;
+      if (path === 'streamDecision') await drain(r.agent.streamDecision(r.session, [{ approvalId: only!.id, approved: true }]));
+      else {
+        await recordApproval(r.session, only!.id, true);
+        if (path === 'send') await r.agent.send(r.session, '');
+        else if (path === 'structured') await r.agent.sendStructured(r.session, '', { type: 'object' });
+        else await drain(r.agent.streamSteps(r.session, ''));
+      }
+      // The resume wrote the result and then the model's answer, in its own run.
+      const rows = (await r.session.thread().messages()).map((entry) => entry.message);
+      expect(rows.at(-1)?.type).toBe('assistant');
+      await recordApproval(r.session, only!.id, true);
+      await r.agent.send(r.session, '');
+
+      expect(r.ran).toEqual([1]);
+      expect(await outcomesOf(r.session, 1)).toEqual(['ran:1']);
+    });
+  }
+
+  it("a structured turn's own answer, in the run that parked, does not supersede", async () => {
+    const r = rig([echo('c1', 1)]);
+    const [only] = (await r.agent.sendStructured(r.session, 'go', { type: 'object' })).pendingApprovals;
+    await drain(r.agent.streamDecision(r.session, [{ approvalId: only!.id, approved: true }]));
+    expect(r.ran).toEqual([1]);
+    expect(await outcomesOf(r.session, 1)).toEqual(['ran:1']);
+  });
+
+  it('a run id is the caller\'s to give through Thread.record: a text row recorded under the run that owns the step is treated as inside it, so it does not supersede; the step is still decided on its own, and nothing beyond its own approval can run', async () => {
+    // Forging the owning run's id is possible through the public API (the
+    // thread is the app's own record). It changes only the label: the step is
+    // not denied as replaced, and its decisions are accepted. The approved
+    // call still does not run, because the row moved the transcript tail the
+    // tool scope is read from, so it fails closed as not available.
+    const r = rig([echo('c1', 1), echo('c2', 2)]);
+    const [one, two] = (await r.agent.send(r.session, 'go')).pendingApprovals;
+    const owner = (await r.session.thread().messages()).find((entry) => entry.message.type === 'assistant')!.runId;
+    expect(owner).not.toBeNull();
+    await r.session.thread().record([{ type: 'assistant', content: 'Forged note.', tool_calls: [], tool_approval_requests: [] }], owner);
+    await recordDecisions(r.session, [{ approvalId: one!.id, approved: false, reason: 'no' }, { approvalId: two!.id, approved: true }]);
+    await r.agent.send(r.session, '');
+    await r.agent.send(r.session, '');
+
+    expect(r.ran).toEqual([]);
+    expect(await outcomesOf(r.session, 1)).toEqual(['no']);
+    expect(await outcomesOf(r.session, 2)).toEqual(['Not run: echo is not available to this run.']);
   });
 });
 
