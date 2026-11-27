@@ -307,6 +307,12 @@ pending call with no decision is refused with "No approval response provided".
 A call that has a result never runs again. Who may approve is your application's
 decision: authorize before calling `recordApproval()`. `recordDecisions(session,
 [{ approvalId, approved, reason }])` records several decisions as one row.
+A denial is final. Once a denial is recorded for an approval, the call never
+runs, and a later approval for it records nothing. A denial recorded after an
+approval revokes it, as long as the call has not run yet. A repeated decision
+records nothing, and a `decision_recorded` step reports the decision that
+stands. When the thread already holds several decisions for an approval, any
+denial among them decides it.
 
 A paused step is replaced when a later step with tool calls is recorded after
 it, or when your application records a user or assistant message on the thread

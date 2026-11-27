@@ -420,15 +420,16 @@ export class AgentRuntime {
 
       // DURABLE FIRST, through the one writer every decision path uses, and
       // before any tool or provider call.
-      await writeDecisions(live, decisions);
+      const stands = await writeDecisions(live, decisions);
 
       const tagger = this.#tagger(context, channel, parked?.lastSeq ?? 0);
       const execution = executionContext(context);
       const runId = parked?.id ?? randomUUID();
       tagger.bind(live.key(), runId, execution?.parentRunId ?? null, execution?.rootRunId ?? runId);
 
-      for (const decision of decisions) {
+      for (const decision of stands) {
         // From the APP's run context, never from the model or the request.
+        // The decision that stands for the approval (G-401).
         tagger.decision(decision.approvalId, decision.approved, decision.reason ?? null, context?.actor ?? null);
       }
 
@@ -1009,11 +1010,6 @@ export class AgentRuntime {
     const answered = view.slice(index + 1).filter((row) => row.type === 'tool_result') as ToolResultRow[];
     // Each result as the replay view holds it, never folded by call id alone (G-402).
     const results = answered.flatMap((row) => row.tool_results);
-    const decisions = new Map(answered.flatMap((row) => row.tool_approval_responses).map((entry) => [entry.approval_id, entry]));
-    // A started call keeps the decision it started under: a decision written
-    // after it started (straight into the thread) is not recorded beside its
-    // outcome (G-411).
-    for (const [approvalId, entry] of startedDecisions(messages, stored)) if (decisions.has(approvalId)) decisions.set(approvalId, entry);
     // An approval belongs to the step that first asked for it: a later row
     // repeating its id (a copy a host recorded) asks for nothing, so one
     // decision never decides a call of another step (G-408).
@@ -1032,6 +1028,18 @@ export class AgentRuntime {
     // id a result by id cannot say whose it is, so its gated calls stay open
     // until there are as many results for the id as calls carrying it.
     // Counted on the rows as stored: the replay view folds results by id.
+    // A DENIAL is final (G-401), as when it was written: any denial recorded
+    // for an approval decides it, from a racing writer or a row recorded before
+    // the rule too. Read row by row, as stored: the replay view folds rows.
+    const decisions = new Map<string, ApprovalDecisionEntry>();
+    for (const row of rows.slice(stored + 1).flatMap((message) => threadView([message]))) {
+      if (row.type !== 'tool_result') continue;
+      for (const entry of (row as ToolResultRow).tool_approval_responses) decisions.set(entry.approval_id, standingDecision(decisions.get(entry.approval_id), entry));
+    }
+    // A started call keeps the decision it started under: a decision written
+    // after it started (straight into the thread) is not recorded beside its
+    // outcome (G-411).
+    for (const [approvalId, entry] of startedDecisions(messages, stored)) if (decisions.has(approvalId)) decisions.set(approvalId, entry);
     // Which of its calls already has an outcome: each result belongs to one
     // call, matched by id and the arguments it records, in the segment it sits
     // in or an earlier step's, never by id alone (G-392, G-397).
@@ -1244,20 +1252,58 @@ export async function recordDecisions(session: Session, decisions: readonly Appr
 }
 
 /** Where decisions are made durable, for every path that takes them. */
-async function writeDecisions(session: Session, decisions: readonly ApprovalDecision[]): Promise<void> {
+/**
+ * The decision that stands for an approval, given the one that stood before
+ * (G-401): a DENIAL is final. Once a denial is recorded it stands; an
+ * approval stands only while there is no denial.
+ */
+function standingDecision<T extends { approved: boolean }>(previous: T | undefined, next: T): T {
+  if (previous !== undefined && !previous.approved) return previous;
+  if (!next.approved) return next;
+  return previous ?? next;
+}
+
+/**
+ * Returns, for each decision given and in its order, the decision that
+ * STANDS for its approval (G-401) once these are recorded: a denial is final.
+ * A decision is written only when it changes what stands: a first decision,
+ * or a denial after an approval (a person can revoke an approval before the
+ * call runs). An approval after a denial, or a repeat, records nothing.
+ */
+async function writeDecisions(session: Session, decisions: readonly ApprovalDecision[]): Promise<ApprovalDecision[]> {
   // A decision for a step that was superseded is refused before anything is
   // written: it could never run anything (G-397).
   const messages = await session.thread().messages();
   for (const decision of decisions) {
     if (approvalSuperseded(messages, decision.approvalId)) throw HarnessError.approvalNotPending(decision.approvalId);
   }
-  const run = await session.run();
+  const standing = new Map<string, ApprovalDecision>();
+  for (const { message } of messages) {
+    for (const row of threadView([message])) {
+      if (row.type !== 'tool_result') continue;
+      for (const response of (row as ToolResultRow).tool_approval_responses) {
+        standing.set(response.approval_id, standingDecision(standing.get(response.approval_id), { approvalId: response.approval_id, approved: response.approved, reason: response.reason }));
+      }
+    }
+  }
+  const fresh: ApprovalDecision[] = [];
+  for (const decision of decisions) {
+    const previous = standing.get(decision.approvalId);
+    const next = standingDecision(previous, decision);
+    if (next === previous) continue;
+    standing.set(decision.approvalId, next);
+    fresh.push(decision);
+  }
+  if (fresh.length > 0) {
+    const run = await session.run();
+    await session.thread().record([toolResultRow([], fresh.map((decision) => ({
+      approval_id: decision.approvalId,
+      approved: decision.approved,
+      reason: decision.reason ?? null,
+    })))], run?.id ?? null, HARNESS_RECORDING);
+  }
 
-  await session.thread().record([toolResultRow([], decisions.map((decision) => ({
-    approval_id: decision.approvalId,
-    approved: decision.approved,
-    reason: decision.reason ?? null,
-  })))], run?.id ?? null, HARNESS_RECORDING);
+  return decisions.map((decision) => standing.get(decision.approvalId)!);
 }
 
 /** Runtime guards: a decision arrives from an app's request handling, not from a typed caller. */
