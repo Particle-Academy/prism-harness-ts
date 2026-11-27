@@ -1160,6 +1160,8 @@ function providerContentIsOwn(row: JsonObject): boolean {
   }
   if (Array.isArray(extra.content_blocks)) {
     const blocks = extra.content_blocks as JsonObject[];
+    // A fallback block changes what prism-ts sends from it on: never judged as the row's own.
+    if (blocks.some((block) => block.type === 'fallback')) return false;
     if (pairs(blocks.filter((block) => block.type === 'tool_use')) !== own || blocks.filter((block) => block.type === 'text').map((block) => block.text).join('') !== content) return false;
   }
   return true;
