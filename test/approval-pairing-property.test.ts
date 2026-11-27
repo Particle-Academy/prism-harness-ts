@@ -42,13 +42,17 @@ const REPEATED = 'Tool call was not run because another call in this step has th
 const NO_RESPONSE = 'No approval response provided';
 const DENIED = 'User denied tool execution';
 
-const EXAMPLES = positive(process.env.PRISM_PROPERTY_EXAMPLES, 150);
+const EXAMPLES = positive(process.env.PRISM_PROPERTY_EXAMPLES, 150, 1);
 const BASE_SEED = positive(process.env.PRISM_PROPERTY_BASE_SEED, 0x6392);
 const REPLAY = process.env.PRISM_PROPERTY_SEED;
 
-function positive(value: string | undefined, fallback: number): number {
-  const parsed = value === undefined || value === '' ? NaN : Number(value);
-  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : fallback;
+/** The variable's value, or `fallback` when it is not set. A value that is set but invalid FAILS (no silent default). */
+function positive(value: string | undefined, fallback: number, min = 0): number {
+  if (value === undefined) return fallback;
+  if (!/^[0-9]+$/.test(value) || !Number.isSafeInteger(Number(value)) || Number(value) < min) {
+    throw new Error(`A property-test setting must be a whole number >= ${min}, got ${JSON.stringify(value)}.`);
+  }
+  return Number(value);
 }
 
 // ---------------------------------------------------------------------------
