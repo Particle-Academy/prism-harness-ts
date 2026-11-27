@@ -16,7 +16,7 @@ import {
   type Session,
 } from '../src/index.js';
 import { ARGUMENTS_AS_SENT, assistantRow, threadView, toolResultEntry, toolResultRow } from '../src/thread-rows.js';
-import { canonicalJson } from '../src/tool-policy.js';
+import { argsDigest, canonicalJson } from '../src/tool-policy.js';
 
 // G-392 QC: property tests for the approval pairing invariants.
 //
@@ -197,21 +197,26 @@ interface Case {
   /**
    * G-408 and its 0.11.x #92 follow-up: right before the first resume the
    * host records an assistant row whose tool_calls are NOT a list of objects
-   * (a string, a number, null, a list of strings, a JSON string, a list
-   * MIXING objects with a NEW call, token 901), or a valid COPY step with a
-   * NEW call (token 902) that keeps the parked step's OLD approval
-   * requests. None is the parked step; none of their requests is theirs (an
-   * approval belongs to the step that first asked for it). From a generator
-   * of its own (seed ^ 0x408408).
+   * (a string, a number, null, a list of strings, a JSON string), or a step
+   * holding a NEW call (a list MIXING non-objects with it, token 901, or a
+   * valid COPY, token 902) that keeps the parked step's OLD approval
+   * requests. None of their requests is theirs (an approval belongs to the
+   * step that first asked for it): the new call is never run on them. From
+   * a generator of its own (seed ^ 0x408408).
    */
   junk: { kind: JunkKind; requests: boolean } | null;
 }
 
-type JunkKind = 'string' | 'number' | 'null' | 'strings' | 'scalar' | 'mixed' | 'copy';
-const JUNK_KINDS: readonly JunkKind[] = ['string', 'number', 'null', 'strings', 'scalar', 'mixed', 'copy'];
+type JunkKind = 'string' | 'number' | 'null' | 'strings' | 'scalar' | 'mixed' | 'copy' | 'both';
+const JUNK_KINDS: readonly JunkKind[] = ['string', 'number', 'null', 'strings', 'scalar', 'mixed', 'copy', 'both'];
 
-/** The junk row's tool_calls: never a list of objects, except the valid copy. */
-function junkCalls(kind: JunkKind, id: string): JsonValue {
+/** The parked step's first gated call: the one a `both` copy holds again beside its altered twin. */
+function firstGated(c: Case): Call {
+  return c.calls.find((call) => call.tool === 'echo')!;
+}
+
+/** The junk row's tool_calls (see Case.junk); `both`: the parked step's first gated call AND an altered twin (token 903). */
+function junkCalls(kind: JunkKind, id: string, gated?: Call): JsonValue {
   const call = (n: number): JsonObject => ({ id, name: 'echo', arguments: { n }, result_id: null, reasoning_id: null, reasoning_summary: null });
   switch (kind) {
     case 'string': return ['x'];
@@ -221,13 +226,18 @@ function junkCalls(kind: JunkKind, id: string): JsonValue {
     case 'scalar': return JSON.stringify([{ id, name: 'echo', arguments: { n: 901 } }]);
     case 'mixed': return ['x', call(901), null, 3];
     case 'copy': return [call(902)];
+    case 'both': return [{ ...call(gated!.token), id: gated!.id }, { ...call(903), id: gated!.id }];
   }
 }
 
-/** A tool-call step by the one rule (G-408): an assistant row whose tool_calls are a non-empty list of objects. */
+/** A tool-call step by the one rule (G-408, #92): an assistant row whose tool_calls are an array holding at least one object. */
 function isStepRow(row: JsonObject): boolean {
-  return row.type === 'assistant' && Array.isArray(row.tool_calls) && row.tool_calls.length > 0
-    && row.tool_calls.every((call) => typeof call === 'object' && call !== null && !Array.isArray(call));
+  return row.type === 'assistant' && Array.isArray(row.tool_calls) && row.tool_calls.some(isCall);
+}
+
+/** One call of a step: an object entry of its tool_calls (the others are no call). */
+function isCall(call: unknown): call is JsonObject {
+  return typeof call === 'object' && call !== null && !Array.isArray(call);
 }
 
 /** The fixed regression seeds keep the exact case they were found with: no duplicate, no junk row. */
@@ -522,9 +532,18 @@ function expected(c: Case): Expected {
   // names still gets the replaced denial (segment ownership).
   c.calls.forEach((call, index) => put(decided.outcome, call.token, call.tool === 'free' ? `free:${call.token}`
     : c.prior.includes(index) ? `prior:${call.token}` : index === forged ? forgedText : REPLACED));
-  // #92: a valid COPY step's new call owns none of the old requests: it is
+  // #92: a COPY step's new call (a valid copy, or a mixed list holding one
+  // object: a step by the one rule) owns none of the old requests: it is
   // open with no approval, and its resume refuses it.
   if (c.junk?.kind === 'copy') put(decided.outcome, 902, NO_RESPONSE);
+  if (c.junk?.kind === 'mixed') put(decided.outcome, 901, NO_RESPONSE);
+  // A copy holding the old call AND an altered twin under one id repeats an
+  // id: neither runs, each gets the repeated-id denial (the old call's token
+  // gains that one outcome beside the parked call's).
+  if (c.junk?.kind === 'both') {
+    put(decided.outcome, firstGated(c).token, REPEATED);
+    put(decided.outcome, 903, REPEATED);
+  }
   return decided;
 }
 
@@ -674,7 +693,7 @@ async function outcomes(session: Session): Promise<[number, string][]> {
   const seen = new Map<string, number>();
   for (const row of await rows(session)) {
     if (isStepRow(row)) {
-      calls = row.tool_calls as JsonObject[];
+      calls = (row.tool_calls as unknown[]).filter(isCall);
       has = calls.map(() => false);
       seen.clear();
       continue;
@@ -856,7 +875,7 @@ async function runCase(c: Case): Promise<void> {
     const requests = c.junk.requests
       ? c.requests.map((q, index) => ({ approval_id: approvalIds[index]!, tool_call_id: c.calls[q.call]!.id, arguments_format: ARGUMENTS_AS_SENT }))
       : [];
-    await r.session.thread().record([{ type: 'assistant', content: '', tool_calls: junkCalls(c.junk.kind, c.calls[0]!.id), additional_content: {}, tool_approval_requests: requests, harness_tool_names: ['echo', 'free'] }]);
+    await r.session.thread().record([{ type: 'assistant', content: '', tool_calls: junkCalls(c.junk.kind, c.calls[0]!.id, firstGated(c)), additional_content: {}, tool_approval_requests: requests, harness_tool_names: ['echo', 'free'] }]);
   }
   if (!resumedYet) first = await resumed(async () => await turn(r, c.resume, ''));
 
@@ -871,7 +890,18 @@ async function runCase(c: Case): Promise<void> {
   // Invariant 1, with no exemption (round 15): no call runs without its OWN
   // approval, the junk row's and the copy's new calls (901, 902) included:
   // an approval belongs only to the step that first asked for it (#92).
-  check(!r.ran.includes(901) && !r.ran.includes(902), '1: no call runs without its own approval (a copy\'s new call)', r.ran);
+  check(!r.ran.includes(901) && !r.ran.includes(902) && !r.ran.includes(903), '1: no call runs without its own approval (a copy\'s new call)', r.ran);
+  // The design rule (round 15): a call runs only under a request whose id,
+  // tool name and arguments digest match it, the request its step's own.
+  {
+    const stored = await rows(r.session);
+    for (const token of r.ran) {
+      const bound = stored.some((row) => isStepRow(row) && (row.tool_calls as unknown[]).filter(isCall).some((call) => Number((call.arguments as JsonObject).n) === token
+        && ((row.tool_approval_requests ?? []) as JsonObject[]).some((request) => request.tool_call_id === call.id
+          && JSON.stringify(request.harness_call) === JSON.stringify({ tool_name: 'echo', args_digest: argsDigest({ n: token }) }))));
+      check(bound, '1: a call runs only under a request whose id, name and digest match it', { token });
+    }
+  }
   if (c.later !== null) check(r.ran.every((token) => token >= 200), 'a replaced step\'s approvals never run anything', r.ran);
   if (oracle.repeated) check(r.ran.length === 0, '4: a step with repeated ids runs none of its gated calls', r.ran);
   check(sameSet(r.ran, oracle.runs), 'the calls that ran are exactly the oracle\'s', { ran: r.ran, expected: [...oracle.runs] });
@@ -885,7 +915,7 @@ async function runCase(c: Case): Promise<void> {
     check(sameSet(ok, r.ran) && ok.length === r.ran.length, '6: the ok tool_result steps are the calls that ran', ok);
     const hit = forgedTarget(c);
     const forgedToken = hit === null ? -1 : (hit.step === 'later' ? c.later!.calls : c.calls)[hit.index]!.token;
-    const open = c.junk !== null ? (c.junk.kind === 'copy' ? [902] : [])
+    const open = c.junk !== null ? (c.junk.kind === 'copy' ? [902] : c.junk.kind === 'mixed' ? [901] : c.junk.kind === 'both' ? [firstGated(c).token, 903] : [])
       : c.later !== null ? (laterSuperseded(c) ? [] : c.later.calls.filter((call) => call.tool === 'echo' && call.token !== forgedToken).map((call) => call.token))
       : superseded(c) ? []
         // By call, never by token: an identical duplicate shares its token (round 15).

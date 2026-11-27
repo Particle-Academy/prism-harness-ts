@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   AgentRuntime,
@@ -373,8 +374,12 @@ describe('item 1: crash, forged marks', () => {
       // A harness-written row (as stored rows read) naming step 1 for a call id that step does not have.
       { type: 'tool_result', tool_results: [{ tool_call_id: 'c2', tool_name: 'echo', args: { n: 2 }, result: 'ran:2', tool_call_result_id: null, artifacts: [] }], tool_approval_responses: [], harness_answers_step: { position: 2 } },
     ]);
-    // It stays after the later step, answering it, and the mark never reaches the replay.
-    expect(view.map((row) => row.type)).toEqual(['user', 'assistant', 'assistant', 'tool_result']);
+    // It stays after the later step, answering it, and the mark never reaches
+    // the replay; the earlier step (not the paused one), its requested call
+    // with no outcome, is given its one replaced result (item 9).
+    expect(view.map((row) => row.type)).toEqual(['user', 'assistant', 'tool_result', 'assistant', 'tool_result']);
+    expect(((view[2]!.tool_results ?? []) as JsonObject[]).map((entry) => [entry.tool_call_id, entry.result])).toEqual([['c1', REPLACED]]);
+    expect(((view[4]!.tool_results ?? []) as JsonObject[]).map((entry) => [entry.tool_call_id, entry.result])).toEqual([['c2', 'ran:2']]);
     expect(JSON.stringify(view)).not.toContain('harness_answers_step');
   });
 });
@@ -666,5 +671,112 @@ describe('added: a parked structured response carries the unchecked document now
     // `text` is the transcript, as documented; nothing else carries the document.
     const { text: _transcript, ...rest } = parked;
     expect(JSON.stringify(rest)).not.toContain('admin');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Added DESIGN RULE (coordinator): an approval binds to the exact call the
+// person was shown. Every stored request carries `harness_call {tool_name,
+// args_digest}` as its last key; a call runs only when its request binds it.
+// ---------------------------------------------------------------------------
+
+describe('added: an approval binds to the exact call the person was shown', () => {
+  const call = (id: string, n: number, name = 'echo'): JsonObject => ({ id, name, arguments: { n }, result_id: null, reasoning_id: null, reasoning_summary: null });
+  const copy = (calls: JsonObject[], id: string): JsonObject => ({
+    type: 'assistant', content: '', tool_calls: calls, additional_content: {},
+    tool_approval_requests: [{ approval_id: id, tool_call_id: 'c1', arguments_format: ARGUMENTS_AS_SENT }],
+    harness_tool_names: ['echo', 'free'],
+  });
+
+  it('the parked step\'s request is bound to its call: its tool and the digest of its arguments, the request\'s last key', async () => {
+    const r = new Rig();
+    await r.parked();
+    const step = (await r.rows()).find((row) => row.type === 'assistant')!;
+    const request = (step.tool_approval_requests as JsonObject[])[0]!;
+    expect(Object.keys(request).at(-1)).toBe('harness_call');
+    expect(request.harness_call).toEqual({ tool_name: 'echo', args_digest: `sha256:${createHash('sha256').update('{"n":1}').digest('hex')}` });
+  });
+
+  it('the reference example digest: {"city":"Paris"}', async () => {
+    const { callArgsDigest } = await import('../src/thread-rows.js');
+    expect(callArgsDigest({ city: 'Paris' })).toBe('sha256:6e1e312d537bc71b5410b0599f5a508142149e13174c6ee0d1671658845bc67d');
+    expect(callArgsDigest('{"city":"Paris"}')).toBe('sha256:6e1e312d537bc71b5410b0599f5a508142149e13174c6ee0d1671658845bc67d');
+    expect(callArgsDigest({})).toBe(`sha256:${createHash('sha256').update('{}').digest('hex')}`);
+  });
+
+  for (const when of ['before', 'after'] as const) {
+    it(`a copy with ALTERED arguments under the kept request, recorded ${when} the approval: the altered call never runs, nothing runs, one outcome each`, async () => {
+      const r = new Rig();
+      const [id] = await r.parked();
+      if (when === 'after') await recordApproval(r.session(), id!, true);
+      await r.session().thread().record([copy([call('c1', 5)], id!)]);
+      if (when === 'before') expect(await recordApproval(r.session(), id!, true).then(() => 'accepted', code)).toBe('approval_not_pending');
+      for (let i = 0; i < 3; i += 1) await r.runtime.send(r.session(), '');
+      const rows = await r.rows();
+      expect(r.echoed).toEqual([]);
+      expect(echoOutcomes(rows, 1)).toEqual([REPLACED]);
+      expect(echoOutcomes(rows, 5)).toEqual(['No approval response provided']);
+    });
+  }
+
+  it('a copy holding BOTH the old call and the altered one, under the kept request: neither runs, one outcome each', async () => {
+    const r = new Rig();
+    const [id] = await r.parked();
+    await recordApproval(r.session(), id!, true);
+    await r.session().thread().record([copy([call('c1', 1), call('c1', 5)], id!)]);
+    for (let i = 0; i < 3; i += 1) await r.runtime.send(r.session(), '');
+    const rows = await r.rows();
+    expect(r.echoed).toEqual([]);
+    expect(echoOutcomes(rows, 5)).toHaveLength(1);
+    expect(echoOutcomes(rows, 1)).toHaveLength(2);
+    expect(echoOutcomes(rows, 1)).toContain(REPLACED);
+  });
+
+  it('a host cannot choose a binding: record() binds each request to its own call, whatever binding the row carried', async () => {
+    const r = new Rig();
+    await r.session().thread().record([{ type: 'user', content: 'Go' }, {
+      ...copy([call('c1', 1)], 'apr_h'),
+      tool_approval_requests: [{ approval_id: 'apr_h', tool_call_id: 'c1', arguments_format: ARGUMENTS_AS_SENT, harness_call: { tool_name: 'free', args_digest: 'sha256:00' } }],
+    }]);
+    const step = (await r.rows()).find((row) => row.type === 'assistant')!;
+    expect((step.tool_approval_requests as JsonObject[])[0]!.harness_call).toEqual({ tool_name: 'echo', args_digest: `sha256:${createHash('sha256').update('{"n":1}').digest('hex')}` });
+  });
+
+  async function stored(r: Rig, request: JsonObject): Promise<void> {
+    const thread = r.session().thread() as unknown as { store: MemorySessionStore; key: string };
+    const rows: [JsonObject, string | null][] = [[{ type: 'user', content: 'Go' }, null], [{ ...copy([call('c1', 1)], 'apr_s'), tool_approval_requests: [request] }, 'run-x']];
+    await thread.store.put(thread.key, { messages: rows.map(([message, runId], index) => ({ position: index + 1, message, run_id: runId, recorded_at: '2026-11-01T00:00:00.000Z' })) as never });
+  }
+
+  for (const [label, binding] of [
+    ['other arguments', { tool_name: 'echo', args_digest: `sha256:${createHash('sha256').update('{"n":2}').digest('hex')}` }],
+    ['another tool', { tool_name: 'free', args_digest: `sha256:${createHash('sha256').update('{"n":1}').digest('hex')}` }],
+    ['a malformed binding', 'sha256:abc'],
+  ] as [string, JsonValue][]) {
+    it(`a stored request bound to ${label}: approved and resumed, the call is denied fail-closed with ONE outcome and never runs`, async () => {
+      const r = new Rig();
+      await stored(r, { approval_id: 'apr_s', tool_call_id: 'c1', arguments_format: ARGUMENTS_AS_SENT, harness_call: binding });
+      await recordApproval(r.session(), 'apr_s', true);
+      for (let i = 0; i < 3; i += 1) await r.runtime.send(r.session(), '');
+      expect(r.echoed).toEqual([]);
+      expect(echoOutcomes(await r.rows(), 1)).toEqual(['Not run: this call is not the one that was approved, or it is no longer open.']);
+    });
+  }
+
+  it('the upgrade rule: a stored request with NO binding (written before it) binds to its own step\'s call by position, and runs once when approved', async () => {
+    const r = new Rig();
+    await stored(r, { approval_id: 'apr_s', tool_call_id: 'c1', arguments_format: ARGUMENTS_AS_SENT });
+    await recordApproval(r.session(), 'apr_s', true);
+    for (let i = 0; i < 3; i += 1) await r.runtime.send(r.session(), '');
+    expect(r.echoed).toEqual([1]);
+    expect(echoOutcomes(await r.rows(), 1)).toEqual(['ran:1']);
+  });
+
+  it('the binding is never sent to a provider', async () => {
+    const r = new Rig();
+    const [id] = await r.parked();
+    await recordApproval(r.session(), id!, true);
+    await r.runtime.send(r.session(), '');
+    for (const request of r.requests) expect(JSON.stringify(request.messages)).not.toContain('harness_call');
   });
 });

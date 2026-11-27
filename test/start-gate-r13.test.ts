@@ -1084,8 +1084,14 @@ describe('upgrade: a thread the 0.11.x line wrote', () => {
       const rows = (await root.thread().messages()).map((row) => row.message);
       expect(rows.filter((row) => Object.hasOwn(row, 'harness_replaced_step'))).toHaveLength(1);
       expect(rows.some((row) => Object.hasOwn(row, 'harness_superseded'))).toBe(false);
-      // The replaced-step answer never reaches a provider as S2's result.
-      expect(JSON.stringify(r.requests.at(-1)!.messages)).not.toContain(REPLACED);
+      // The replaced-step answer never reaches a provider as S2's result: the
+      // replay gives S1's calls their one replaced result in S1's OWN result
+      // run (round 15, item 4), and S2's segment holds only S2's.
+      const sent = r.requests.at(-1)!.messages as JsonObject[];
+      const s2 = sent.findIndex((row) => row.type === 'assistant' && JSON.stringify(row.tool_calls).includes('"n":3'));
+      const replaced = sent.flatMap((row, index) => (row.type === 'tool_result' ? (row.tool_results as JsonObject[]).filter((entry) => entry.result === REPLACED).map((entry) => [index, (entry.args as JsonObject).n]) : []));
+      expect(replaced.map(([, n]) => n).sort()).toEqual([1, 2]);
+      for (const [index] of replaced) expect(index as number).toBeLessThan(s2);
     });
   }
 });
