@@ -236,6 +236,26 @@ export function approvalToolScope(rows: readonly JsonObject[]): { names: string[
  * (one assistant row per model step since the turn's user row), so the count
  * survives a reload, a different worker and a deploy, with no extra state.
  */
+/**
+ * The model steps the turn at the transcript tail has taken so far, since
+ * the turn's last user row, whether the turn is paused, finished or ran out of
+ * steps: each assistant row the harness recorded (one per model step), and
+ * each tool-call step another writer recorded. An assistant text row a host
+ * recorded is not a model step. An empty send continues that turn, so it
+ * starts from this count and never reopens the turn's budget.
+ *
+ * @internal
+ */
+export function turnStepsSoFar(rows: readonly StoredRow[]): number {
+  let steps = 0;
+  for (let index = rows.length - 1; index >= 0; index -= 1) {
+    const { message, harness } = rows[index]!;
+    if (message.type === 'user') break;
+    if (message.type === 'assistant' && (harness === true || isToolCallStep(message))) steps += 1;
+  }
+  return steps;
+}
+
 export function approvalRunSteps(rows: readonly JsonObject[]): number | null {
   if (approvalToolScope(rows) === null) return null;
   let steps = 0;
