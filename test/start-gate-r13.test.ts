@@ -1022,3 +1022,67 @@ describe('DECISION B on an append-log thread (the file store)', () => {
     expect((await new Thread(store, 'b:thread').messages()).filter((entry) => Object.hasOwn(entry.message, 'harness_superseded'))).toHaveLength(1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Upgrade from the 0.11.x line: a thread that line wrote marks the answer to
+// a replaced step `harness_replaced_step: {position}`, stored AFTER the later
+// step. Main reads it: every gated call ends with exactly one outcome, there
+// is no double denial, and nothing runs twice.
+// ---------------------------------------------------------------------------
+
+describe('upgrade: a thread the 0.11.x line wrote', () => {
+  const REPLACED = 'Tool call was not run because a later step replaced it';
+  const entry = (id: string, n: number, result: string): JsonObject => ({ tool_call_id: id, tool_name: 'echo', args: { n }, result, tool_call_result_id: null, artifacts: [] });
+
+  /** S1 (parked, run X) with calls a/b; then a later step S2 another writer recorded, reusing id `a`. */
+  async function legacyThread(r: Rig, scope: string, answered: boolean): Promise<Session> {
+    const root = r.session(scope);
+    await root.usingMode('work');
+    const thread = root.thread();
+    // Recorded through the store directly, as 0.11.x stored them: no main supersede on the way in.
+    const rows: [JsonObject, string | null][] = [
+      [{ type: 'user', content: 'Go' }, null],
+      [{ type: 'assistant', content: '', tool_calls: [{ id: 'a', name: 'echo', arguments: { n: 1 } }, { id: 'b', name: 'echo', arguments: { n: 2 } }], additional_content: {}, tool_approval_requests: [{ approval_id: 'apr_s1a', tool_call_id: 'a', arguments_format: 1 }, { approval_id: 'apr_s1b', tool_call_id: 'b', arguments_format: 1 }], harness_tool_names: ['echo', 'free'] }, 'run-x'],
+      [{ type: 'tool_result', tool_results: [], tool_approval_responses: [{ approval_id: 'apr_s1a', approved: true, reason: null }] }, null],
+      [{ type: 'assistant', content: '', tool_calls: [{ id: 'a', name: 'echo', arguments: { n: 3 } }], additional_content: {}, tool_approval_requests: [{ approval_id: 'apr_s2a', tool_call_id: 'a', arguments_format: 1 }], harness_tool_names: ['echo', 'free'] }, null],
+    ];
+    if (answered) {
+      // 0.11.x's own answer to S1 (position 2), byte for byte as that line writes it.
+      rows.push([{ type: 'tool_result', tool_results: [entry('a', 1, REPLACED), entry('b', 2, REPLACED)], tool_approval_responses: [], harness_replaced_step: { position: 2 } }, 'run-y']);
+    }
+    // The 0.11.x rows as stored: written straight to the store (positions 1..n), bypassing main's record().
+    const store = (thread as unknown as { store: MemorySessionStore }).store;
+    const threadKey = (thread as unknown as { key: string }).key;
+    await store.put(threadKey, { messages: rows.map(([message, runId], index) => ({ position: index + 1, message, run_id: runId, recorded_at: '2026-11-01T00:00:00.000Z' })) as never });
+    return root;
+  }
+
+  async function outcomesOf(root: Session): Promise<[number, string][]> {
+    return (await root.thread().messages()).map((row) => row.message).filter((row) => row.type === 'tool_result')
+      .flatMap((row) => row.tool_results as JsonObject[]).map((result) => [(result.args as JsonObject).n as number, result.result as string]);
+  }
+
+  for (const answered of [true, false]) {
+    it(`${answered ? 'S1 already answered by 0.11.x' : 'S1 superseded but not yet answered'}: main resumes S2; every call ends with exactly one outcome, S2's own approval runs its call once`, async () => {
+      const r = new Rig();
+      const root = await legacyThread(r, `upgrade-${String(answered)}`, answered);
+      // S1's approval is not pending (S2 is the paused step); S2 is decided by its own.
+      await expect(recordApproval(root, 'apr_s1b', true)).rejects.toMatchObject({ code: 'approval_not_pending' });
+      await recordApproval(root, 'apr_s2a', true);
+      for (let resume = 0; resume < 3; resume += 1) {
+        r.text('Resumed.');
+        await r.runtime.send(root, '');
+      }
+      expect(r.echoed).toEqual([3]);
+      const outcomes = await outcomesOf(root);
+      const by = (n: number): string[] => outcomes.filter(([token]) => token === n).map(([, result]) => result);
+      expect([by(1), by(2), by(3)]).toEqual([[REPLACED], [REPLACED], ['ok']]);
+      // No main denial was added for S1 on top of the 0.11.x answer.
+      const rows = (await root.thread().messages()).map((row) => row.message);
+      expect(rows.filter((row) => Object.hasOwn(row, 'harness_replaced_step'))).toHaveLength(1);
+      expect(rows.some((row) => Object.hasOwn(row, 'harness_superseded'))).toBe(false);
+      // The replaced-step answer never reaches a provider as S2's result.
+      expect(JSON.stringify(r.requests.at(-1)!.messages)).not.toContain(REPLACED);
+    });
+  }
+});
