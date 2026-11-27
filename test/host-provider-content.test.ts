@@ -186,6 +186,34 @@ describe('G-415: a host row\'s provider content is sent only when it is that row
     expect((step.tool_calls as JsonObject[]).map((entry) => [entry.reasoning_id, entry.reasoning_summary])).toEqual([['rs_9', [{ type: 'summary_text', text: 'own thought' }]]]);
   });
 
+  for (const path of ['send', 'streamSteps'] as const) {
+    for (const withItems of [true, false]) {
+      it(`a harness OpenAI reasoning step (${path}, ${withItems ? 'with' : 'without'} output_items) is sent byte for byte as stored: its tool calls keep their reasoning id and summary, in order`, async () => {
+        const summary = [{ type: 'summary_text', text: 'own thought' }];
+        const r = rig([
+          {
+            text: '',
+            finishReason: 'tool_calls',
+            toolCalls: [
+              { id: 'fc_1', name: 'lookup', arguments: { q: 'x' }, resultId: 'call_1', reasoningId: 'rs_1', reasoningSummary: summary },
+              { id: 'fc_2', name: 'lookup', arguments: { q: 'y' }, resultId: 'call_2', reasoningId: 'rs_1', reasoningSummary: summary },
+            ],
+            ...(withItems ? { additionalContent: { output_items: [{ type: 'reasoning', id: 'rs_1', summary }, openaiCall('fc_1'), openaiCall('fc_2')] } } : {}),
+          },
+          { text: 'done', finishReason: 'stop' },
+        ]);
+        if (path === 'send') await r.agent.send(r.session, 'go');
+        else for await (const _step of r.agent.streamSteps(r.session, 'go')) { /* drain */ }
+        const pick = (row: JsonObject) => JSON.stringify({ content: row.content, tool_calls: row.tool_calls, additional_content: row.additional_content });
+        const isStep = (row: JsonObject) => row.type === 'assistant' && Array.isArray(row.tool_calls) && row.tool_calls.length > 0;
+        const stored = (await r.session.thread().messages()).map((entry) => entry.message).find(isStep)!;
+        const sent = (r.requests.at(-1)!.messages as JsonObject[]).find(isStep)!;
+        expect(pick(sent)).toBe(pick(stored));
+        expect((sent.tool_calls as JsonObject[]).map((entry) => [entry.id, entry.reasoning_id])).toEqual([['fc_1', 'rs_1'], ['fc_2', 'rs_1']]);
+      });
+    }
+  }
+
   it('a host row whose tool_calls hold no objects counts as one with none', async () => {
     const { sent } = await sendWith(hostRow(NOTE, { output_items: [openaiCall('fc_1'), message(NOTE)], content_blocks: [{ type: 'text', text: NOTE }, toolUse('t1')] }, ['{"id":"fc_1"}']));
     expect(additional(sent)).toEqual({});

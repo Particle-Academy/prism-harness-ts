@@ -338,7 +338,7 @@ function insertedRow(c: Case): JsonObject {
   const copied = copiedContent(providerCopy(c));
   switch (insert.kind) {
     case 'assistant_text': return { type: 'assistant', content: 'A note.', tool_calls: [], tool_approval_requests: [], ...(providerCopy(c) === null ? {} : { additional_content: copied }) };
-    case 'assistant_call': return { type: 'assistant', content: '', tool_calls: [{ id: call.id, name: 'free', arguments: { n: 900 } }], tool_approval_requests: [], ...(providerCopy(c) === null ? {} : { additional_content: copied }) };
+    case 'assistant_call': return { type: 'assistant', content: '', tool_calls: [{ id: call.id, name: 'free', arguments: { n: 900 }, ...(providerCopy(c) === null ? {} : { reasoning_id: 'rs_copied', reasoning_summary: [{ type: 'summary_text', text: 'copied' }] }) }], tool_approval_requests: [], ...(providerCopy(c) === null ? {} : { additional_content: copied }) };
     case 'user': return { type: 'user', content: 'Something else.' };
     case 'system': return { type: 'system', content: 'A system note.' };
     case 'tool_empty': return toolResultRow([]);
@@ -1138,6 +1138,9 @@ function sentRequestsAnswerEveryCall(sent: JsonObject[][]): void {
     messages.forEach((row, at) => {
       if (row.type !== 'assistant') return;
       check(providerContentIsOwn(row), '8: an assistant row is sent with provider content only when it is its own: same tool calls, same text (G-415)', { request, row: at, additional: row.additional_content });
+      // No step in the generated cases carries reasoning of its own, so none is ever sent (G-415).
+      const reasoned = (Array.isArray(row.tool_calls) ? row.tool_calls as JsonObject[] : []).filter((call) => (call.reasoning_id !== null && call.reasoning_id !== undefined) || (call.reasoning_summary !== null && call.reasoning_summary !== undefined));
+      check(reasoned.length === 0, '8: a host row tool call is sent without a copied reasoning id or summary (G-415)', { request, row: at, reasoned });
     });
   });
 }
