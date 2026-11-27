@@ -440,6 +440,28 @@ export const REPLACED_STEP_RESULT = 'Tool call was not run because a later step 
  */
 export const REPLACED_STEP_KEY = 'harness_replaced_step';
 
+/**
+ * The key of the mark on every result row the harness writes for a step's
+ * calls: `{position}`, the thread position of the step it answers (G-407).
+ * Such a row answers that step wherever it lands: a tool-call step another
+ * writer records while a call runs never takes the call's result. Kept out of
+ * the replay view, which rebuilds rows from their known keys.
+ *
+ * @internal
+ */
+export const ANSWERS_STEP_KEY = 'harness_answers_step';
+
+/** `row` marked as answering the step at `position` (unchanged when it is unknown). @internal */
+export function answeringStep<T extends JsonObject | ToolResultRow>(row: T, position: number | undefined): T {
+  return position === undefined ? row : { ...row, [ANSWERS_STEP_KEY]: { position } } as T;
+}
+
+/** The step position a harness result row names, if it names one. */
+function answeredStep(row: JsonObject): number | undefined {
+  const mark = row[ANSWERS_STEP_KEY] ?? (isReplacedStepRow(row) ? row[REPLACED_STEP_KEY] : undefined);
+  return isObject(mark) && typeof mark.position === 'number' ? mark.position : undefined;
+}
+
 /** Whether a stored row is the answer to a replaced step (G-397). @internal */
 export function isReplacedStepRow(row: JsonObject): boolean {
   const mark = row[REPLACED_STEP_KEY];
@@ -506,7 +528,7 @@ export function resultOwners(messages: readonly StoredRow[]): Map<number, Set<nu
   const byPosition = new Map<number, number>();
   let segment = -1;
   const args = (value: JsonValue | undefined): string => canonicalJson(usableArguments(value) ?? {});
-  for (const [index, { position, message: row }] of messages.entries()) {
+  for (const [index, { position, message: row, harness }] of messages.entries()) {
     if (row.type === 'assistant' && list(row.tool_calls).length > 0) {
       segment = index;
       owned.set(index, new Set());
@@ -516,7 +538,11 @@ export function resultOwners(messages: readonly StoredRow[]): Map<number, Set<nu
     }
     if (segment === -1) continue;
     const replaced = isReplacedStepRow(row);
-    const target = replaced ? byPosition.get((row[REPLACED_STEP_KEY] as JsonObject).position as number) ?? segment : segment;
+    // A harness row answers the step it names (G-407); any other row, the step
+    // whose segment holds it.
+    // Only a mark the harness itself recorded is honoured.
+    const named = harness === true ? answeredStep(row) : undefined;
+    const target = named === undefined ? segment : byPosition.get(named) ?? segment;
     const calls = list(messages[target]!.message.tool_calls);
     const mine = owned.get(target)!;
     const prints = seen.get(target)!;
