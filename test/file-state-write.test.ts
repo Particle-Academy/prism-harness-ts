@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { FileSessionStore } from '../src/index.js';
+import { REPLACE_WINDOW_MS, replaceStateFile } from '../src/stores/file-session-store.js';
 
 vi.mock('node:fs/promises', async (importActual) => {
   const actual = await importActual<typeof import('node:fs/promises')>();
@@ -116,8 +117,9 @@ it('keeps an otherwise idle child alive until the awaited write settles', async 
     const result = JSON.parse(stdout);
     if (process.platform === 'win32') {
       expect(result.code).toMatch(/^(EPERM|EACCES)$/);
+      // A lower bound only: the deadline itself is tested in-process below
+      // with an injected clock, and the spawn timeout bounds a hang.
       expect(result.elapsedMs).toBeGreaterThanOrEqual(700);
-      expect(result.elapsedMs).toBeLessThan(2000);
       expect(await readFile(target)).toEqual(originalBytes);
     } else expect(result.code).toBeNull();
     expect((await readdir(directory)).filter(name => name.endsWith('.tmp'))).toEqual([]);
@@ -133,4 +135,32 @@ it.each(['EPERM', 'EACCES'])('does not retry POSIX %s errors', async code => {
   await expect(store.put('k', { revision: 1 })).rejects.toBe(failure);
   expect(replace).toHaveBeenCalledTimes(1);
   expect((await readdir(directory)).filter(name => name.endsWith('.tmp'))).toEqual([]);
+});
+
+// The retry deadline, deterministic (round 15): an injected clock that moves
+// only when the store waits, and a rename that always reports a sharing
+// violation. No wall-clock time is measured.
+it('retries a Windows sharing violation until its deadline on the injected clock, then rethrows the FIRST error', async () => {
+  vi.stubGlobal('process', { ...process, platform: 'win32' });
+  const errors: Error[] = [];
+  replace.mockClear().mockImplementation(async () => { const error = Object.assign(new Error(`violation ${errors.length}`), { code: 'EPERM' }); errors.push(error); throw error; });
+  let now = 0;
+  const waits: number[] = [];
+  const clock = { now: () => now, wait: async (ms: number) => { waits.push(ms); now += ms; } };
+  await expect(replaceStateFile('a.tmp', 'a.json', clock)).rejects.toBe(errors[0]);
+  // One first attempt, then one per 10 ms wait that ends before the deadline.
+  expect(waits.reduce((sum, ms) => sum + ms, 0)).toBe(REPLACE_WINDOW_MS);
+  expect(waits.every((ms) => ms === 10)).toBe(true);
+  expect(replace).toHaveBeenCalledTimes(REPLACE_WINDOW_MS / 10);
+});
+
+it('stops retrying the moment a replace succeeds, before the deadline', async () => {
+  vi.stubGlobal('process', { ...process, platform: 'win32' });
+  let calls = 0;
+  replace.mockClear().mockImplementation(async () => { calls += 1; if (calls < 4) throw Object.assign(new Error('violation'), { code: 'EACCES' }); });
+  let now = 0;
+  const clock = { now: () => now, wait: async (ms: number) => { now += ms; } };
+  await expect(replaceStateFile('a.tmp', 'a.json', clock)).resolves.toBeUndefined();
+  expect(replace).toHaveBeenCalledTimes(4);
+  expect(now).toBe(30);
 });

@@ -366,19 +366,28 @@ function isMissing(error: unknown): boolean {
 }
 
 /** An open Windows target can block replacement even with delete sharing. */
-async function replaceStateFile(temporary: string, target: string): Promise<void> {
+/** The clock a state-file replace retries by: injectable so its deadline is tested without wall-clock time. @internal */
+export type ReplaceClock = { now: () => number; wait: (ms: number) => Promise<unknown> };
+
+const REAL_CLOCK: ReplaceClock = { now: () => performance.now(), wait: (ms) => delay(ms) };
+
+/** The window a Windows replace is retried for, on a sharing violation. @internal */
+export const REPLACE_WINDOW_MS = 750;
+
+/** @internal Exported for its deadline test only. */
+export async function replaceStateFile(temporary: string, target: string, clock: ReplaceClock = REAL_CLOCK): Promise<void> {
   try {
     await rename(temporary, target);
     return;
   } catch (original) {
     if (process.platform !== 'win32' || !isReplacePermissionError(original)) throw original;
-    const deadline = performance.now() + 750;
+    const deadline = clock.now() + REPLACE_WINDOW_MS;
     while (true) {
-      const remaining = deadline - performance.now();
+      const remaining = deadline - clock.now();
       if (remaining <= 0) throw original;
       // This timer stays referenced: an awaited write must keep the process alive.
-      await delay(Math.min(10, remaining));
-      if (performance.now() >= deadline) throw original;
+      await clock.wait(Math.min(10, remaining));
+      if (clock.now() >= deadline) throw original;
       try {
         await rename(temporary, target);
         return;
