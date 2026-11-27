@@ -609,3 +609,43 @@ describe('round 13: new channels', () => {
     expect(tasks).toEqual(['First', 'Second']);
   });
 });
+
+// ---------------------------------------------------------------------------
+// BRIEF-R13 (added): a structured send whose FIRST step stops for approval
+// returns the structured response, with its pending approvals and no
+// document (`structured: null`), never a throw or a missing field.
+// ---------------------------------------------------------------------------
+
+describe('sendStructured that parks on its first step', () => {
+  const schema: JsonObject = { type: 'object', properties: { ok: { type: 'boolean' } }, required: ['ok'] };
+
+  it('returns awaiting_approval with the pending approvals and structured null; the resume returns the document', async () => {
+    const r = new Rig();
+    const root = r.session('structured');
+    await root.usingMode('work');
+    r.calls([['echo', { n: 1 }]]);
+    const parked = await r.runtime.sendStructured(root, 'Go', schema);
+
+    expect(parked.finishReason).toBe('awaiting_approval');
+    expect(parked.pendingApprovals.map((pending) => pending.tool)).toEqual(['echo']);
+    expect(Object.hasOwn(parked, 'structured')).toBe(true);
+    expect(parked.structured).toBeNull();
+
+    await recordApproval(root, parked.pendingApprovals[0]!.id, true);
+    r.queue.push({ text: '{"ok":true}', finishReason: 'stop', structured: { ok: true } });
+    const done = await r.runtime.sendStructured(root, '', schema);
+    expect(done.structured).toEqual({ ok: true });
+    expect(r.echoed).toEqual([1]);
+  });
+
+  it('a structured run stopped by its step budget before any document also returns structured null', async () => {
+    const r = new Rig();
+    const root = r.session('structured');
+    await root.usingMode('work');
+    r.calls([['free', {}]]);
+    const response = await r.runtime.sendStructured(root, 'Go', schema, undefined, RunContext.root('one', new RunBudget(1)));
+    expect(response.finishReason).toBe('budget_exhausted');
+    expect(Object.hasOwn(response, 'structured')).toBe(true);
+    expect(response.structured).toBeNull();
+  });
+});
