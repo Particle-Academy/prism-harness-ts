@@ -210,6 +210,17 @@ export class Session {
   /** The stored conversation this session is bound to. */
   thread(): Thread {
     this.#assertWritable();
+    return this.#threadOf();
+  }
+
+  /**
+   * The thread, for a READ this session makes itself (G-387 round 10): the
+   * confirmation of a provisional record and the parked runs. A read is
+   * allowed in a read-only tool-resolution view, which refuses writes only,
+   * so these never go through thread()'s write guard; the Thread is never
+   * handed out.
+   */
+  #threadOf(): Thread {
     const store = this.#addressIndex ? indexedStore(this.#rawDurable, this.#addressIndex, this.address, 'durable', 'thread') : this.#durable;
     return new Thread(store, `${this.key()}:thread`);
   }
@@ -293,24 +304,17 @@ export class Session {
    * @internal Read by the runtime and Plans.
    */
   async childRefs(): Promise<ChildRefs | null> {
-    const record = await this.#childRecord();
+    const record = (await this.#durable.get(this.#durableKey())) ?? {};
     // A provisional start with no task row (G-387 round 9): the child's
     // records are absent, but it IS a child, so every turn the runner did
-    // not start fails closed (no binding, no tree).
-    if (record === 'unconfirmed') return { tree: null, planLedger: null };
-    const refs = record.child_refs;
-    if (!isJsonObject(refs)) return null;
-    const pair = (value: JsonValue | undefined, first: string, second: string): Record<string, string> | null => {
-      if (!isJsonObject(value)) return null;
-      const a = value[first], b = value[second];
+    // not start fails closed (no binding). Its tree and plan ledger read as
+    // the ones it was last CONFIRMED with (round 10), kept beside the
+    // provisional ones, never as none: keeping a tree or a plan budget only
+    // narrows, and reading none would let a later start under the host's
+    // tree save none, and the child's later turns open a tree of their own.
+    const { refs, confirmed } = await this.#confirmedRefs(record);
 
-      return typeof a === 'string' && a !== '' && typeof b === 'string' && b !== '' ? { [first]: a, [second]: b } : null;
-    };
-
-    return {
-      tree: pair(refs.tree, 'session', 'run') as ChildRefs['tree'],
-      planLedger: pair(refs.plan_ledger, 'session', 'plan') as ChildRefs['planLedger'],
-    };
+    return storedRefs(refs) ?? (confirmed ? null : { tree: null, planLedger: null });
   }
 
   /**
@@ -394,7 +398,7 @@ export class Session {
     await this.#durable.withLock(name, async () => {
       const stored = await this.#durable.get(name);
       if (stored == null || stored.child_provisional !== runId) return;
-      const { child_provisional: _confirmed, ...rest } = stored;
+      const { child_provisional: _confirmed, child_confirmed_refs: _kept, ...rest } = stored;
       await this.#durable.put(name, rest);
     }, 10, 5);
     this.#cachedState = null;
@@ -430,6 +434,17 @@ export class Session {
     return await this.#confirmed(record) ? record : 'unconfirmed';
   }
 
+  /**
+   * The child refs `record` was last CONFIRMED with (G-387 round 10): its
+   * own refs when the record is confirmed, else the ones a runner start
+   * kept beside its provisional records (`child_confirmed_refs`).
+   */
+  async #confirmedRefs(record: JsonObject): Promise<{ refs: JsonValue | undefined; confirmed: boolean }> {
+    const confirmed = await this.#confirmed(record);
+
+    return { refs: confirmed ? record.child_refs : record.child_confirmed_refs, confirmed };
+  }
+
   /** Whether `record`'s provisional mark, if any, is confirmed by its run's task row. */
   async #confirmed(record: JsonObject): Promise<boolean> {
     if (!Object.hasOwn(record, 'child_provisional')) return true;
@@ -441,7 +456,7 @@ export class Session {
   async #taskRecorded(runId: JsonValue | undefined): Promise<boolean> {
     if (typeof runId !== 'string' || runId === '') return false;
 
-    return (await this.thread().messages()).some((entry) => entry.runId === runId && entry.message.type === 'user');
+    return (await this.#threadOf().messages()).some((entry) => entry.runId === runId && entry.message.type === 'user');
   }
 
   /**
@@ -506,6 +521,9 @@ export class Session {
         return;
       }
       const holds: JsonObject = hold.steps < 1 ? {} : { [hold.runId]: { steps: hold.steps, at: hold.at } };
+      // The refs the child was last CONFIRMED with (round 10): its own when
+      // its record is confirmed, else the ones its unconfirmed record kept.
+      const confirmedRefs = (await this.#confirmedRefs(stored)).refs;
       const written: JsonObject = binding === null ? {} : {
         child_binding: {
           session: { ...binding.session },
@@ -523,6 +541,7 @@ export class Session {
         // absent until this run's task row is in the child's thread. A
         // start that fails before it needs no second write to be safe.
         child_provisional: hold.runId,
+        ...(confirmedRefs === undefined ? {} : { child_confirmed_refs: confirmedRefs }),
       };
       const prior: JsonObject = {};
       for (const key of CHILD_START_KEYS) if (Object.hasOwn(stored, key)) prior[key] = stored[key]!;
@@ -721,7 +740,7 @@ export class Session {
 
   /** The runs that issued the approvals the thread is parked on. */
   async #parkedRunIds(): Promise<string[]> {
-    const entries = await this.thread().messages();
+    const entries = await this.#threadOf().messages();
     const runs: string[] = [];
     for (const approvalId of pausedApprovalIds(entries.map((entry) => entry.message))) {
       const issued = entries.find((entry) => Array.isArray(entry.message.tool_approval_requests)
@@ -1078,7 +1097,23 @@ export interface ChildStart {
 }
 
 /** The child records a runner start writes in its one locked write. */
-const CHILD_START_KEYS: readonly string[] = ['child_binding', 'child_depth', 'child_ceiling', 'child_steps', 'child_refs', 'child_provisional'];
+const CHILD_START_KEYS: readonly string[] = ['child_binding', 'child_depth', 'child_ceiling', 'child_steps', 'child_refs', 'child_provisional', 'child_confirmed_refs'];
+
+/** Stored child refs as the runtime reads them, or null when the value is not a refs record. */
+function storedRefs(refs: JsonValue | undefined): ChildRefs | null {
+  if (!isJsonObject(refs)) return null;
+  const pair = (value: JsonValue | undefined, first: string, second: string): Record<string, string> | null => {
+    if (!isJsonObject(value)) return null;
+    const a = value[first], b = value[second];
+
+    return typeof a === 'string' && a !== '' && typeof b === 'string' && b !== '' ? { [first]: a, [second]: b } : null;
+  };
+
+  return {
+    tree: pair(refs.tree, 'session', 'run') as ChildRefs['tree'],
+    planLedger: pair(refs.plan_ledger, 'session', 'plan') as ChildRefs['planLedger'],
+  };
+}
 
 /** A value as text with its object keys sorted, for comparing stored JSON. */
 function canonical(value: JsonValue | undefined): string {

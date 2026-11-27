@@ -15,7 +15,7 @@ import { PlanIds } from './ids.js';
 import { PlanLimits, type PlansConfig } from './limits.js';
 import { PlanMachine, phpTrim, type Plan, type PlanStep } from './machine.js';
 import { PlanRefused, PlansDisabled } from './refusal.js';
-import { pausedApprovalIds, pausedRunState } from '../thread-rows.js';
+import { endedByStart, pausedApprovalIds, pausedRunState } from '../thread-rows.js';
 import { approvalDecisions, pendingApprovalCalls } from './thread.js';
 import { planTools } from './tools.js';
 import { PlanView, type PlanCounts } from './view.js';
@@ -184,7 +184,9 @@ export class Plans {
     const pending = superseding ? [] : pendingApprovalCalls(rows);
     const decided = approvalDecisions(rows);
 
-    return this.mutate(session, (current) => PlanMachine.reconcile(current, pending, decided, this.now(), runId, superseding));
+    const ended = [...endedByStart(rows)];
+
+    return this.mutate(session, (current) => PlanMachine.reconcile(current, pending, decided, this.now(), runId, superseding, ended));
   }
 
   async #indexed(sessionKey: string, plan: Plan): Promise<void> {

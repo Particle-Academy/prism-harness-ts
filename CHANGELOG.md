@@ -99,6 +99,39 @@
   limit", in `RunBudget.fromConfig`, the runtime config, modes and plan
   budgets (now pinned by tests).
 
+### Fixed: provisional child records, round 10 (G-387)
+
+- A child whose records a runner start left provisional reads as the run
+  tree and shared plan budget it was last CONFIRMED with, kept beside the
+  provisional records, never as none. A later start outside a parent turn (a
+  direct `SubagentRunner.run()`, or the subagent tool called with the
+  context it was wired with) keeps them, so every later turn on the child
+  stays in the root's run tree, bounded by it, and spends from the same plan
+  budget. A child with nothing confirmed before still reads as having none.
+- A decision a person recorded that no resume has acted on yet refuses a
+  runner start exactly as an undecided approval does (`denied`, waiting on a
+  person, nothing written), at the gate and in the locked re-check of the
+  child's records: a model re-delegating can no longer end a call a person
+  decided. A resume then acts on the decision as before. A decision nobody
+  can act on any more (its binding gone, too deep) still does not block.
+- A host `ToolProvider`, factory or offer policy may read the child's session
+  state (`run()`, `childBinding()`, `childRefs()`, `childDepth()`,
+  `childCeiling()`, `mode()`) while a runner start resolves its tools: the
+  read that confirms a provisional record is allowed in the read-only
+  resolution view, which still refuses every write.
+- The `tool_denied` events (and run steps) for the calls a runner start ends
+  as not run are emitted only after those rows are recorded with its task
+  row; a store failure on that write reports none.
+- A call a runner start ended as not run no longer counts as approved work in
+  the child's plan: its approval reads as superseded, whatever decision was
+  recorded on it.
+- Pinned by tests (unchanged behaviour): the mode a start wrote reads as the
+  mode before it (or none) until its task row; a thrown value that is not an
+  `Error` fails the run with the same cleanup and still reaches the caller;
+  a framed failure, `run.failed` and the run row name an identifier-shaped
+  class only, never a path, file or line (an anonymous class, or a class or
+  constructor whose name carries a path, reads as `Error`).
+
 ### Changed: no exception text in run rows or `run.failed` (G-387 round 8)
 
 - A failed run's row (`session.run().failure`) and its `run.failed` event now

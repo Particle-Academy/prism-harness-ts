@@ -16,6 +16,8 @@ import {
   unusableStoredCalls,
   ambiguousCalls,
   pendingApprovalIds,
+  unresolvedApprovalIds,
+  endedByStartResult,
   ARGUMENTS_AS_SENT,
 } from './thread-rows.js';
 import { usableArguments } from './tool-arguments.js';
@@ -1139,7 +1141,7 @@ export class AgentRuntime {
         // not this delegation's to act on. Its task row ends them: each
         // pending call is recorded as not run, in the same write as the task.
         const outOfTime = turn.budget.maxSeconds !== null && turn.ledger.elapsedSeconds() >= turn.budget.maxSeconds;
-        const ended = started !== null ? await this.#endApprovals(session, mode, runId, steps) : [];
+        const ended = started !== null ? await this.#endApprovals(session, mode, runId, steps) : null;
         if (started === null && !turn.ledger.cancelled && !outOfTime) offered = await this.#resolveApprovals(session, mode, offered, runId, called, scope?.legacy === true, steps, stepping?.locked === true);
 
         if (prompt !== '') {
@@ -1151,7 +1153,10 @@ export class AgentRuntime {
               ? { type: 'user', content: prompt }
               : { type: 'user', content: prompt, additional_content: [...attachments, { text: prompt }], additional_attributes: {} };
 
-          await thread.record([...ended, message], runId);
+          await thread.record([...(ended?.rows ?? []), message], runId);
+          // Only once those rows are stored (round 10): a write that failed
+          // reports no denial that was never recorded.
+          ended?.announce();
         }
         taskRecorded = true;
         // The task row CONFIRMS a runner start's records (round 9); clearing
@@ -1482,19 +1487,23 @@ export class AgentRuntime {
    * (G-387 round 9): each one NOT RUN, whatever decision is recorded on it.
    * Nothing is invoked; the rows are written with the task row, in one write.
    */
-  async #endApprovals(session: Session, mode: AgentMode, runId: string, steps?: RunStepTagger): Promise<JsonObject[]> {
+  async #endApprovals(session: Session, mode: AgentMode, runId: string, steps?: RunStepTagger): Promise<{ rows: JsonObject[]; announce: () => void }> {
     const work = await this.#unresolved(session, mode);
-    if (work === null) return [];
-    const ended: ToolResultEntry[] = work.calls.map((call) => {
-      const input = { id: call.id, name: call.name, arguments: work.ambiguous.has(call.id) ? {} : call.arguments, resultId: call.result_id };
-      const entry = toolResultEntry(input, `Not run: ${call.name} was waiting on an approval when its delegation ended and a new task was given.`);
-      this.#toolDecision('tool_denied', session, runId, input, undefined, 'policy');
-      steps?.toolResult(call.id, entry.result, { ok: false, code: 'approval_denied', refused: true });
+    if (work === null) return { rows: [], announce: () => {} };
+    const inputs = work.calls.map((call) => ({ id: call.id, name: call.name, arguments: work.ambiguous.has(call.id) ? {} : call.arguments, resultId: call.result_id }));
+    const ended: ToolResultEntry[] = inputs.map((input) => toolResultEntry(input, endedByStartResult(input.name)));
 
-      return entry;
-    });
-
-    return [toolResultRow([...work.results.values(), ...ended]) as unknown as JsonObject];
+    return {
+      rows: [toolResultRow([...work.results.values(), ...ended]) as unknown as JsonObject],
+      // The events and run steps for them, emitted by the caller only once
+      // the rows are recorded with the task row (G-387 round 10).
+      announce: () => {
+        inputs.forEach((input, index) => {
+          this.#toolDecision('tool_denied', session, runId, input, undefined, 'policy');
+          steps?.toolResult(input.id, ended[index]!.result, { ok: false, code: 'approval_denied', refused: true });
+        });
+      },
+    };
   }
 
   async #resolveApprovals(
@@ -1893,9 +1902,16 @@ export async function decisionsAnswerable(session: Session): Promise<boolean> {
   return await actionability(session, (await session.thread().messages()).map((entry) => entry.message), undefined) === null;
 }
 
-/** A parked child's pending approvals, as the start gate reads them. */
+/**
+ * A parked child's approvals, as the start gate and (b)'s locked re-check
+ * read them. A decision a person recorded that no resume has acted on yet
+ * counts as an approval a person can answer (G-387 round 10): a runner start
+ * would end its call as not run, so a model re-delegating could void a
+ * person's decision. While a resume could still act on it, the start is
+ * refused `child_waiting`, exactly as for an undecided one.
+ */
 async function pendingState(session: Session, rows: readonly JsonObject[]): Promise<'none' | 'answerable' | 'unanswerable'> {
-  if (pendingApprovalIds(rows).length === 0) return 'none';
+  if (pendingApprovalIds(rows).length === 0 && unresolvedApprovalIds(rows).length === 0) return 'none';
 
   return await decisionsAnswerable(session) ? 'answerable' : 'unanswerable';
 }

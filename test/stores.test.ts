@@ -165,9 +165,18 @@ describe.each<[string, () => Promise<SessionStore>]>([
       acquired = resolve;
     });
 
+    // The first caller holds the lock until the second has given up: a
+    // barrier, not a 200 ms sleep raced against the second caller's wait
+    // (G-387 round 10, item 9). A stalled event loop could otherwise let the
+    // first caller release before the second's deadline, and the test would
+    // fail claiming the lock had been taken while held.
+    let release!: () => void;
+    const barrier = new Promise<void>((resolve) => {
+      release = resolve;
+    });
     const held = store.withLock('k', async () => {
       acquired();
-      await new Promise((resolve) => setTimeout(resolve, 200));
+      await barrier;
     });
 
     await holding;
@@ -182,7 +191,7 @@ describe.each<[string, () => Promise<SessionStore>]>([
         // A wait short enough to expire while the first caller still holds it.
         0.05,
       ),
-    ).rejects.toMatchObject({ code: 'session_locked' });
+    ).rejects.toMatchObject({ code: 'session_locked' }).finally(release);
 
     expect(ranWhileHeld).toBe(false);
     await held;
