@@ -73,7 +73,8 @@ describe('a decision recorded through the runtime', () => {
     await runtime.decide(session, approvalId, true);
     await expect(runtime.decide(session, approvalId, false)).rejects.toMatchObject({code: 'approval_not_pending'});
 
-    const resumed = await runtime.send(session, 'Go on.');
+    // A resume acts on it (a new message would supersede the step, DECISION B).
+    const resumed = await runtime.send(session, '');
     expect(resumed.finishReason).toBe('stop');
     expect(ran).toEqual([{city: 'Paris'}]);
   });

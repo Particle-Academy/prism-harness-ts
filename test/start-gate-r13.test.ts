@@ -922,3 +922,103 @@ describe('DECISION B: a superseded parked step denies its open calls once', () =
     expect(rows.some((row) => Object.hasOwn(row, 'harness_superseded'))).toBe(false);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Aligned with the release lines (BRIEF-R13): the owning runs of a parked
+// step are the run that recorded it plus every run that recorded one of its
+// results; a repeated APPROVAL id across distinct calls fails closed; a
+// decision after a supersede is refused all-or-nothing per batch; and the
+// append-log thread keeps the same rule while reading only its open tail.
+// ---------------------------------------------------------------------------
+
+describe('release-line alignment', () => {
+  const REPLACED = 'Not run: a later step replaced it.';
+
+  it('a run that recorded one of the step’s results owns it: its own text row does not supersede; another run’s does', async () => {
+    const r = new Rig();
+    const root = r.session('own-results');
+    await root.usingMode('work');
+    await root.thread().record([
+      { type: 'user', content: 'Go' },
+      { type: 'assistant', content: '', tool_calls: [{ id: 'c1', name: 'echo', arguments: { n: 1 } }, { id: 'c2', name: 'echo', arguments: { n: 2 } }], additional_content: {}, tool_approval_requests: [{ approval_id: 'apr_1', tool_call_id: 'c1', arguments_format: 1 }, { approval_id: 'apr_2', tool_call_id: 'c2', arguments_format: 1 }] },
+    ], 'run-step');
+    // Run R2 records a result for c1 (as the runtime would, inside R2).
+    await recordingInRun('run-r2', () => root.thread().record([{ type: 'tool_result', tool_results: [{ tool_call_id: 'c1', tool_name: 'echo', args: { n: 1 }, result: 'ok', tool_call_result_id: null, artifacts: [] }], tool_approval_responses: [] }], 'run-r2'));
+    // R2's own text row: R2 owns the step, so nothing is denied.
+    await recordingInRun('run-r2', () => root.thread().record([{ type: 'assistant', content: 'R2 answers.', tool_calls: [], tool_approval_requests: [] }], 'run-r2'));
+    expect((await root.thread().messages()).some((entry) => Object.hasOwn(entry.message, 'harness_superseded'))).toBe(false);
+
+    // The same, but the text row comes from a run that owns nothing of it: c2 is denied once.
+    const other = r.session('own-results-other');
+    await other.usingMode('work');
+    await other.thread().record([
+      { type: 'user', content: 'Go' },
+      { type: 'assistant', content: '', tool_calls: [{ id: 'c1', name: 'echo', arguments: { n: 1 } }, { id: 'c2', name: 'echo', arguments: { n: 2 } }], additional_content: {}, tool_approval_requests: [{ approval_id: 'apr_1', tool_call_id: 'c1', arguments_format: 1 }, { approval_id: 'apr_2', tool_call_id: 'c2', arguments_format: 1 }] },
+    ], 'run-step');
+    await recordingInRun('run-r2', () => other.thread().record([{ type: 'tool_result', tool_results: [{ tool_call_id: 'c1', tool_name: 'echo', args: { n: 1 }, result: 'ok', tool_call_result_id: null, artifacts: [] }], tool_approval_responses: [] }], 'run-r2'));
+    await recordingInRun('run-r3', () => other.thread().record([{ type: 'assistant', content: 'R3 answers.', tool_calls: [], tool_approval_requests: [] }], 'run-r3'));
+    const marked = (await other.thread().messages()).map((entry) => entry.message).filter((row) => Object.hasOwn(row, 'harness_superseded'));
+    expect(marked.map((row) => [(row.tool_results as JsonObject[]).map((entry) => [entry.tool_call_id, entry.result]), row.harness_superseded])).toEqual([[[['c2', REPLACED]], { approval_ids: ['apr_2'] }]]);
+  });
+
+  it('a repeated APPROVAL id across two distinct calls fails closed: the decision is recorded as the repeated-id denial and nothing runs', async () => {
+    const r = new Rig();
+    const root = r.session('dup-approval');
+    await root.usingMode('work');
+    await root.thread().record([
+      { type: 'user', content: 'Go' },
+      { type: 'assistant', content: '', tool_calls: [{ id: 'c1', name: 'echo', arguments: { n: 1 } }, { id: 'c2', name: 'echo', arguments: { n: 2 } }], additional_content: {}, tool_approval_requests: [{ approval_id: 'apr_same', tool_call_id: 'c1', arguments_format: 1 }, { approval_id: 'apr_same', tool_call_id: 'c2', arguments_format: 1 }], harness_tool_names: ['echo', 'free'] },
+    ]);
+    await recordApproval(root, 'apr_same', true);
+    expect(storedDecisions((await root.thread().messages()).map((entry) => entry.message)).get('apr_same')).toEqual({ approval_id: 'apr_same', approved: false, reason: REPEATED_CALL_ID_RESULT });
+    r.text('Resumed.');
+    await r.runtime.send(root, '');
+    expect(r.echoed).toEqual([]);
+    const entries = (await root.thread().messages()).map((entry) => entry.message).filter((row) => row.type === 'tool_result').flatMap((row) => row.tool_results as JsonObject[]);
+    expect(entries.map((entry) => [entry.tool_call_id, entry.result])).toEqual([['c1', REPEATED_CALL_ID_RESULT], ['c2', REPEATED_CALL_ID_RESULT]]);
+  });
+
+  it('a batch naming one approval of a superseded step and one of the live step is refused whole: nothing of it is recorded', async () => {
+    const r = new Rig();
+    const root = r.session('batch');
+    await root.usingMode('work');
+    r.calls([['echo', { n: 1 }, 'a']]);
+    const first = await r.runtime.send(root, 'Go');
+    const old = first.pendingApprovals[0]!.id;
+    // A later tool-call step another writer recorded: it is the step decided now.
+    await root.thread().record([{ type: 'assistant', content: '', tool_calls: [{ id: 'b', name: 'echo', arguments: { n: 2 } }], additional_content: {}, tool_approval_requests: [{ approval_id: 'apr_later', tool_call_id: 'b', arguments_format: 1 }], harness_tool_names: ['echo', 'free'] }]);
+    const before = (await root.thread().messages()).length;
+    await expect(recordDecisions(root, [{ approvalId: 'apr_later', approved: true }, { approvalId: old, approved: true }])).rejects.toMatchObject({ code: 'approval_not_pending' });
+    expect((await root.thread().messages()).length).toBe(before);
+    // The later step alone is decided by its own approval; the old one was replaced, once.
+    await recordApproval(root, 'apr_later', true);
+    r.text('Resumed.');
+    await r.runtime.send(root, '');
+    expect(r.echoed).toEqual([2]);
+    const outcomes = (await root.thread().messages()).map((entry) => entry.message).filter((row) => row.type === 'tool_result').flatMap((row) => row.tool_results as JsonObject[]).map((entry) => [(entry.args as JsonObject).n, entry.result]);
+    expect(outcomes).toEqual([[1, REPLACED], [2, 'ok']]);
+  });
+});
+
+describe('DECISION B on an append-log thread (the file store)', () => {
+  const REPLACED = 'Not run: a later step replaced it.';
+  it('a host row supersedes the parked step exactly as on a payload thread, and a fresh Thread object reads the same open tail', async () => {
+    const { mkdtemp } = await import('node:fs/promises');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { FileSessionStore, Thread } = await import('../src/index.js');
+    const directory = await mkdtemp(join(tmpdir(), 'prism-harness-decision-b-'));
+    const store = new FileSessionStore(directory);
+    const step: JsonObject = { type: 'assistant', content: '', tool_calls: [{ id: 'c1', name: 'echo', arguments: { n: 1 } }, { id: 'c2', name: 'free', arguments: {} }], additional_content: {}, tool_approval_requests: [{ approval_id: 'apr_1', tool_call_id: 'c1', arguments_format: 1 }] };
+    await new Thread(store, 'b:thread').record([{ type: 'user', content: 'Go' }, step], 'run-1');
+    await new Thread(store, 'b:thread').record([{ type: 'tool_result', tool_results: [{ tool_call_id: 'c2', tool_name: 'free', args: {}, result: 'free ok', tool_call_result_id: null, artifacts: [] }], tool_approval_responses: [] }], 'run-1');
+    await new Thread(store, 'b:thread').record([{ type: 'system', content: 'Note.' }]);
+    await new Thread(store, 'b:thread').record([{ type: 'user', content: 'Later.' }]);
+    const rows = (await new Thread(store, 'b:thread').messages()).map((entry) => entry.message);
+    expect(rows.map((row) => row.type)).toEqual(['user', 'assistant', 'tool_result', 'system', 'tool_result', 'user']);
+    expect(rows[4]).toEqual({ type: 'tool_result', tool_results: [{ tool_call_id: 'c1', tool_name: 'echo', args: { n: 1 }, result: REPLACED, tool_call_result_id: null, artifacts: [] }], tool_approval_responses: [], harness_superseded: { approval_ids: ['apr_1'] } });
+    // Nothing open any more: a later row adds nothing.
+    await new Thread(store, 'b:thread').record([{ type: 'assistant', content: 'Fine.', tool_calls: [], tool_approval_requests: [] }]);
+    expect((await new Thread(store, 'b:thread').messages()).filter((entry) => Object.hasOwn(entry.message, 'harness_superseded'))).toHaveLength(1);
+  });
+});
