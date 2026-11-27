@@ -75,7 +75,7 @@ async function hostDenial(session: Session, approvalId: string): Promise<void> {
 }
 
 describe('G-411 F1: a denial written straight into the thread after the call started', () => {
-  it('the answer says interrupted and records the approval the call started under, and the provider sees the same', async () => {
+  it('the replay answers interrupted with the approval the call started under; nothing is stored for the call (G-414)', async () => {
     const r = rig({ failResult: true });
     const parked = await r.agent.send(r.session, 'go');
     const approvalId = parked.pendingApprovals[0]!.id;
@@ -86,11 +86,11 @@ describe('G-411 F1: a denial written straight into the thread after the call sta
     await r.agent.send(r.session, '');
     expect(r.ran).toEqual([1]);
 
-    const answer = (await rows(r.session)).filter((row) => row.type === 'tool_result' && (row.tool_results as JsonObject[]).length > 0).at(-1)!;
-    expect((answer.tool_results as JsonObject[]).map((entry) => entry.result)).toEqual([INTERRUPTED]);
-    expect(answer.tool_approval_responses).toEqual([{ approval_id: approvalId, approved: true, reason: null }]);
+    // Replay-only (G-414): no stored outcome for the call.
+    expect((await rows(r.session)).filter((row) => row.type === 'tool_result' && (row.tool_results as JsonObject[]).length > 0)).toEqual([]);
 
     const sent = (r.requests.at(-1)!.messages as JsonObject[]).filter((row) => row.type === 'tool_result' && (row.tool_results as JsonObject[]).length > 0);
+    expect(sent.map((row) => (row.tool_results as JsonObject[]).map((entry) => entry.result))).toEqual([[INTERRUPTED]]);
     expect(sent.map((row) => row.tool_approval_responses)).toEqual([[{ approval_id: approvalId, approved: true, reason: null }]]);
   });
 

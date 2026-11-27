@@ -133,13 +133,21 @@ function plainRig(options: { refuse?: string; gated?: boolean }) {
   return { session, agent, requests, ran };
 }
 
+/** What a request answers `id` with, in the result row directly after its step. */
+function answerFor(request: LlmRequest, id: string): string | undefined {
+  const rows = request.messages as JsonObject[];
+  const step = rows.findIndex((row) => row.type === 'assistant' && Array.isArray(row.tool_calls) && (row.tool_calls as JsonObject[]).some((call) => call.id === id));
+  const next = rows[step + 1];
+  return next?.type === 'tool_result' ? (next.tool_results as JsonObject[]).find((entry) => entry.tool_call_id === id)?.result as string | undefined : undefined;
+}
+
 async function resultsFor(session: Session, id: string): Promise<string[]> {
   return (await session.thread().messages()).flatMap((entry) => (entry.message.type === 'tool_result' ? entry.message.tool_results as JsonObject[] : []))
     .filter((entry) => entry.tool_call_id === id).map((entry) => String(entry.result));
 }
 
 describe('G-412: a call no resolution answers is still answered in every request', () => {
-  it('an ungated call whose result write was refused: the next send stores it as interrupted, once, and never runs it again', async () => {
+  it('an ungated call whose result write was refused: every later request answers it as interrupted, nothing is stored for it (G-414), and it never runs again', async () => {
     const r = plainRig({ refuse: 'worked:1' });
     await r.agent.send(r.session, 'go').catch(() => undefined);
     expect(r.ran).toEqual([1]);
@@ -147,7 +155,8 @@ describe('G-412: a call no resolution answers is still answered in every request
     await r.agent.send(r.session, '');
 
     expect(r.ran).toEqual([1]);
-    expect(await resultsFor(r.session, 'w1')).toEqual(['Tool call was interrupted, it may have run']);
+    expect(await resultsFor(r.session, 'w1')).toEqual([]);
+    expect(r.requests.slice(1).map((request) => answerFor(request, 'w1'))).toEqual(r.requests.slice(1).map(() => 'Tool call was interrupted, it may have run'));
     expect(r.requests.length).toBeGreaterThanOrEqual(3);
     expect(r.requests.flatMap(unanswered)).toEqual([]);
   });

@@ -9,6 +9,7 @@ import {
   type AgentResponse,
   type JsonObject,
   type JsonValue,
+  type LlmRequest,
   type LlmResponse,
   type RunStep,
   type Session,
@@ -55,6 +56,8 @@ interface Rig {
   agent: AgentRuntime;
   ran: number[];
   free: number[];
+  /** Every request the model was sent. */
+  requests: LlmRequest[];
 }
 
 function rig(marker: string, calls: { id: string; name: string; n: number }[]): Rig {
@@ -65,21 +68,40 @@ function rig(marker: string, calls: { id: string; name: string; n: number }[]): 
   });
   const ran: number[] = [];
   const free: number[] = [];
+  const requests: LlmRequest[] = [];
   let model = 0;
   const agent = new AgentRuntime({
     modes: new ModeRegistry({ default: 'guarded', modes: { guarded: { system_prompt: 'Careful.', tools: ['echo', 'free'], max_steps: 6, requires_approval: ['echo'] } } }),
     tools: new ToolRegistry()
       .register({ name: 'echo', handle: (args: JsonObject) => { ran.push(Number(args.n)); return `ran:${String(args.n)}`; } })
       .register({ name: 'free', handle: (args: JsonObject) => { free.push(Number(args.n)); return `free:${String(args.n)}`; } }),
-    client: async (): Promise<LlmResponse> => (++model === 1
-      ? { text: '', finishReason: 'tool_calls', toolCalls: calls.map((call) => ({ id: call.id, name: call.name, arguments: { n: call.n } })) }
-      : { text: 'done', finishReason: 'stop' }),
+    client: async (request: LlmRequest): Promise<LlmResponse> => {
+      requests.push(JSON.parse(JSON.stringify(request)) as LlmRequest);
+      return ++model === 1
+        ? { text: '', finishReason: 'tool_calls', toolCalls: calls.map((call) => ({ id: call.id, name: call.name, arguments: { n: call.n } })) }
+        : { text: 'done', finishReason: 'stop' };
+    },
   });
-  return { session: harness.for({ type: 'User', id: 1 }).session('write-fails'), agent, ran, free };
+  return { session: harness.for({ type: 'User', id: 1 }).session('write-fails'), agent, ran, free, requests };
 }
 
 async function drain(stream: AsyncGenerator<RunStep, AgentResponse, undefined>): Promise<void> {
   for (;;) if ((await stream.next()).done === true) return;
+}
+
+/** What the newest request answers each call with, in the result row directly after its step. */
+function sentAnswers(requests: readonly LlmRequest[]): Record<string, string> {
+  const rows = (requests.at(-1)?.messages ?? []) as JsonObject[];
+  const out: Record<string, string> = {};
+  rows.forEach((row, at) => {
+    if (row.type !== 'assistant' || !Array.isArray(row.tool_calls)) return;
+    const next = rows[at + 1];
+    for (const call of row.tool_calls as JsonObject[]) {
+      const entry = next?.type === 'tool_result' ? (next.tool_results as JsonObject[]).find((result) => result.tool_call_id === call.id) : undefined;
+      out[String(call.id)] = entry === undefined ? '(unanswered)' : String(entry.result);
+    }
+  });
+  return out;
 }
 
 async function outcomes(session: Session, n: number): Promise<string[]> {
@@ -89,7 +111,7 @@ async function outcomes(session: Session, n: number): Promise<string[]> {
 
 describe('a call whose result could not be written', () => {
   for (const path of ['send', 'streamDecision', 'streamSteps'] as const) {
-    it(`the approved call ran and its resolution row was refused (${path}): later resumes never run it again, and it has one outcome`, async () => {
+    it(`the approved call ran and its resolution row was refused (${path}): later resumes never run it again; nothing is stored for it, and the replay answers it as interrupted`, async () => {
       const r = rig('ran:1', [{ id: 'c1', name: 'echo', n: 1 }]);
       const [pending] = (await r.agent.send(r.session, 'go')).pendingApprovals;
       if (path === 'streamDecision') {
@@ -102,7 +124,9 @@ describe('a call whose result could not be written', () => {
       for (let i = 0; i < 3; i += 1) await r.agent.send(r.session, '');
 
       expect(r.ran).toEqual([1]);
-      expect(await outcomes(r.session, 1)).toEqual([INTERRUPTED]);
+      // Replay-only (G-414): a result that lands later would be its one outcome.
+      expect(await outcomes(r.session, 1)).toEqual([]);
+      expect(sentAnswers(r.requests)).toEqual({ c1: INTERRUPTED });
     });
   }
 
@@ -123,19 +147,23 @@ describe('a call whose result could not be written', () => {
 const THR_0022 = '[{"type":"tool_result","tool_results":[],"tool_approval_responses":[],"harness_started":{"tool_call_id":"call_paris","tool_name":"weather","approval_id":"apr_1"},"harness_answers_step":{"position":2}}]';
 
 describe('G-410: the started row', () => {
-  function weatherRig(during: (session: Session) => Promise<void> = async () => {}): { session: Session; agent: AgentRuntime; ran: string[] } {
+  function weatherRig(during: (session: Session) => Promise<void> = async () => {}): { session: Session; agent: AgentRuntime; ran: string[]; requests: LlmRequest[] } {
     const harness = new PrismHarness({
       drivers: { memory: () => new MemorySessionStore(), durable: () => new FailingOnce('never') },
       stores: { ephemeral: 'memory', durable: 'durable' },
     });
     const session = harness.for({ type: 'User', id: 1 }).session('started');
     const ran: string[] = [];
+    const requests: LlmRequest[] = [];
     const agent = new AgentRuntime({
       modes: new ModeRegistry({ default: 'guarded', modes: { guarded: { system_prompt: 'Careful.', tools: ['weather'], max_steps: 6, requires_approval: ['weather'] } } }),
       tools: new ToolRegistry().register({ name: 'weather', handle: async (args: JsonObject) => { ran.push(String(args.city)); await during(session); return `Sunny in ${String(args.city)}`; } }),
-      client: async (): Promise<LlmResponse> => ({ text: 'done', finishReason: 'stop' }),
+      client: async (request: LlmRequest): Promise<LlmResponse> => {
+        requests.push(JSON.parse(JSON.stringify(request)) as LlmRequest);
+        return { text: 'done', finishReason: 'stop' };
+      },
     });
-    return { session, agent, ran };
+    return { session, agent, ran, requests };
   }
   const parked = (calls: [string, string, string][]): JsonObject[] => [
     { type: 'user', content: 'Weather?' },
@@ -162,7 +190,7 @@ describe('G-410: the started row', () => {
     expect(JSON.stringify(replay)).not.toContain('harness_started');
   });
 
-  it('a started row with no result (the worker died) reads interrupted, and the call is never run again', async () => {
+  it('a started row with no result (the worker died) reads interrupted in the replay, nothing is stored for it, and the call is never run again', async () => {
     const r = weatherRig();
     await r.session.thread().record(parked([['call_paris', 'Paris', 'apr_1']]));
     await recordApproval(r.session, 'apr_1', true);
@@ -170,7 +198,9 @@ describe('G-410: the started row', () => {
     for (let i = 0; i < 3; i += 1) await r.agent.send(r.session, '');
 
     expect(r.ran).toEqual([]);
-    expect(await outcomes2(r.session, 'Paris')).toEqual(['Tool call was interrupted, it may have run']);
+    // Replay-only (G-414): nothing is stored, and every request answers it as interrupted.
+    expect(await outcomes2(r.session, 'Paris')).toEqual([]);
+    expect(sentAnswers(r.requests)).toEqual({ call_paris: INTERRUPTED });
   });
 
   it('a started row a host records through Thread.record is ignored: the approved call runs once', async () => {
