@@ -634,9 +634,12 @@ export function replayRows(messages: readonly StoredRow[]): JsonObject[] {
  *
  * So an assistant row a host recorded (not the harness) keeps its provider
  * content ONLY when it is that row's own: its tool items are the row's tool
- * calls exactly (id and name, as a multiset) and its text is the row's
- * content, read as prism-ts reads it. Otherwise both keys are dropped and the
- * client maps the row from `content` and `tool_calls`. Every other key is
+ * calls exactly (id and name, as a multiset), its text is the row's content,
+ * read as prism-ts reads it, and it carries no reasoning (OpenAI reasoning
+ * items; Anthropic thinking, thinking_signature, thinking_blocks, or
+ * thinking and redacted_thinking blocks), which cannot be checked. Otherwise
+ * all of those keys are dropped and the client maps the row from `content`
+ * and `tool_calls`. Every other key is
  * kept, rows the harness wrote are returned as they are, and the stored row is
  * unchanged.
  */
@@ -654,12 +657,22 @@ function withoutHostToolItems(row: JsonObject, harness: true | undefined): JsonO
   const anthropicOwn = !Array.isArray(contentBlocks) || (
     callPrints(contentBlocks.filter(isObject).filter((block) => block.type === 'tool_use').map((block) => [text(block.id), text(block.name)])) === own
     && contentBlocks.filter(isObject).filter((block) => block.type === 'text').map((block) => (typeof block.text === 'string' ? block.text : '')).join('') === content);
-  if (openaiOwn && anthropicOwn) return row;
+  // Reasoning cannot be checked against the row, so a host row carrying any
+  // is never the host's own content to send.
+  const reasoning = REASONING_KEYS.some((key) => additional[key] !== undefined && additional[key] !== null)
+    || (Array.isArray(outputItems) && outputItems.some((item) => isObject(item) && item.type === 'reasoning'))
+    || (Array.isArray(contentBlocks) && contentBlocks.some((block) => isObject(block) && (block.type === 'thinking' || block.type === 'redacted_thinking')));
+  if (openaiOwn && anthropicOwn && !reasoning) return row;
   const kept: JsonObject = { ...additional };
-  delete kept.output_items;
-  delete kept.content_blocks;
+  for (const key of PROVIDER_CONTENT_KEYS) delete kept[key];
   return { ...row, additional_content: kept };
 }
+
+/** Anthropic's reasoning keys on an assistant row's additional_content. */
+const REASONING_KEYS = ['thinking', 'thinking_signature', 'thinking_blocks'] as const;
+
+/** What a prism client replays from an assistant row as given: left out together (G-415). */
+const PROVIDER_CONTENT_KEYS = ['output_items', 'content_blocks', ...REASONING_KEYS] as const;
 
 /** A multiset of (id, name) pairs, as one comparable string. */
 function callPrints(pairs: [string, string][]): string {
