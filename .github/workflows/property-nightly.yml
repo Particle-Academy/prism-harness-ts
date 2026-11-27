@@ -5,8 +5,11 @@ name: Property tests (long set)
 # the property files, with many more examples and a seed taken from the run,
 # so each run explores new cases and logs the seed to replay them.
 #
-# `schedule` fires only from the default branch, so this copy runs every
-# supported line as a matrix ref; each release line keeps a dispatch-only copy.
+# `schedule` fires only from the default branch, so this copy tests the
+# default branch only. It never checks out another ref: code from another ref
+# run in the default branch's context could poison what that context trusts
+# (CodeQL actions/cache-poisoning). Each release line keeps its own
+# dispatch-only copy of this workflow.
 
 on:
   schedule:
@@ -23,25 +26,21 @@ permissions:
 
 jobs:
   property:
-    name: property / ${{ matrix.ref }} / ${{ matrix.os }}
+    name: property / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        ref: [main, release/0.11.x]
         os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ matrix.ref }}
           persist-credentials: false
-      # No dependency cache: this job checks out another ref (a release line)
-      # in the default branch's context, so a cache it wrote could be restored
-      # by a default-branch run (CodeQL actions/cache-poisoning).
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+          cache: npm
       - run: npm ci
       - name: Property tests
         shell: bash
