@@ -20,6 +20,7 @@ import {
   supersededAt,
   resultOwners,
   approvalSuperseded,
+  startedDecisions,
   REPLACED_STEP_KEY,
   answeringStep,
   isToolCallStep,
@@ -1009,6 +1010,10 @@ export class AgentRuntime {
     // Each result as the replay view holds it, never folded by call id alone (G-402).
     const results = answered.flatMap((row) => row.tool_results);
     const decisions = new Map(answered.flatMap((row) => row.tool_approval_responses).map((entry) => [entry.approval_id, entry]));
+    // A started call keeps the decision it started under: a decision written
+    // after it started (straight into the thread) is not recorded beside its
+    // outcome (G-411).
+    for (const [approvalId, entry] of startedDecisions(messages, stored)) if (decisions.has(approvalId)) decisions.set(approvalId, entry);
     // An approval belongs to the step that first asked for it: a later row
     // repeating its id (a copy a host recorded) asks for nothing, so one
     // decision never decides a call of another step (G-408).
