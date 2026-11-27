@@ -117,13 +117,41 @@ describe('G-415: a host row\'s provider content is sent only when it is that row
     expect(additional(sent)).toEqual({});
   });
 
-  it('a host row whose provider content IS its own (same calls, same text) is sent as recorded, on both providers', async () => {
+  it('a host row whose provider content IS its own (same calls, same text, no reasoning) is sent as recorded, on both providers', async () => {
     const own = { output_items: [message('Looking.'), openaiCall('fc_1')], content_blocks: [{ type: 'text', text: 'Looking.' }, toolUse('fc_1')] };
     // OpenAI's text is the first part of the last output item: here the call, so empty.
-    const openai = await sendWith(hostRow('', { output_items: [{ type: 'reasoning', id: 'rs_1', summary: [] }, openaiCall('fc_1')] }, [call('fc_1')]));
-    expect(additional(openai.sent).output_items).toEqual([{ type: 'reasoning', id: 'rs_1', summary: [] }, openaiCall('fc_1')]);
+    const openai = await sendWith(hostRow('', { output_items: [message('Looking.'), openaiCall('fc_1')] }, [call('fc_1')]));
+    expect(additional(openai.sent).output_items).toEqual(own.output_items);
     const anthropic = await sendWith(hostRow('Looking.', { content_blocks: own.content_blocks }, [call('fc_1')]));
     expect(additional(anthropic.sent).content_blocks).toEqual(own.content_blocks);
+  });
+
+  it('reasoning on a host row cannot be checked, so the row\'s provider content is dropped: OpenAI reasoning items, even when calls and text match', async () => {
+    for (const items of [
+      [{ type: 'reasoning', id: 'rs_copied', summary: [] }, message(NOTE)],
+      [{ type: 'reasoning', id: 'rs_copied', summary: [{ type: 'summary_text', text: 'thought' }], encrypted_content: 'x' }, openaiCall('fc_1')],
+    ]) {
+      const calls = items.some((item) => item.type === 'function_call') ? [call('fc_1')] : [];
+      const { sent, stored } = await sendWith(hostRow(calls.length > 0 ? '' : NOTE, { output_items: items, keep: 'me' }, calls));
+      expect(additional(sent)).toEqual({ keep: 'me' });
+      expect(additional(stored).output_items).toEqual(items);
+    }
+  });
+
+  it('reasoning on a host row cannot be checked, so the row\'s provider content is dropped: Anthropic thinking, thinking_signature, thinking_blocks and thinking blocks', async () => {
+    const thinking = { type: 'thinking', thinking: 'copied thought', signature: 'sig' };
+    for (const extra of [
+      { thinking: 'copied thought', thinking_signature: 'sig' },
+      { thinking_blocks: [thinking] },
+      { content_blocks: [thinking, { type: 'text', text: NOTE }] },
+      { content_blocks: [{ type: 'redacted_thinking', data: 'x' }, { type: 'text', text: NOTE }] },
+      { content_blocks: [{ type: 'fallback' }, thinking, { type: 'text', text: NOTE }] },
+      { thinking: 'copied thought', thinking_signature: 'sig', content_blocks: [{ type: 'text', text: NOTE }] },
+    ]) {
+      const { sent } = await sendWith(hostRow(NOTE, { ...extra, keep: 'me' }));
+      expect(additional(sent)).toEqual({ keep: 'me' });
+      expect(sent.content).toBe(NOTE);
+    }
   });
 
   it('a host row whose tool_calls hold no objects counts as one with none', async () => {
