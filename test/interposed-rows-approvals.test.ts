@@ -26,6 +26,7 @@ import {
 // Offline; every store is in memory.
 
 const REPEATED = 'Tool call was not run because another call in this step has the same id';
+const REPLACED = 'Tool call was not run because a later step replaced it';
 
 const network = vi.fn(() => { throw new Error('A test tried to use the network.'); });
 beforeEach(() => { vi.stubGlobal('fetch', network); });
@@ -54,6 +55,13 @@ const INTERPOSED: Record<string, JsonObject> = {
   },
   'an empty tool result row': { type: 'tool_result', tool_results: [], tool_approval_responses: [] },
 };
+
+/**
+ * The rows that SUPERSEDE the parked step when the host records them, outside
+ * the run that owns it (G-397): its gated calls are then denied as replaced,
+ * nothing of it runs, and a decision recorded after the row is refused.
+ */
+const SUPERSEDING = new Set(['an assistant text row', 'a user row']);
 
 interface Rig {
   session: Session;
@@ -101,15 +109,26 @@ async function outcomesOf(session: Session, n: number): Promise<string[]> {
 
 type Decide = 'recordApproval' | 'recordDecisions' | 'streamDecision';
 
-async function decideAndResume(r: Rig, decisions: ApprovalDecision[], how: Decide, row: JsonObject, where: 'before' | 'after'): Promise<void> {
+/**
+ * Record `row` before or after the decisions, decide, and resume. A decision
+ * recorded after a superseding row must be refused (approval_not_pending);
+ * every other decision must be accepted.
+ */
+async function decideAndResume(r: Rig, decisions: ApprovalDecision[], how: Decide, row: JsonObject, where: 'before' | 'after', supersedes: boolean): Promise<void> {
+  const refused = supersedes && where === 'before';
+  const outcome = async (body: () => Promise<unknown>): Promise<void> => {
+    if (refused) await expect(body()).rejects.toMatchObject({ code: 'approval_not_pending' });
+    else await body();
+  };
   if (where === 'before') await r.session.thread().record([row]);
   if (how === 'streamDecision') {
     if (where === 'after') throw new Error('streamDecision records and resumes in one call');
-    await drain(r.agent.streamDecision(r.session, decisions));
+    await outcome(() => drain(r.agent.streamDecision(r.session, decisions)));
+    if (refused) await r.agent.send(r.session, '');
     return;
   }
-  if (how === 'recordDecisions') await recordDecisions(r.session, decisions);
-  else for (const d of decisions) await recordApproval(r.session, d.approvalId, d.approved, d.reason ?? null);
+  if (how === 'recordDecisions') await outcome(() => recordDecisions(r.session, decisions));
+  else for (const d of decisions) await outcome(() => recordApproval(r.session, d.approvalId, d.approved, d.reason ?? null));
   if (where === 'after') await r.session.thread().record([row]);
   await r.agent.send(r.session, '');
 }
@@ -131,15 +150,16 @@ describe('G-397: a row between the park and the decision never makes a repeated-
           expect(parked.pendingApprovals).toHaveLength(2);
           const decisions = parked.pendingApprovals.map((p, i) => ({ approvalId: p.id, approved: verdicts[i]!, reason: verdicts[i] ? null : 'no' }));
 
-          await decideAndResume(r, decisions, how, row, where);
+          await decideAndResume(r, decisions, how, row, where, SUPERSEDING.has(label));
           // A later approval and repeat resumes revive nothing.
           for (const p of parked.pendingApprovals) await recordApproval(r.session, p.id, true).catch(() => undefined);
           await r.agent.send(r.session, '');
           await drain(r.agent.streamSteps(r.session, ''));
 
+          const denial = SUPERSEDING.has(label) ? REPLACED : REPEATED;
           expect(r.ran).toEqual([]);
-          expect(await outcomesOf(r.session, 1)).toEqual([REPEATED]);
-          expect(await outcomesOf(r.session, 2)).toEqual([REPEATED]);
+          expect(await outcomesOf(r.session, 1)).toEqual([denial]);
+          expect(await outcomesOf(r.session, 2)).toEqual([denial]);
         });
       }
     }
@@ -149,12 +169,13 @@ describe('G-397: a row between the park and the decision never makes a repeated-
     const r = rig([{ id: '', name: 'free', arguments: {} }, echo('', 1), echo('', 2)]);
     const parked = await r.agent.send(r.session, 'go');
     await r.session.thread().record([INTERPOSED['a user row']!]);
-    await recordDecisions(r.session, parked.pendingApprovals.map((p) => ({ approvalId: p.id, approved: true })));
+    await expect(recordDecisions(r.session, parked.pendingApprovals.map((p) => ({ approvalId: p.id, approved: true }))))
+      .rejects.toMatchObject({ code: 'approval_not_pending' });
     await r.agent.send(r.session, '');
 
     expect(r.ran).toEqual([]);
-    expect(await outcomesOf(r.session, 1)).toEqual([REPEATED]);
-    expect(await outcomesOf(r.session, 2)).toEqual([REPEATED]);
+    expect(await outcomesOf(r.session, 1)).toEqual([REPLACED]);
+    expect(await outcomesOf(r.session, 2)).toEqual([REPLACED]);
   });
 });
 
@@ -165,19 +186,15 @@ describe('G-397 control: distinct ids with a row between are decided per call, n
         const r = rig([echo('c1', 1), echo('c2', 2)]);
         const parked = await r.agent.send(r.session, 'go');
         const [one, two] = parked.pendingApprovals;
-        await decideAndResume(r, [{ approvalId: one!.id, approved: false, reason: 'no' }, { approvalId: two!.id, approved: true }], how, row, where);
+        await decideAndResume(r, [{ approvalId: one!.id, approved: false, reason: 'no' }, { approvalId: two!.id, approved: true }], how, row, where, SUPERSEDING.has(label));
         await recordApproval(r.session, one!.id, true).catch(() => undefined);
         await r.agent.send(r.session, '');
 
-        expect(r.ran).not.toContain(1);
-        expect(r.ran.filter((n) => n === 2).length).toBeLessThanOrEqual(1);
-        // Each call has exactly one outcome, and a call that did not run is not reported as run.
-        const first = await outcomesOf(r.session, 1);
-        const second = await outcomesOf(r.session, 2);
-        expect(first).toHaveLength(1);
-        expect(first[0]).not.toMatch(/^ran:/);
-        expect(second).toHaveLength(1);
-        expect(second[0] === 'ran:2').toBe(r.ran.includes(2));
+        // Superseded: neither runs, each is denied as replaced. Otherwise each
+        // is decided by its own approval, once.
+        expect(r.ran).toEqual(SUPERSEDING.has(label) ? [] : [2]);
+        expect(await outcomesOf(r.session, 1)).toEqual([SUPERSEDING.has(label) ? REPLACED : 'no']);
+        expect(await outcomesOf(r.session, 2)).toEqual([SUPERSEDING.has(label) ? REPLACED : 'ran:2']);
       });
     }
   }
@@ -211,20 +228,16 @@ describe('G-397: a resolved call is never run again because a row sits between i
         else for (const d of decisions) await recordApproval(session, d.approvalId, d.approved, d.reason ?? null);
         await session.thread().record([row]);
 
+        const supersedes = SUPERSEDING.has(label);
         await expect(agent.send(session, '')).rejects.toThrow('scripted');
-        // A row that moves the tail (a user or assistant text row) may make the
-        // approved call fail closed; otherwise it ran. Either way, once.
-        expect(ran.length).toBeLessThanOrEqual(1);
-        const once = [...ran];
+        expect(ran).toEqual(supersedes ? [] : [2]);
         const again = await agent.send(session, '');
         await drain(agent.streamSteps(session, ''));
 
-        expect(ran).toEqual(once);
+        expect(ran).toEqual(supersedes ? [] : [2]);
         expect(again.toolCalls).toEqual([]);
-        expect(await outcomesOf(session, 1)).toEqual(['no']);
-        const second = await outcomesOf(session, 2);
-        expect(second).toHaveLength(1);
-        expect(second[0] === 'ran:2').toBe(ran.includes(2));
+        expect(await outcomesOf(session, 1)).toEqual([supersedes ? REPLACED : 'no']);
+        expect(await outcomesOf(session, 2)).toEqual([supersedes ? REPLACED : 'ran:2']);
       });
     }
   }
