@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { ParticipantRef, SessionAddress } from './address.js';
 import { indexedStore, storeLockRank, StoreAddressIndex } from './address-index.js';
 import type { JsonObject, JsonValue } from './json.js';
@@ -104,6 +105,14 @@ export class Session {
   #cachedState: JsonObject | null = null;
   #resolutionOnly = false;
   #resolvedMode: string | null = null;
+  /**
+   * The runner start THIS Session object is running (G-387 round 11), from
+   * its commit (b) until its run ends: the start's own reads see what it
+   * committed (mode, binding, refs, depth, ceiling, its run), every other
+   * Session object on the child keeps the provisional rule until the task
+   * row. In memory only: nothing stored can set it, and it dies with the run.
+   */
+  #ownStart: string | null = null;
 
   constructor(options: SessionOptions) {
     if (options.participant instanceof ParticipantRef && options.actor === undefined) throw new Error('Typed participants require an explicit authorization actor.');
@@ -452,9 +461,30 @@ export class Session {
     return await this.#taskRecorded(record.child_provisional);
   }
 
-  /** True when `runId` is a run id with a user row recorded under it in this thread. */
+  /**
+   * End this object's view of the runner start `runId` (G-387 round 11):
+   * from here its reads follow the provisional rule like every other
+   * reader's. A no-op for any other run id. Called when the start's run
+   * ends, and first thing on its failure path.
+   *
+   * @internal Called by the runtime.
+   */
+  endChildStartView(runId: string): void {
+    if (this.#ownStart === runId) this.#ownStart = null;
+    const scope = turnScopes.getStore();
+    if (scope?.start === runId) scope.start = null;
+  }
+
+  /**
+   * True when `runId` is a run id with a user row recorded under it in this
+   * thread, or the runner start this very object is running (round 11).
+   */
   async #taskRecorded(runId: JsonValue | undefined): Promise<boolean> {
     if (typeof runId !== 'string' || runId === '') return false;
+    // The start's own view: this object, inside the turn that committed it.
+    // A decision or another turn, even one entered on this object from
+    // inside that run, has a scope of its own and keeps the provisional rule.
+    if (runId === this.#ownStart && turnScopes.getStore()?.start === runId) return true;
 
     return (await this.#threadOf().messages()).some((entry) => entry.runId === runId && entry.message.type === 'user');
   }
@@ -510,15 +540,15 @@ export class Session {
     let result: ChildStart | 'busy' | 'waiting' = 'busy';
     this.#assertWritable();
     const name = this.#durableKey();
-    await this.#durable.withLock(name, async () => {
+    const committed = await this.#durable.withLock(name, async (): Promise<boolean> => {
       const existing = await this.#durable.get(name);
       const stored = existing ?? {};
-      if (hasLiveHold(stored.child_steps, hold.at, ttlSeconds)) return;
+      if (hasLiveHold(stored.child_steps, hold.at, ttlSeconds)) return false;
       // Under the same lock: an approval a person can answer, parked since
       // the start's gate read the child (round 8), refuses it too.
       if (await waiting()) {
         result = 'waiting';
-        return;
+        return false;
       }
       const holds: JsonObject = hold.steps < 1 ? {} : { [hold.runId]: { steps: hold.steps, at: hold.at } };
       // The refs the child was last CONFIRMED with (round 10): its own when
@@ -569,7 +599,14 @@ export class Session {
         }
       }
       result = { existed: existing != null, prior, written, mode, priorMode: priorMode ?? null, holdRunId: hold.runId };
+      return true;
     }, 10, 5);
+    // Committed: this object's own reads, in this turn, now see the start (round 11).
+    if (committed) {
+      this.#ownStart = hold.runId;
+      const scope = turnScopes.getStore();
+      if (scope !== undefined) scope.start = hold.runId;
+    }
 
     return result;
   }
@@ -586,6 +623,7 @@ export class Session {
    */
   async undoChildStart(start: ChildStart, now: number, ttlSeconds: number): Promise<void> {
     this.#assertWritable();
+    this.endChildStartView(start.holdRunId);
     const name = this.#durableKey();
     let restored = Object.keys(start.written).length === 0;
     if (!restored) {
@@ -931,7 +969,7 @@ export class Session {
   async resolveReadOnly<T>(mode: string, resolve: (session: Session) => T | Promise<T>): Promise<T> {
     const view = new Session({ participant: this.participant, scope: this.scope, agent: this.agent, actor: this.actor,
       ephemeral: this.#rawEphemeral, durable: this.#rawDurable, addressIndex: this.#addressIndex, ttlSeconds: this.#ttlSeconds });
-    view.#resolutionOnly = true; view.#resolvedMode = mode;
+    view.#resolutionOnly = true; view.#resolvedMode = mode; view.#ownStart = this.#ownStart;
     try { return await resolve(view); }
     finally { view.#resolutionOnly = false; view.#cachedState = null; }
   }
@@ -1122,4 +1160,24 @@ function canonical(value: JsonValue | undefined): string {
   if (isJsonObject(value)) return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonical(value[key])}`).join(',')}}`;
 
   return JSON.stringify(value);
+}
+
+/**
+ * The turn (or decision) an async call chain belongs to (G-387 round 11):
+ * `start` is the runner start that turn committed, if any. A runner start's
+ * own view of its records applies only on its own Session object AND inside
+ * its own turn's scope, so host code that reaches that object some other way
+ * (a decision, a resume, a new message) reads the provisional records as
+ * absent, like every reader outside the start.
+ */
+const turnScopes = new AsyncLocalStorage<{ start: string | null }>();
+
+/**
+ * Run `body` as a turn or a decision of its own: no runner start's view
+ * from an enclosing turn reaches it.
+ *
+ * @internal Called by the runtime for every turn and every decision write.
+ */
+export function inOwnTurnScope<T>(body: () => T): T {
+  return turnScopes.run({ start: null }, body);
 }

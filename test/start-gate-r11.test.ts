@@ -418,7 +418,7 @@ describe('item 4: terminal events and log lines', () => {
       await r.session().usingMode('lead');
       const value = make();
       const seen: string[] = [];
-      r.events.listen((event: HarnessEvent) => { if (event.type === 'run.started' || event.type === 'run.failed' || event.type === 'run.completed') seen.push(event.type); });
+      r.events.listen((event: HarnessEvent) => { if (event.type === 'run.started' || event.type === 'run.failed' || event.type === 'run.finished') seen.push(event.type); });
       const runtime = new AgentRuntime({ modes: r.modes, tools: r.registry, events: r.events, client: async () => { throw value; } });
 
       const caught = await runtime.send(r.session(), 'Hello').then(() => 'resolved', (error: unknown) => error);

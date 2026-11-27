@@ -622,9 +622,12 @@ describe("item 5: a host tool provider may read the child's session state while 
 
       expect(framed).not.toMatch(/failed|denied|exhausted/);
       expect(reads).toHaveLength(1);
-      // The start is still provisional while it resolves its tools: the run
-      // before it (none) and no binding.
-      expect(reads[0]).toMatchObject({ run: null, binding: null, unconfirmed: true });
+      // The start's OWN reads see what it committed (round 11 item 5): its
+      // run and its binding, confirmed for it. Every other reader still
+      // reads them as provisional (start-gate-r11, the invariant matrix).
+      expect(reads[0]).toMatchObject({ unconfirmed: false });
+      expect((reads[0] as { run: unknown }).run).not.toBeNull();
+      expect((reads[0] as { binding: unknown }).binding).not.toBeNull();
       expect(wrote).toBe(0);
       expect(refused).toEqual(Array(3).fill('Harness tool resolution is read-only.'));
     });
@@ -872,7 +875,10 @@ describe('round 10: new channels considered', () => {
     // Another tool's text, or a near copy: not ended.
     expect([...endedByStart([asked, result(endedByStartResult('other')), user])]).toEqual([]);
     expect([...endedByStart([asked, result(`${endedByStartResult('echo')} `), user])]).toEqual([]);
-    // The start's own row, right before its task row: ended.
-    expect([...endedByStart([asked, result(endedByStartResult('echo')), user])]).toEqual(['apr_1']);
+    // The same text right before a task row is NOT ended either (round 11):
+    // only the harness's own mark makes a row the start's.
+    expect([...endedByStart([asked, result(endedByStartResult('echo')), user])]).toEqual([]);
+    const marked: JsonObject = { type: 'tool_result', tool_results: [{ tool_call_id: 'c1', tool_name: 'echo', result: endedByStartResult('echo'), not_run: 'delegation_ended', approval_id: 'apr_1' }], tool_approval_responses: [] };
+    expect([...endedByStart([asked, marked, user])]).toEqual(['apr_1']);
   });
 });

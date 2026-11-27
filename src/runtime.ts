@@ -17,17 +17,19 @@ import {
   ambiguousCalls,
   pendingApprovalIds,
   unresolvedApprovalIds,
+  ENDED_BY_START,
+  ENDED_BY_START_KEY,
   endedByStartResult,
   ARGUMENTS_AS_SENT,
 } from './thread-rows.js';
 import { usableArguments } from './tool-arguments.js';
 import { admitAttachments } from './attachments.js';
 import { HarnessError } from './errors.js';
-import { errorCode, runFailure } from './failures.js';
+import { errorCode, failureName, runFailure } from './failures.js';
 import type { HarnessEvents, ToolDecisionEvent } from './events.js';
 import { ToolPolicy, argsDigest } from './tool-policy.js';
 import type { AgentMode, ModeRegistry } from './modes.js';
-import type { ChildRefs, Session } from './session.js';
+import { inOwnTurnScope, type ChildRefs, type Session } from './session.js';
 import { schemaName, schemaProblems } from './structured.js';
 import { MAX_DEPTH, RunBudget, RunContext, RunLedger, bindingRoute, type ModelBinding, type RunStop } from './subagents.js';
 import { RunTrees, type RunTreeRef, type TreeMembership } from './run-trees.js';
@@ -890,6 +892,20 @@ export class AgentRuntime {
     schema?: Readonly<JsonObject>,
     stepping?: Stepping,
   ): Promise<AgentResponse> {
+    // Every turn has a scope of its own (round 11): a runner start's view of
+    // its own records reaches no other turn, nested or not.
+    return inOwnTurnScope(() => this.#turnIn(session, prompt, toolNames, context, additionalContent, schema, stepping));
+  }
+
+  async #turnIn(
+    session: Session,
+    prompt: string,
+    toolNames?: readonly string[],
+    context?: RunContext,
+    additionalContent: readonly unknown[] = [],
+    schema?: Readonly<JsonObject>,
+    stepping?: Stepping,
+  ): Promise<AgentResponse> {
     // Refused before a run exists: a bad attachment is a mistake in the call,
     // and it should not cost a run, events or budget.
     const attachments = admitAttachments(prompt, additionalContent);
@@ -986,6 +1002,7 @@ export class AgentRuntime {
       // The run never began: a runner start is undone (its child records,
       // mode and holds), and it fails as before.
       unwatchPlan();
+      session.endChildStartView(runId);
       await started?.undo();
       throw error;
     }
@@ -1154,6 +1171,10 @@ export class AgentRuntime {
               : { type: 'user', content: prompt, additional_content: [...attachments, { text: prompt }], additional_attributes: {} };
 
           await thread.record([...(ended?.rows ?? []), message], runId);
+          // Recorded the moment its row is (round 11), before any event: a
+          // listener that throws or re-enters never sees a recorded task as
+          // unrecorded, and a start whose task row exists is never undone.
+          taskRecorded = true;
           // Only once those rows are stored (round 10): a write that failed
           // reports no denial that was never recorded.
           ended?.announce();
@@ -1190,6 +1211,9 @@ export class AgentRuntime {
       // A runner start that never recorded its task row is provisional: its
       // records already read as absent, so the undo is housekeeping only and
       // its failure changes nothing; its holds expire.
+      // The start's own view ends first (round 11): from here its Session
+      // reads its records by the provisional rule, as every other reader.
+      session.endChildStartView(runId);
       if (started !== null && !taskRecorded) {
         try {
           await started.undo();
@@ -1216,6 +1240,7 @@ export class AgentRuntime {
 
       throw error;
     } finally {
+      session.endChildStartView(runId);
       unwatchPlan();
       this.#childRefs.delete(runId);
       // A root run that holds part of a run tree's budget settles it.
@@ -1491,7 +1516,15 @@ export class AgentRuntime {
     const work = await this.#unresolved(session, mode);
     if (work === null) return { rows: [], announce: () => {} };
     const inputs = work.calls.map((call) => ({ id: call.id, name: call.name, arguments: work.ambiguous.has(call.id) ? {} : call.arguments, resultId: call.result_id }));
-    const ended: ToolResultEntry[] = inputs.map((input) => toolResultEntry(input, endedByStartResult(input.name)));
+    // Each entry carries the harness-only mark (round 11) and the approval
+    // it ended: a tool controls only its `result` string, and the replay
+    // view and every builder rebuild entries from their known keys, so no
+    // tool result, argument or model output can produce either.
+    const ended: ToolResultEntry[] = inputs.map((input) => {
+      const approvalId = work.approvalIds.get(input.id);
+
+      return { ...toolResultEntry(input, endedByStartResult(input.name)), [ENDED_BY_START_KEY]: ENDED_BY_START, ...(approvalId === undefined ? {} : { approval_id: approvalId }) };
+    });
 
     return {
       rows: [toolResultRow([...work.results.values(), ...ended]) as unknown as JsonObject],
@@ -1851,6 +1884,11 @@ async function writeDecisionsLocked(
  * Call it holding the session lock: the check and the write are one step.
  */
 async function writeDecisions(session: Session, decisions: readonly ApprovalDecision[], context?: RunContext): Promise<void> {
+  // A decision is never inside a runner start's own view (round 11).
+  return inOwnTurnScope(() => writeDecisionsIn(session, decisions, context));
+}
+
+async function writeDecisionsIn(session: Session, decisions: readonly ApprovalDecision[], context?: RunContext): Promise<void> {
   const rows = (await session.thread().messages()).map((entry) => entry.message);
   const pending = new Set(pendingApprovalIds(rows));
   for (const decision of decisions) {
@@ -2024,7 +2062,7 @@ async function settleDelegation(session: Session, runId: string, took: number, t
   try {
     await session.settleChildSteps(runId, took, Math.floor(Date.now() / 1000), ttl);
   } catch (error) {
-    process.emitWarning(`A delegation step budget update failed: ${error instanceof Error ? error.constructor.name : typeof error}.`);
+    process.emitWarning(`A delegation step budget update failed: ${failureName(error)}.`);
   }
 }
 
@@ -2040,6 +2078,7 @@ async function rememberSeq(session: Session, runId: string, steps: RunStepTagger
   try {
     await session.rememberStepSeq(runId, steps.seq);
   } catch (error) {
-    process.emitWarning(`prism-harness could not record the step sequence of run [${runId}]: ${String(error)}`);
+    // The class by the named-class rule, never the error's own words (round 11).
+    process.emitWarning(`prism-harness could not record the step sequence of run [${runId}]: ${failureName(error)}.`);
   }
 }

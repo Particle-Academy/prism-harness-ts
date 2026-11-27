@@ -1,5 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import { HarnessError } from '../errors.js';
+import { failureName } from '../failures.js';
 import type { HarnessEvents } from '../events.js';
 import type { JsonObject } from '../json.js';
 import type { ModeRegistry } from '../modes.js';
@@ -687,8 +688,7 @@ function key(sessionKey: string): string {
  * plan text never goes into a log.
  */
 function reportQuietly(error: unknown): void {
-  const name = error instanceof Error ? error.constructor.name : typeof error;
-  process.emitWarning(`A plan update failed: ${name}.`);
+  process.emitWarning(`A plan update failed: ${failureName(error)}.`);
 }
 
 /**

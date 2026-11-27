@@ -271,8 +271,8 @@ export function unresolvedApprovalIds(rows: readonly JsonObject[]): string[] {
 /**
  * The result a runner start's task row records for a call its child was
  * parked on (G-387 round 9): not run, whatever decision is recorded on it.
- * Read back by endedByStart() so a decision on such a call never reads as
- * approved work (round 10).
+ * The text is for the model; the harness recognises such a row only by its
+ * mark (ENDED_BY_START_KEY, round 11), never by these words.
  *
  * @internal
  */
@@ -281,31 +281,49 @@ export function endedByStartResult(tool: string): string {
 }
 
 /**
+ * The key and value of the mark a runner start's task row puts on each
+ * entry it ends (G-387 round 11), beside `approval_id`, the approval it
+ * ended. Only the harness writes them: a tool returns a `result` string and
+ * nothing else of the entry, and the replay view rebuilds entries from
+ * their known keys, so the model never sees them either.
+ *
+ * @internal
+ */
+export const ENDED_BY_START_KEY = 'not_run';
+/** @internal */
+export const ENDED_BY_START = 'delegation_ended';
+
+/**
  * The approval ids whose call a runner start's task row ended as not run
  * (G-387 round 10): their decision, if any, was never acted on, so it reads
- * as ended, never as approved. Such a result is the start's own row: its
- * exact text for its tool, in the tool result row written directly before
- * the start's task row (one write). A tool result that only copies the
- * text, anywhere else, is not one; one that also sat right before a new
- * message could only make a decision read as ended, never as approved.
+ * as ended, never as approved.
+ *
+ * Recognised ONLY by the harness's mark (round 11), never by the result
+ * text: a tool that returns the very words of a "Not run" result is an
+ * ordinary result. And only for the approval the mark names, asked for by a
+ * request row BEFORE the marked row, for the same call: never by tool_call
+ * id across the thread, since providers reuse call ids (one per function
+ * name, or numbered per response), and a later approval with a reused id
+ * is its own. The marked row is the one written directly before the start's
+ * task row (one write).
  *
  * @internal
  */
 export function endedByStart(rows: readonly JsonObject[]): Set<string> {
-  const calls = new Set<string>();
+  const asked = new Map<string, string>();
+  const ended = new Set<string>();
   for (const [index, row] of rows.entries()) {
+    if (row.type === 'assistant') {
+      for (const request of list(row.tool_approval_requests)) {
+        if (typeof request.approval_id === 'string' && typeof request.tool_call_id === 'string' && !asked.has(request.approval_id)) asked.set(request.approval_id, request.tool_call_id);
+      }
+      continue;
+    }
     if (row.type !== 'tool_result' || rows[index + 1]?.type !== 'user') continue;
     for (const result of list(row.tool_results)) {
-      if (typeof result.tool_call_id === 'string' && typeof result.tool_name === 'string'
-        && result.result === endedByStartResult(result.tool_name)) calls.add(result.tool_call_id);
-    }
-  }
-  const ended = new Set<string>();
-  if (calls.size === 0) return ended;
-  for (const row of rows) {
-    if (row.type !== 'assistant') continue;
-    for (const request of list(row.tool_approval_requests)) {
-      if (typeof request.approval_id === 'string' && typeof request.tool_call_id === 'string' && calls.has(request.tool_call_id)) ended.add(request.approval_id);
+      const approval = result.approval_id;
+      if (result[ENDED_BY_START_KEY] === ENDED_BY_START && typeof approval === 'string'
+        && asked.has(approval) && asked.get(approval) === result.tool_call_id) ended.add(approval);
     }
   }
 
