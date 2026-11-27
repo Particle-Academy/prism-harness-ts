@@ -1,6 +1,5 @@
 import type { JsonObject, JsonValue } from './json.js';
 import { usableArguments } from './tool-arguments.js';
-import { canonicalJson } from './tool-policy.js';
 
 /**
  * The rows a run writes to a thread, in the shape the PHP reference stores.
@@ -245,7 +244,27 @@ function unreplayed(row: ToolResultRow, replayed: Map<string, number>, decided: 
  * or their arguments are two results.
  */
 function resultKey(entry: ToolResultEntry): string {
-  return `${entry.tool_call_id.length}:${entry.tool_call_id}${entry.tool_name.length}:${entry.tool_name}${canonicalJson(entry.args)}`;
+  const known = KEYS.get(entry);
+  if (known !== undefined) return known;
+  const key = `${entry.tool_call_id.length}:${entry.tool_call_id}${entry.tool_name.length}:${entry.tool_name}${sortedJson(entry.args)}`;
+  KEYS.set(entry, key);
+
+  return key;
+}
+
+/** Each entry's key, computed once: arguments can be large, and a fold asks more than once. */
+const KEYS = new WeakMap<ToolResultEntry, string>();
+
+/**
+ * JSON with every object's keys in sorted order (UTF-16 code units, as
+ * canonical JSON sorts them), by the engine's own serialiser: the same
+ * equality as canonical JSON for stored arguments, in one pass and without
+ * an intermediate string per element (a call's arguments may be very large).
+ */
+function sortedJson(value: unknown): string {
+  return JSON.stringify(value, (_key, item: unknown) => (typeof item === 'object' && item !== null && !Array.isArray(item)
+    ? Object.fromEntries(Object.keys(item).sort().map((key) => [key, (item as Record<string, unknown>)[key]]))
+    : item)) ?? 'null';
 }
 
 /**
@@ -899,7 +918,7 @@ export function stepResultsByPosition(rows: readonly JsonObject[], index: number
     const added: string[] = [];
     for (const entry of entries) {
       const id = text(entry.tool_call_id);
-      const print = canonicalJson([id, text(entry.tool_name), isObject(entry.args) ? entry.args : {}, text(entry.result)]);
+      const print = sortedJson([id, text(entry.tool_name), isObject(entry.args) ? entry.args : {}, text(entry.result)]);
       if (prints.has(print)) continue;
       added.push(print);
       const open = (position: number): boolean => !has[position] && text(calls[position]!.id) === id;
