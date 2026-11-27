@@ -1,0 +1,206 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  AgentRuntime,
+  MemorySessionStore,
+  ModeRegistry,
+  PrismHarness,
+  ToolRegistry,
+  recordApproval,
+  type JsonObject,
+  type LlmRequest,
+  type LlmResponse,
+  type LlmToolCall,
+  type Session,
+} from '../src/index.js';
+import { ARGUMENTS_AS_SENT, assistantRow } from '../src/thread-rows.js';
+
+class DurableMemory extends MemorySessionStore {
+  override durability(): 'durable' {
+    return 'durable';
+  }
+}
+
+// G-392: each call in a step is decided by its OWN approval request, never by
+// a map keyed by tool call id. A step whose calls (or whose approval requests)
+// repeat a tool call id cannot be paired safely, so every gated call in it is
+// denied and does not run, whatever was decided. Offline; every store is in
+// memory.
+
+const REPEATED = 'Tool call was not run because another call in this step has the same id';
+
+const network = vi.fn(() => { throw new Error('A test tried to use the network.'); });
+beforeEach(() => { vi.stubGlobal('fetch', network); });
+afterEach(() => { expect(network).not.toHaveBeenCalled(); vi.unstubAllGlobals(); });
+
+const modes = new ModeRegistry({
+  default: 'guarded',
+  modes: { guarded: { system_prompt: 'Careful.', tools: ['echo', 'free'], max_steps: 6, requires_approval: ['echo'] } },
+});
+
+interface Rig {
+  session: Session;
+  agent: AgentRuntime;
+  requests: LlmRequest[];
+  /** The `n` argument of every echo that ran, in order. */
+  ran: number[];
+  free: () => number;
+}
+
+function rig(calls: LlmToolCall[]): Rig {
+  const harness = new PrismHarness({
+    drivers: { memory: () => new MemorySessionStore(), durable: () => new DurableMemory() },
+    stores: { ephemeral: 'memory', durable: 'durable' },
+  });
+  const session = harness.for({ type: 'User', id: 1 }).session('repeated');
+  const ran: number[] = [];
+  let free = 0;
+  const tools = new ToolRegistry()
+    .register({ name: 'echo', handle: (args: JsonObject) => { ran.push(Number(args.n)); return 'ok'; } })
+    .register({ name: 'free', handle: () => { free += 1; return 'free ok'; } });
+  const requests: LlmRequest[] = [];
+  const client = async (request: LlmRequest): Promise<LlmResponse> => {
+    requests.push(request);
+
+    return requests.length === 1 && calls.length > 0
+      ? { text: '', finishReason: 'tool_calls', toolCalls: calls }
+      : { text: 'done', finishReason: 'stop' };
+  };
+
+  return { session, agent: new AgentRuntime({ client, modes, tools }), requests, ran, free: () => free };
+}
+
+const echo = (id: string, n: number): LlmToolCall => ({ id, name: 'echo', arguments: { n } });
+
+async function rows(session: Session): Promise<JsonObject[]> {
+  return (await session.thread().messages()).map((entry) => entry.message);
+}
+
+/** The result entries of the resolution row: the last tool result row. */
+async function resolved(session: Session): Promise<JsonObject[]> {
+  const results = (await rows(session)).filter((row) => row.type === 'tool_result' && (row.tool_results as JsonObject[]).length > 0);
+
+  return (results.at(-1)?.tool_results ?? []) as JsonObject[];
+}
+
+describe('G-392: a step with a repeated tool call id runs none of its gated calls', () => {
+  const orders: [string, boolean, boolean][] = [
+    ['deny call 1, approve call 2', false, true],
+    ['approve call 1, deny call 2', true, false],
+    ['approve both', true, true],
+  ];
+
+  for (const [name, first, second] of orders) {
+    it(`${name}: neither runs, and each gets its own denial`, async () => {
+      const r = rig([echo('weather', 1), echo('weather', 2)]);
+      const parked = await r.agent.send(r.session, 'go');
+      expect(parked.finishReason).toBe('awaiting_approval');
+      expect(parked.pendingApprovals).toHaveLength(2);
+      const [one, two] = parked.pendingApprovals;
+      expect(one!.id).not.toBe(two!.id);
+
+      await recordApproval(r.session, one!.id, first, first ? undefined : 'no');
+      await recordApproval(r.session, two!.id, second, second ? undefined : 'no');
+      await r.agent.send(r.session, '');
+
+      expect(r.ran).toEqual([]);
+      const entries = await resolved(r.session);
+      expect(entries.map((entry) => [entry.tool_call_id, (entry.args as JsonObject).n, entry.result])).toEqual([
+        ['weather', 1, REPEATED],
+        ['weather', 2, REPEATED],
+      ]);
+    });
+  }
+
+  it('no later decision or resume revives a call denied for a repeated id', async () => {
+    const r = rig([echo('weather', 1), echo('weather', 2)]);
+    const parked = await r.agent.send(r.session, 'go');
+    const [one, two] = parked.pendingApprovals;
+    await recordApproval(r.session, one!.id, false, 'no');
+    await r.agent.send(r.session, '');
+    expect(r.ran).toEqual([]);
+
+    // The second approval was never answered; answering it now, and resuming
+    // again, still runs nothing.
+    await recordApproval(r.session, two!.id, true).catch(() => undefined);
+    await r.agent.send(r.session, '');
+    await r.agent.send(r.session, '');
+
+    expect(r.ran).toEqual([]);
+    const denials = (await rows(r.session)).filter((row) => row.type === 'tool_result')
+      .flatMap((row) => row.tool_results as JsonObject[]).filter((entry) => entry.result === REPEATED);
+    expect(denials).toHaveLength(2);
+  });
+
+  it('empty ids count as repeated', async () => {
+    const r = rig([echo('', 1), echo('', 2)]);
+    const parked = await r.agent.send(r.session, 'go');
+    for (const approval of parked.pendingApprovals) await recordApproval(r.session, approval.id, true);
+    await r.agent.send(r.session, '');
+
+    expect(r.ran).toEqual([]);
+    expect((await resolved(r.session)).map((entry) => entry.result)).toEqual([REPEATED, REPEATED]);
+  });
+
+  it('an ungated call sharing the id still runs at once; the gated calls do not run', async () => {
+    const r = rig([{ id: 'dup', name: 'free', arguments: {} }, echo('dup', 1), echo('dup', 2)]);
+    const parked = await r.agent.send(r.session, 'go');
+    expect(r.free()).toBe(1);
+    expect(parked.pendingApprovals).toHaveLength(2);
+    for (const approval of parked.pendingApprovals) await recordApproval(r.session, approval.id, true);
+    await r.agent.send(r.session, '');
+    await r.agent.send(r.session, '');
+
+    expect(r.ran).toEqual([]);
+    expect(r.free()).toBe(1);
+    const denials = (await rows(r.session)).filter((row) => row.type === 'tool_result')
+      .flatMap((row) => row.tool_results as JsonObject[]).filter((entry) => entry.result === REPEATED);
+    expect(denials.map((entry) => (entry.args as JsonObject).n)).toEqual([1, 2]);
+  });
+
+  it('approval requests that repeat a tool call id make the step ambiguous too (rows as stored)', async () => {
+    const r = rig([]);
+    // A step whose two requests both name the first call, as a row written by
+    // another writer could hold it.
+    await r.session.thread().record([
+      { type: 'user', content: 'go' },
+      {
+        ...assistantRow('', [echo('c1', 1), echo('c2', 2)], {}, [
+          { approval_id: 'apr_1', tool_call_id: 'c1', arguments_format: ARGUMENTS_AS_SENT },
+          { approval_id: 'apr_2', tool_call_id: 'c1', arguments_format: ARGUMENTS_AS_SENT },
+        ]),
+        harness_tool_names: ['echo', 'free'],
+      },
+    ]);
+
+    await recordApproval(r.session, 'apr_1', true);
+    await recordApproval(r.session, 'apr_2', true);
+    await r.agent.send(r.session, '');
+
+    expect(r.ran).toEqual([]);
+    expect((await resolved(r.session)).map((entry) => [entry.tool_call_id, entry.result])).toEqual([['c1', REPEATED], ['c2', REPEATED]]);
+  });
+});
+
+describe('G-392 control: unique ids are decided per call, by their own approval', () => {
+  it('deny call 1, approve call 2: only call 2 runs, and call 1 carries the denial', async () => {
+    const r = rig([echo('c1', 1), echo('c2', 2)]);
+    const [one, two] = (await r.agent.send(r.session, 'go')).pendingApprovals;
+    await recordApproval(r.session, one!.id, false, 'no');
+    await recordApproval(r.session, two!.id, true);
+    await r.agent.send(r.session, '');
+
+    expect(r.ran).toEqual([2]);
+    expect((await resolved(r.session)).map((entry) => [entry.tool_call_id, entry.result])).toEqual([['c1', 'no'], ['c2', 'ok']]);
+  });
+
+  it('approve call 1, deny call 2: only call 1 runs', async () => {
+    const r = rig([echo('c1', 1), echo('c2', 2)]);
+    const [one, two] = (await r.agent.send(r.session, 'go')).pendingApprovals;
+    await recordApproval(r.session, one!.id, true);
+    await recordApproval(r.session, two!.id, false, 'no');
+    await r.agent.send(r.session, '');
+
+    expect(r.ran).toEqual([1]);
+    expect((await resolved(r.session)).map((entry) => [entry.tool_call_id, entry.result])).toEqual([['c1', 'ok'], ['c2', 'no']]);
+  });
+});
