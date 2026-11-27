@@ -13,6 +13,7 @@ import {
   type RunStep,
   type Session,
 } from '../src/index.js';
+import { toolResultRow } from '../src/thread-rows.js';
 
 // G-401: the FIRST decision for an approval stands. A second decision for an
 // approval that already has one, through recordApproval, recordDecisions or
@@ -144,6 +145,37 @@ describe('G-401: the first decision for an approval stands', () => {
 
     expect(r.ran).toEqual([1]);
     expect(await outcome(r.session)).toEqual(['ran:1']);
+  });
+
+  it('a deny-then-approve pair already in the thread (written through Thread.record, as an earlier version or two racing writers can leave it): the denial stands when it is read, nothing runs', async () => {
+    const r = await parked();
+    await r.session.thread().record([toolResultRow([], [{ approval_id: r.approvalId, approved: false, reason: 'no' }])]);
+    await r.session.thread().record([toolResultRow([], [{ approval_id: r.approvalId, approved: true, reason: null }])]);
+    await r.agent.send(r.session, '');
+    await r.agent.send(r.session, '');
+
+    expect(r.ran).toEqual([]);
+    expect(await outcome(r.session)).toEqual(['no']);
+  });
+
+  it('an approve-then-deny pair already in the thread: the approval stands when it is read, the call runs once', async () => {
+    const r = await parked();
+    await r.session.thread().record([toolResultRow([], [{ approval_id: r.approvalId, approved: true, reason: null }])]);
+    await r.session.thread().record([toolResultRow([], [{ approval_id: r.approvalId, approved: false, reason: 'no' }])]);
+    await r.agent.send(r.session, '');
+    await r.agent.send(r.session, '');
+
+    expect(r.ran).toEqual([1]);
+    expect(await outcome(r.session)).toEqual(['ran:1']);
+  });
+
+  it('a pair in ONE row written through Thread.record, deny first: the denial stands', async () => {
+    const r = await parked();
+    await r.session.thread().record([toolResultRow([], [{ approval_id: r.approvalId, approved: false, reason: 'no' }, { approval_id: r.approvalId, approved: true, reason: null }])]);
+    await r.agent.send(r.session, '');
+
+    expect(r.ran).toEqual([]);
+    expect(await outcome(r.session)).toEqual(['no']);
   });
 
   it('a re-sent identical decision records nothing and runs nothing', async () => {

@@ -146,7 +146,7 @@ interface Request {
    * G-401: a SECOND decision for the same approval, in the same batch or
    * recorded after it. The first decision stands; the second records nothing.
    */
-  second?: { verdict: 'approve' | 'deny'; reason: string | null; same: boolean };
+  second?: { verdict: 'approve' | 'deny'; reason: string | null; same: boolean; thread: boolean };
 }
 
 /** A later tool-call step another writer recorded after the park (G-397). */
@@ -449,8 +449,11 @@ function seconds(seed: number, requests: Request[]): Request[] {
     const draw = rng.next();
     const verdict = rng.chance(0.5) ? 'approve' : 'deny';
     const same = rng.chance(0.5);
+    // Written straight through Thread.record, as an earlier version or a
+    // racing writer could leave a pair of decisions (never in the same batch).
+    const thread = !same && rng.chance(0.4);
     if (request.verdict === 'none' || request.approval !== undefined || draw >= 0.2) return request;
-    return { ...request, second: { verdict, reason: verdict === 'deny' ? 'second-no' : null, same } };
+    return { ...request, second: { verdict, reason: verdict === 'deny' ? 'second-no' : null, same, thread } };
   });
 }
 
@@ -564,6 +567,22 @@ function actions(c: Case): Action[] {
   return insert.when === 'before_decision' ? ['later', 'insert', 'old', 'new'] : ['later', 'old', 'new', 'insert'];
 }
 
+/**
+ * G-401, the rule under test on this line: the FIRST decision recorded for an
+ * approval stands, on every write path and when it is read.
+ */
+function stand<T extends { approved: boolean }>(previous: T | undefined, next: T): T {
+  return previous ?? next;
+}
+
+/** The verdict that stands for a request with its first and (maybe) second decision. */
+function effective(request: Request | undefined): { verdict: Verdict; reason: string | null } | undefined {
+  if (request === undefined || request.verdict === 'none') return request;
+  const first = { approved: request.verdict === 'approve', reason: request.reason };
+  const standing = request.second === undefined ? first : stand(first, { approved: request.second.verdict === 'approve', reason: request.second.reason });
+  return { verdict: standing.approved ? 'approve' : 'deny', reason: standing.reason };
+}
+
 function decideStep(prefix: string, calls: Call[], requests: Request[], prior: number[]): Expected {
   const dup = (ids: (string | number)[]): boolean => new Set(ids).size !== ids.length;
   const repeated = dup(calls.map((call) => call.id)) || dup(requests.map((request) => calls[request.call]!.id))
@@ -587,7 +606,7 @@ function decideStep(prefix: string, calls: Call[], requests: Request[], prior: n
       return;
     }
     // Distinct ids: this call's own request, if it has one.
-    const own = requests.find((request) => request.call === index);
+    const own = effective(requests.find((request) => request.call === index));
     if (own?.verdict === 'approve') {
       runs.add(key);
       outcome.set(key, `ran:${call.token}`);
@@ -867,7 +886,7 @@ async function runCase(c: Case): Promise<void> {
   const afterBatch = { old: secondOf(c.requests, oldId, false), new: secondOf(c.later?.requests ?? [], newId, false) };
   // The decision that stands for each approval: the first one accepted.
   const standing = new Map<string, Decision>();
-  const accepted = (batch: Decision[]): void => { for (const d of batch) if (!standing.has(d.approvalId)) standing.set(d.approvalId, d); };
+  const accepted = (batch: Decision[]): void => { for (const d of batch) standing.set(d.approvalId, stand(standing.get(d.approvalId), d)); };
   const recordLater = async (): Promise<void> => {
     // The later step, as another writer could record it after the park.
     const later = c.later!;
@@ -963,7 +982,7 @@ async function runCase(c: Case): Promise<void> {
           // One decision_recorded step per decision given, reporting the
           // decision that stands for its approval (G-401).
           const stands = new Map(standing);
-          for (const d of batch) if (!stands.has(d.approvalId)) stands.set(d.approvalId, d);
+          for (const d of batch) stands.set(d.approvalId, stand(stands.get(d.approvalId), d));
           const recorded = (run as Turn).steps!.filter((step) => step.type === 'decision_recorded');
           check(JSON.stringify(recorded.map((step) => [step.approvalId, step.verdict])) === JSON.stringify(batch.map((d) => [d.approvalId, stands.get(d.approvalId)!.approved ? 'approved' : 'denied'])),
             '6: one decision_recorded step per decision, reporting the one that stands');
@@ -981,11 +1000,19 @@ async function runCase(c: Case): Promise<void> {
         if (!no) accepted([d]);
       }
     }
-    // G-401: a second decision recorded after the batch (before any resume) records nothing.
+    // G-401: a second decision recorded after the batch (before any resume),
+    // through the API or straight through Thread.record.
     if (!resumedYet) {
       for (const d of later) {
+        const viaThread = (action === 'old' ? c.requests : c.later?.requests ?? []).some((q, index) => q.second?.thread === true
+          && (action === 'old' ? approvalIds[index] : `apr_later_${c.seed}_${index}`) === d.approvalId);
+        if (viaThread) {
+          await r.session.thread().record([toolResultRow([], [{ approval_id: d.approvalId, approved: d.approved, reason: d.reason }])]);
+          continue;
+        }
         const no = await refused(() => recordApproval(r.session, d.approvalId, d.approved, d.reason));
         check(no === expectRefused, 'G-397: a decision is refused exactly when its step was superseded first', { action, no, expectRefused, second: true });
+        if (!no) accepted([d]);
       }
     }
   }
@@ -1264,6 +1291,9 @@ describe('G-392 property: approval pairing invariants over generated steps', () 
       expect(has((c) => c.requests.some((q) => q.second?.same === same && q.verdict === 'approve' && q.second.verdict === 'deny')), `approve then deny, same ${same}`).toBe(true);
     }
     expect(has((c) => c.failOnce && c.requests.some((q) => q.second !== undefined && q.verdict === 'deny')), 'second decision, then a resume whose model call fails').toBe(true);
+    // A pair of decisions already in the thread (written straight through Thread.record), both orders.
+    expect(has((c) => c.requests.some((q) => q.second?.thread === true && q.verdict === 'deny' && q.second.verdict === 'approve')), 'deny then approve, written to the thread').toBe(true);
+    expect(has((c) => c.requests.some((q) => q.second?.thread === true && q.verdict === 'approve' && q.second.verdict === 'deny')), 'approve then deny, written to the thread').toBe(true);
     expect(has((c) => c.later !== null && c.later.requests.some((q) => q.second !== undefined)), 'second decision on a later step').toBe(true);
     // G-397 / G-399: every inserted row kind, before and after the decision (main's shape check).
     for (const kind of INSERT_KINDS) {
