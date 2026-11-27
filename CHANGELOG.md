@@ -41,8 +41,8 @@
 - A parked step is superseded by any later assistant row with tool calls,
   or by an assistant text row or user row recorded outside the run that owns
   it (a host's `thread().record()`, whatever run id it passes, or a new
-  message). Each of its calls that has no result then gets ONE result, `Not
-  run: a later step replaced it.`, in a row the harness writes before the
+  message). Each of its calls that has no result then gets ONE result, `Tool
+  call was not run because a later step replaced it`, in a row the harness writes before the
   superseding row and marks `harness_superseded: {approval_ids}`. Nothing
   from the step runs, whatever was decided on it, and a later decision is
   refused, all-or-nothing per batch (`approval_not_pending`). The runs that

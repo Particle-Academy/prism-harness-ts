@@ -348,7 +348,7 @@ export function endedByStartRow(calls: readonly ToolCallInput[], approvalIds: re
 export const SUPERSEDED_KEY = 'harness_superseded';
 
 /** The result each open call of a superseded step is given; the same in every language (DECISION B). @internal */
-export const SUPERSEDED_RESULT = 'Not run: a later step replaced it.';
+export const SUPERSEDED_RESULT = 'Tool call was not run because a later step replaced it';
 
 /**
  * Whether `message` supersedes the paused step (DECISION B, refined): any

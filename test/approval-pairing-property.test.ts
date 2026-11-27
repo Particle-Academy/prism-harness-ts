@@ -42,7 +42,7 @@ const REPEATED = 'Tool call was not run because another call in this step has th
 const NO_RESPONSE = 'No approval response provided';
 // The replaced-step denial: the PHP reference's text, as every main writes it
 // (harness-approval-pairing apr-0016..0019).
-const REPLACED = 'Not run: a later step replaced it.';
+const REPLACED = 'Tool call was not run because a later step replaced it';
 const DENIED = 'User denied tool execution';
 
 /** The fixed-seed set normal CI runs; the coverage check below is asserted on exactly these seeds. */

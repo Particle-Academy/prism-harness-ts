@@ -79,12 +79,16 @@ async function record(row: PairingCase): Promise<unknown> {
   if (row.supersede === 'assistant_text') await session.thread().record([{ type: 'assistant', content: 'A later answer.', tool_calls: [], tool_approval_requests: [] }]);
   if (row.supersede === 'user') await session.thread().record([{ type: 'user', content: 'A later message.' }]);
   if (row.supersede === 'new_message') await runtime.send(session, 'Something else.');
+  // The code each round was refused with, or null (0.2.0, rows with `supersede`).
+  const refusals: (string | null)[] = [];
   for (const round of row.rounds) {
     try {
       await recordDecisions(session, round.map(([index, approved]) => ({ approvalId: pending[index]!.id, approved })));
+      refusals.push(null);
     } catch (error) {
       // A decision the harness refuses is swallowed; the round still resumes.
       if (!(error instanceof HarnessError && error.code === 'approval_not_pending')) throw error;
+      refusals.push(error.code);
     }
     await runtime.send(session, '');
   }
@@ -116,6 +120,7 @@ async function record(row: PairingCase): Promise<unknown> {
       }
     }
     outcome.outcomes = row.calls.map((call) => first.get(call.id) ?? null);
+    outcome.refusals = refusals;
   }
 
   return outcome;

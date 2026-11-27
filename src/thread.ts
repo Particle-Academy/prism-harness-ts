@@ -89,17 +89,20 @@ export class Thread {
     if (supportsAppendLog(store)) {
       return store.withLock(this.key, async () => {
         const length = (await store.logLength(this.key)) ?? (await this.#migrate(store));
-        // Only the paused step and the rows after it decide a supersede, and
-        // only while it has an open call: kept beside the log (written only
-        // when it changes), so an append never reads the whole log.
+        // A supersede needs the stored rows only while a paused step has an
+        // open call. Whether one has is kept beside the log (its position,
+        // never a copy of a row; written only when it changes), so an append
+        // with nothing open never reads the whole log.
         const payload = (await store.get(this.key)) ?? {};
-        const kept = keptTail(payload[OPEN_STEP_KEY]);
-        const tail = kept ?? openTail(((await store.readLog(this.key)) ?? []));
-        const appended = this.#entries(planned(tail.map((entry) => this.#toMessage(entry)), messages, inRun, denialsOnly), length, runId);
+        const kept = keptOpen(payload[OPEN_STEP_KEY]);
+        const full = kept === false ? [] : (await store.readLog(this.key)) ?? [];
+        const appended = this.#entries(planned(openTail(full).map((entry) => this.#toMessage(entry)), messages, inRun, denialsOnly), length, runId);
         if (appended.length > 0) await store.appendLog(this.key, appended);
-        const next = openTail([...tail, ...appended]);
-        if (kept === null || JSON.stringify(next) !== JSON.stringify(kept)) {
-          await store.put(this.key, { ...((await store.get(this.key)) ?? {}), [OPEN_STEP_KEY]: { v: 1, rows: next as unknown as JsonValue[] } });
+        // With nothing open before, an open step can only be one just appended.
+        const next = openTail(kept === false ? appended : [...full, ...appended]);
+        const open = next.length === 0 ? false : (next[0]!.position as number);
+        if (kept !== open) {
+          await store.put(this.key, { ...((await store.get(this.key)) ?? {}), [OPEN_STEP_KEY]: { v: 1, open } });
         }
 
         return appended.map((entry) => this.#toMessage(entry));
@@ -249,11 +252,17 @@ function planned(existing: readonly ThreadMessage[], messages: readonly JsonObje
   return [...messages.slice(0, at), denial as unknown as JsonObject, ...messages.slice(at)];
 }
 
-/** Where an append-log thread keeps its open paused step (DECISION B): the step and every row after it. */
+/** Where an append-log thread keeps whether its paused step has an open call (DECISION B): its position, or false. */
 const OPEN_STEP_KEY = 'harness_open_step';
 
-function keptTail(value: JsonValue | undefined): JsonObject[] | null {
-  return isJsonObject(value) && value.v === 1 && Array.isArray(value.rows) ? value.rows.filter(isJsonObject) : null;
+/**
+ * The kept open-step fact: the position of the paused step with an open
+ * call, `false` for none, or undefined when it is not kept (a thread written
+ * before it): then the log is read.
+ */
+function keptOpen(value: JsonValue | undefined): number | false | undefined {
+  if (!isJsonObject(value) || value.v !== 1) return undefined;
+  return value.open === false ? false : typeof value.open === 'number' && Number.isSafeInteger(value.open) ? value.open : undefined;
 }
 
 /**

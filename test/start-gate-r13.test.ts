@@ -805,13 +805,13 @@ function assistantRowOf(calls: JsonObject[], requests: JsonObject[]): JsonObject
 // DECISION B (refined): a parked step is SUPERSEDED by any later assistant
 // row with tool calls, or by an assistant text row or user row recorded
 // OUTSIDE the run that owns the step. Each of its open gated calls then gets
-// exactly ONE denial ("Not run: a later step replaced it."), in a row the
+// exactly ONE denial ("Tool call was not run because a later step replaced it"), in a row the
 // harness marks `harness_superseded` and writes BEFORE the superseding row;
 // nothing from it runs; a decision made after it is refused.
 // ---------------------------------------------------------------------------
 
 describe('DECISION B: a superseded parked step denies its open calls once', () => {
-  const REPLACED = 'Not run: a later step replaced it.';
+  const REPLACED = 'Tool call was not run because a later step replaced it';
   type Kind = 'assistant_text' | 'assistant_tool_step' | 'user' | 'new_message' | 'forged_run_id';
   const KINDS: Kind[] = ['assistant_text', 'assistant_tool_step', 'user', 'new_message', 'forged_run_id'];
 
@@ -932,7 +932,7 @@ describe('DECISION B: a superseded parked step denies its open calls once', () =
 // ---------------------------------------------------------------------------
 
 describe('release-line alignment', () => {
-  const REPLACED = 'Not run: a later step replaced it.';
+  const REPLACED = 'Tool call was not run because a later step replaced it';
 
   it('a run that recorded one of the step’s results owns it: its own text row does not supersede; another run’s does', async () => {
     const r = new Rig();
@@ -1001,7 +1001,7 @@ describe('release-line alignment', () => {
 });
 
 describe('DECISION B on an append-log thread (the file store)', () => {
-  const REPLACED = 'Not run: a later step replaced it.';
+  const REPLACED = 'Tool call was not run because a later step replaced it';
   it('a host row supersedes the parked step exactly as on a payload thread, and a fresh Thread object reads the same open tail', async () => {
     const { mkdtemp } = await import('node:fs/promises');
     const { tmpdir } = await import('node:os');
