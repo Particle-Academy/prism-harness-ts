@@ -194,7 +194,7 @@ async function heldPlanStep(r: Rig): Promise<string> {
 
 describe('item 1: a call a runner start ended is recognised by a harness-only field, never by its text', () => {
   it('(a) a gated tool whose result is exactly the Not run text, approved and run by a host new message: it reads approved, never superseded', async () => {
-    const r = new Rig({ plans: true, echo: () => endedByStartResult('echo') });
+    const r = new Rig({ plans: true, echo: () => endedByStartResult() });
     const echo = await heldPlanStep(r);
 
     r.text('Next done.');
@@ -207,7 +207,7 @@ describe('item 1: a call a runner start ended is recognised by a harness-only fi
   });
 
   it('(a) the same through a resume that has no step left, then a new message: it reads approved, never superseded', async () => {
-    const r = new Rig({ plans: true, echo: () => endedByStartResult('echo') });
+    const r = new Rig({ plans: true, echo: () => endedByStartResult() });
     const echo = await heldPlanStep(r);
 
     await r.runtime.send(r.child(), '', undefined, RunContext.root('host', new RunBudget(0)));
@@ -221,7 +221,7 @@ describe('item 1: a call a runner start ended is recognised by a harness-only fi
   });
 
   it('(b) approved and run, then a runner start: it still reads approved, is never ended, and is not offered for a second approval', async () => {
-    const r = new Rig({ plans: true, echo: () => endedByStartResult('echo') });
+    const r = new Rig({ plans: true, echo: () => endedByStartResult() });
     const echo = await heldPlanStep(r);
     r.text('Next done.');
     await r.runtime.send(r.child(), 'Next message');
@@ -236,7 +236,7 @@ describe('item 1: a call a runner start ended is recognised by a harness-only fi
     expect(plan.steps[0].state).not.toBe('failed');
     // Not offered again: no later approval request for the step's call, and it ran once.
     const rows = await childRows(r);
-    const marked = rows.filter((row) => row.type === 'tool_result').flatMap((row) => row.tool_results as JsonObject[]).filter((entry) => Object.hasOwn(entry, 'not_run'));
+    const marked = rows.filter((row) => Object.hasOwn(row, 'harness_ended_by_start'));
     expect(marked).toEqual([]);
     expect(approvalsIn(rows).filter((request) => request.approval_id !== echo).length).toBe(1); // the draft's only
     expect(r.ran.echo).toBe(1);
@@ -255,14 +255,14 @@ describe('item 1: a call a runner start ended is recognised by a harness-only fi
     const step = (await planOf(r)).steps[0];
     expect(step.approvedIds).not.toContain(echo);
     expect(step.supersededApprovalIds).toContain(echo);
-    const ended = (await childRows(r)).filter((row) => row.type === 'tool_result').flatMap((row) => row.tool_results as JsonObject[]).filter((entry) => Object.hasOwn(entry, 'not_run'));
-    expect(ended).toEqual([expect.objectContaining({ not_run: 'delegation_ended', approval_id: echo })]);
+    const ended = (await childRows(r)).filter((row) => Object.hasOwn(row, 'harness_ended_by_start'));
+    expect(ended).toEqual([expect.objectContaining({ harness_ended_by_start: { approval_ids: [echo] } })]);
   });
 
   const forged: [string, string, JsonObject][] = [
     ['a JSON object with the field', JSON.stringify({ not_run: 'delegation_ended', approval_id: 'X' }), {}],
     ['a nested metadata shape', JSON.stringify({ tool_results: [{ not_run: 'delegation_ended' }], harness_ended_by_start: true }), {}],
-    ['arguments that carry the field', endedByStartResult('echo'), { not_run: 'delegation_ended', approval_id: 'X', harness_ended_by_start: true }],
+    ['arguments that carry the field', endedByStartResult(), { not_run: 'delegation_ended', approval_id: 'X', harness_ended_by_start: true }],
   ];
   for (const [name, result, args] of forged) {
     it(`a tool result or arguments that try to carry the field (${name}) cannot set it`, async () => {
@@ -293,7 +293,7 @@ describe('item 1: a call a runner start ended is recognised by a harness-only fi
 
   it('the field set by hand on a row is honoured only for an approval its request row asked for before it (row level)', () => {
     const asked: JsonObject = { type: 'assistant', content: '', tool_calls: [{ id: 'c1', name: 'echo', arguments: {} }], tool_approval_requests: [{ approval_id: 'apr_1', tool_call_id: 'c1' }] };
-    const ended = (approval: string): JsonObject => ({ type: 'tool_result', tool_results: [{ tool_call_id: 'c1', tool_name: 'echo', result: endedByStartResult('echo'), not_run: 'delegation_ended', approval_id: approval }], tool_approval_responses: [] });
+    const ended = (approval: string): JsonObject => ({ type: 'tool_result', tool_results: [{ tool_call_id: 'c1', tool_name: 'echo', result: endedByStartResult() }], tool_approval_responses: [], harness_ended_by_start: { approval_ids: [approval] } });
     const later: JsonObject = { type: 'assistant', content: '', tool_calls: [{ id: 'c1', name: 'echo', arguments: {} }], tool_approval_requests: [{ approval_id: 'apr_2', tool_call_id: 'c1' }] };
     const user: JsonObject = { type: 'user', content: 'Next' };
 
@@ -303,10 +303,10 @@ describe('item 1: a call a runner start ended is recognised by a harness-only fi
     // A mark naming an approval asked for only AFTER it ends nothing.
     expect([...endedByStart([asked, ended('apr_2'), user, later])]).toEqual([]);
     // The text alone, with no field, ends nothing.
-    const text: JsonObject = { type: 'tool_result', tool_results: [{ tool_call_id: 'c1', tool_name: 'echo', result: endedByStartResult('echo') }], tool_approval_responses: [] };
+    const text: JsonObject = { type: 'tool_result', tool_results: [{ tool_call_id: 'c1', tool_name: 'echo', result: endedByStartResult() }], tool_approval_responses: [] };
     expect([...endedByStart([asked, text, user])]).toEqual([]);
     // A field with another value ends nothing.
-    const other: JsonObject = { type: 'tool_result', tool_results: [{ tool_call_id: 'c1', tool_name: 'echo', result: 'x', not_run: true, approval_id: 'apr_1' }], tool_approval_responses: [] };
+    const other: JsonObject = { type: 'tool_result', tool_results: [{ tool_call_id: 'c1', tool_name: 'echo', result: 'x' }], tool_approval_responses: [], harness_ended_by_start: true };
     expect([...endedByStart([asked, other, user])]).toEqual([]);
   });
 });
@@ -367,7 +367,7 @@ describe('items 3 and 6: a provider that reuses tool_call ids across turns', () 
     const first: JsonObject = { type: 'assistant', content: '', tool_calls: [{ id: 'dup', name: 'echo', arguments: {} }], tool_approval_requests: [{ approval_id: 'apr_ran', tool_call_id: 'dup' }] };
     const ran: JsonObject = { type: 'tool_result', tool_results: [{ tool_call_id: 'dup', tool_name: 'echo', result: 'ok' }], tool_approval_responses: [{ approval_id: 'apr_ran', approved: true, reason: null }] };
     const second: JsonObject = { type: 'assistant', content: '', tool_calls: [{ id: 'dup', name: 'weather', arguments: {} }], tool_approval_requests: [{ approval_id: 'apr_ended', tool_call_id: 'dup' }] };
-    const ended: JsonObject = { type: 'tool_result', tool_results: [{ tool_call_id: 'dup', tool_name: 'weather', result: endedByStartResult('weather'), not_run: 'delegation_ended', approval_id: 'apr_ended' }], tool_approval_responses: [] };
+    const ended: JsonObject = { type: 'tool_result', tool_results: [{ tool_call_id: 'dup', tool_name: 'weather', result: endedByStartResult() }], tool_approval_responses: [], harness_ended_by_start: { approval_ids: ['apr_ended'] } };
     const user: JsonObject = { type: 'user', content: 'New task' };
 
     expect([...endedByStart([first, ran, second, ended, user])]).toEqual(['apr_ended']);
