@@ -127,8 +127,9 @@ describe('durable approval tool scope', () => {
     const warning = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
     const row = await exercise({seed: {}, decision});
     expect(row.counts.scope_safe).toBe(decision ? 1 : 0); expect(row.counts.scope_ceiling).toBe(0);
-    expect(row.offers[0]).toEqual(decision ? ['scope_safe'] : []);
-    expect(warning).toHaveBeenCalledExactlyOnceWith('Pending approval has no valid stored tool scope; offering approved requests only.');
+    // Round 17 (the reference's rule): the requested tools, approved or not; a call still runs only on its own approval.
+    expect(row.offers[0]).toEqual(['scope_safe']);
+    expect(warning).toHaveBeenCalledExactlyOnceWith('Pending approval has no valid stored tool scope; offering the requested tools only.');
   });
   it('preserves an empty stored list', async () => {
     const row = await exercise({seed: {scope: []}, decision: true});
@@ -137,7 +138,8 @@ describe('durable approval tool scope', () => {
   it('does not interpret a malformed stored wildcard as authority', async () => {
     vi.spyOn(console, 'warn').mockImplementation(() => undefined);
     const row = await exercise({seed: {scope: ['*']}, decision: false});
-    expect(row.counts.scope_ceiling).toBe(0); expect(row.offers[0]).toEqual([]);
+    // Read as no stored list: the requested tools only (round 17, the reference's rule), never the wildcard.
+    expect(row.counts.scope_ceiling).toBe(0); expect(row.counts.scope_safe).toBe(0); expect(row.offers[0]).toEqual(['scope_safe']);
   });
   it('freezes actual names when the mode is a wildcard', async () => {
     const row = await exercise({ceiling: ['*'], decision: true, lateAfter: true});

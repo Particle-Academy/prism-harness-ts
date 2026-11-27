@@ -44,6 +44,7 @@ import {
   stepResultsByPosition as answeredCalls,
   startedRow,
   UNSTARTED_RESULT,
+  START_DENIED_RESULT,
   unansweredUngatedCalls,
   interruptedEntry,
 } from './thread-rows.js';
@@ -1209,7 +1210,7 @@ export class AgentRuntime {
       // A new message supersedes the paused step (below): its approved scope
       // does not narrow the new turn's tools.
       if (scope !== null && !(started === null && prompt !== '')) {
-        if (scope.legacy) console.warn('Pending approval has no valid stored tool scope; offering approved requests only.');
+        if (scope.legacy) console.warn('Pending approval has no valid stored tool scope; offering the requested tools only.');
         offered = offered.filter(tool => scope.names.includes(tool.name)
           && (mode.tools.includes('*') || mode.tools.includes(tool.name) || planApprovalGate(tool) !== null));
       }
@@ -1764,7 +1765,7 @@ export class AgentRuntime {
 
       // Work can change while waiting. Its calls, decisions AND scope must
       // come from the same locked snapshot, and bound the continuation too.
-      if (work.scope?.legacy && !legacyDiagnosticEmitted) console.warn('Pending approval has no valid stored tool scope; offering approved requests only.');
+      if (work.scope?.legacy && !legacyDiagnosticEmitted) console.warn('Pending approval has no valid stored tool scope; offering the requested tools only.');
       const bounded = offered.filter(tool => work.scope?.names.includes(tool.name) === true);
 
       // WRITE-AHEAD (G-387 round 15, option (i)): each approved call gets its
@@ -1823,10 +1824,12 @@ export class AgentRuntime {
           const start = await this.#start(thread, runId, work.position, at, input, approvalId);
           if (start === 'answered') continue;
           if (start !== true) {
-            // Revoked before it started (a denial recorded since the read):
-            // not run, and that denial is its one outcome.
+            // Revoked before it started (a denial recorded since the read,
+            // G-401: denial wins): not run, and that denial is its one
+            // outcome, said precisely (round 17, Py run21 I3; the
+            // reference's START_DENIED text).
             this.#toolDecision('tool_denied', live, runId, input, declared, 'person');
-            const entry = toolResultEntry(input, start.reason ?? 'User denied tool execution');
+            const entry = toolResultEntry(input, START_DENIED_RESULT);
             steps?.toolResult(call.id, entry.result, { ok: false, code: 'approval_denied', refused: true });
             resolved.push({ entry, at, started: false });
             continue;

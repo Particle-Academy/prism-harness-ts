@@ -227,12 +227,16 @@ export function threadView(rows: readonly JsonObject[]): JsonObject[] {
   let run: ToolResultRow[] = [];
   let replayed = new Map<string, number>();
   let decided = new Set<string>();
+  // The step whose segment this is, and which of its calls the segment
+  // answered (round 17): each call once.
+  let step: AssistantRow | null = null;
+  let sent = new Set<number>();
   // Each decision as it STANDS (round 16, item 10; the reference's fold): a
   // decision recorded after its call's outcome is never shown.
   const standing = standingDecisions(rows);
   const flush = (): void => {
     if (run.length === 0) return;
-    const merged = unreplayed(run.reduce((earlier, later) => fold(earlier, later)), replayed, decided);
+    const merged = answering(unreplayed(run.reduce((earlier, later) => fold(earlier, later)), replayed, decided), step, sent);
     if (merged !== null) view.push(merged);
     run = [];
   };
@@ -257,6 +261,8 @@ export function threadView(rows: readonly JsonObject[]): JsonObject[] {
       // A new step: a new segment.
       replayed = new Map();
       decided = new Set();
+      step = normalised as AssistantRow;
+      sent = new Set();
     }
     view.push(normalised);
   }
@@ -389,6 +395,47 @@ function replayOrder(rows: readonly JsonObject[], synthesise = true): readonly J
   }
 
   return out;
+}
+
+/**
+ * `row` with only the results that answer a call of `step` the segment has
+ * not answered yet, each call once (G-387 round 17, the reference's
+ * ToolResultRuns::answering): a result answers the first such call with its
+ * id, tool name and arguments, then its id and tool name, then its id. A
+ * result that answers no call of its step (a second result for a call, or
+ * one naming a call the step does not have) is never sent: no provider
+ * accepts an output for a call that is not directly before it; it stays
+ * stored, and is no other step's outcome. A result that answers a call is
+ * sent WITH THAT CALL'S IDS (its id and its result id), so a result stored
+ * without the provider's call id is never sent with a null one. A row left
+ * with no results and no decisions is not sent. Results before any step are
+ * sent as they are.
+ */
+function answering(row: ToolResultRow | null, step: AssistantRow | null, sent: Set<number>): ToolResultRow | null {
+  if (row === null || step === null || row.tool_results.length === 0) return row;
+  const calls = step.tool_calls;
+  const args = calls.map((call) => sortedJson(call.arguments));
+  const free = (test: (call: ToolCallRow, at: number) => boolean): number => calls.findIndex((call, at) => !sent.has(at) && test(call, at));
+  let changed = false;
+  const results: ToolResultEntry[] = [];
+  for (const entry of row.tool_results) {
+    const digest = sortedJson(entry.args);
+    let at = free((call, index) => call.id === entry.tool_call_id && call.name === entry.tool_name && args[index] === digest);
+    if (at === -1) at = free((call) => call.id === entry.tool_call_id && call.name === entry.tool_name);
+    if (at === -1) at = free((call) => call.id === entry.tool_call_id);
+    if (at === -1) { changed = true; continue; }
+    sent.add(at);
+    const call = calls[at]!;
+    if (entry.tool_call_id !== call.id || entry.tool_call_result_id !== call.result_id) {
+      results.push({ ...entry, tool_call_id: call.id, tool_call_result_id: call.result_id });
+      changed = true;
+    } else {
+      results.push(entry);
+    }
+  }
+  if (!changed) return row;
+
+  return results.length === 0 && row.tool_approval_responses.length === 0 ? null : toolResultRow(results, row.tool_approval_responses);
 }
 
 /**
@@ -559,8 +606,17 @@ export const ANSWERS_STEP_KEY = 'harness_answers_step';
 export const STARTED_KEY = 'harness_started';
 
 /**
+ * The outcome of an approved call whose start the decision that stands
+ * refused: a denial recorded while it had no outcome (G-401, denial wins).
+ * The reference's Thread::START_DENIED text (round 17).
+ * @internal
+ */
+export const START_DENIED_RESULT = 'Not run: this call was denied before it started.';
+
+/**
  * The outcome of an UNGATED call whose started row could not be written
  * (round 17, TS run20 F3b): the batch never ran, so the call did not run.
+ * TS only: the reference runs such calls inside its model step.
  * @internal
  */
 export const UNSTARTED_RESULT = 'Not run: the harness could not record that this call was starting.';
@@ -974,10 +1030,13 @@ function approvalToolScope$(rows: readonly JsonObject[]): { names: string[]; leg
   }
   // A step that repeats a call id approves nothing (G-392).
   if (pairStepApprovals(list(row.tool_calls), requests).repeated) return {names: [], legacy: true};
-  const decisions = turnDecisions(rows);
-  const approvedCalls = new Set(requests.filter(request => typeof request.approval_id === 'string' && decisions.get(request.approval_id)?.approved === true)
-    .map(request => request.tool_call_id));
-  const names = list(row.tool_calls).filter(call => approvedCalls.has(call.id) && typeof call.name === 'string' && call.name !== '' && call.name !== '*')
+  // No trusted offer (a host's step, or one an older worker wrote; round 17,
+  // the reference's rule): the tools of EVERY call its requests were issued
+  // for, approved or not, so the resolution answers each request (a denial,
+  // or no response) and no request is left with a call unanswered. A call
+  // still runs only on its own approval.
+  const requestedCalls = new Set(requests.map(request => request.tool_call_id));
+  const names = list(row.tool_calls).filter(call => requestedCalls.has(call.id) && typeof call.name === 'string' && call.name !== '' && call.name !== '*')
     .map(call => call.name as string);
   return {names: [...new Set(names)], legacy: true};
 }

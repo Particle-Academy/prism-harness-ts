@@ -1131,10 +1131,11 @@ function everySentRequestAnswersEveryCall(r: Rig, c: Case, label: string): void 
 async function replayShowsEachResultOnce(session: Session, label: string): Promise<void> {
   const stored = await rows(session);
   const isStep = isStepRow;
-  const segments = (list: JsonObject[], view: boolean): Map<string, number>[] => {
-    const out: Map<string, number>[] = [new Map()];
+  // Each segment: its step's call ids (none before the first step), and its results by key.
+  const segments = (list: JsonObject[], view: boolean): { ids: string[]; results: Map<string, number> }[] => {
+    const out: { ids: string[]; results: Map<string, number> }[] = [{ ids: [], results: new Map() }];
     for (const row of list) {
-      if (isStep(row)) { out.push(new Map()); continue; }
+      if (isStep(row)) { out.push({ ids: (row.tool_calls as unknown[]).filter(isCall).map((call) => String(call.id)), results: new Map() }); continue; }
       if (row.type !== 'tool_result' || row.harness_replaced_step !== undefined) continue;
       // Per stored row, the most often a result occurs in one row; per view row, as shown.
       const here = new Map<string, number>();
@@ -1142,7 +1143,7 @@ async function replayShowsEachResultOnce(session: Session, label: string): Promi
         const key = canonicalJson([entry.tool_call_id, entry.tool_name, entry.args]);
         here.set(key, (here.get(key) ?? 0) + 1);
       }
-      const segment = out.at(-1)!;
+      const segment = out.at(-1)!.results;
       for (const [key, count] of here) segment.set(key, view ? (segment.get(key) ?? 0) + count : Math.max(segment.get(key) ?? 0, count));
     }
     return out;
@@ -1150,13 +1151,29 @@ async function replayShowsEachResultOnce(session: Session, label: string): Promi
   const want = segments(stored, false);
   const got = segments(threadView(stored), true);
   check(got.length === want.length, `${label}: the replay view keeps every step`, { stored: want.length, shown: got.length });
-  want.forEach((segment, at) => {
-    for (const [key, count] of segment) {
-      const shown = got[at]?.get(key) ?? 0;
-      check(shown >= count, `${label}: the replay view keeps every result of a step, by id, name and arguments`, { step: at, key, stored: count, shown });
+  want.forEach(({ ids, results }, at) => {
+    const shownHere = got[at]?.results ?? new Map<string, number>();
+    for (const [key, count] of results) {
+      const shown = shownHere.get(key) ?? 0;
       check(shown <= count, `${label}: the replay view shows a result once, in its own segment`, { step: at, key, stored: count, shown });
+      // Before any step, every result is shown as stored.
+      if (at === 0) check(shown >= count, `${label}: the replay view keeps every result before the first step`, { key, stored: count, shown });
     }
-    for (const key of (got[at] ?? new Map<string, number>()).keys()) check(segment.has(key), `${label}: the replay view shows no result outside its own segment`, { step: at, key });
+    for (const key of shownHere.keys()) check(results.has(key), `${label}: the replay view shows no result outside its own segment`, { step: at, key });
+    if (at === 0) return;
+    // Round 17 (the reference's fold, ToolResultRuns::answering): each call
+    // of the step is answered ONCE; a result answering no call of the step
+    // (one naming a call it does not have, a second one for a call) is not
+    // shown. So per call id: as many shown as calls carry it, or as many
+    // distinct results as were stored, whichever is fewer.
+    for (const id of new Set(ids)) {
+      const calls = ids.filter((candidate) => candidate === id).length;
+      const ofId = (map: Map<string, number>): number => [...map].filter(([key]) => (JSON.parse(key) as unknown[])[0] === id).reduce((sum, [, count]) => sum + count, 0);
+      const shown = ofId(shownHere);
+      check(shown <= calls, `${label}: the replay view answers each call once`, { step: at, id, calls, shown });
+      check(shown >= Math.min(calls, ofId(results)), `${label}: the replay view keeps a result for every call that has one`, { step: at, id, calls, shown, stored: ofId(results) });
+    }
+    for (const key of shownHere.keys()) check(ids.includes(String((JSON.parse(key) as unknown[])[0])), `${label}: the replay view shows only results for a call of the step`, { step: at, key });
   });
 }
 

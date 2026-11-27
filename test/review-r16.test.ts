@@ -224,7 +224,8 @@ describe('item 1: a raw denial after the call started or ran', () => {
     const rows = await r.rows();
     expect(r.echoed).toEqual([1]);
     expect(outcomes(rows, 1)).toEqual(['ran:1']);
-    expect(outcomes(rows, 2)).toEqual([DENIED]);
+    // Round 17 (Py run21 I3, the reference's text): a start the standing denial refused says so.
+    expect(outcomes(rows, 2)).toEqual(['Not run: this call was denied before it started.']);
     expect(approvalDecisions(rows).get(a2!)).toBe(false);
     expect(approvalDecisions(rows).get(a1!)).toBe(true);
     for (const decided of replayedDecisions(rows, a2!)) expect(decided).toBe(false);

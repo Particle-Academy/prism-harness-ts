@@ -9,6 +9,7 @@ import {
   ToolRegistry,
   recordDecisions,
   type JsonObject,
+  type LlmRequest,
   type LlmResponse,
 } from '../src/index.js';
 import { ARGUMENTS_AS_SENT, assistantRow, toolResultEntry, toolResultRow } from '../src/thread-rows.js';
@@ -33,7 +34,7 @@ interface PairingCase {
   calls: { id: string; name: string; args: JsonObject }[];
   rounds: [number, boolean][][];
   /** DECISION B (0.2.0): what supersedes the parked step, after the park and before the rounds. */
-  supersede?: 'assistant_tool_step' | 'assistant_text' | 'user' | 'user_owning_run_id' | 'new_message' | 'new_message_failed' | 'altered_copy' | 'altered_copy_after_approval' | 'host_result' | 'denial_after_run';
+  supersede?: 'assistant_tool_step' | 'assistant_text' | 'user' | 'user_owning_run_id' | 'new_message' | 'new_message_failed' | 'altered_copy' | 'altered_copy_after_approval' | 'host_result' | 'denial_after_run' | 'concurrent_user' | 'concurrent_text';
   /**
    * SEGMENT OWNERSHIP (0.2.0, round 13b): a later step a host records after
    * the park, each echo call asking its own approval (`apr_later_<k>`, k
@@ -68,15 +69,25 @@ afterEach(() => { expect(network).not.toHaveBeenCalled(); vi.unstubAllGlobals();
 async function record(row: PairingCase): Promise<unknown> {
   const ran: number[] = [];
   let free = 0;
+  // 0.6.0 (round 17): a host row written WHILE the first echo call runs, once.
+  let during: (() => Promise<unknown>) | null = null;
   const tools = new ToolRegistry()
-    .register({ name: 'echo', handle: (args: JsonObject) => { ran.push(Number(args.n)); return 'ok'; } })
+    .register({ name: 'echo', handle: async (args: JsonObject) => {
+      ran.push(Number(args.n));
+      const hook = during;
+      during = null;
+      if (hook !== null) await hook();
+      return 'ok';
+    } })
     .register({ name: 'free', handle: () => { free += 1; return 'free ok'; } });
   const modes = new ModeRegistry({
     default: 'guarded',
     modes: { guarded: { system_prompt: 'Careful.', tools: ['echo', 'free'], max_steps: 6, requires_approval: ['echo'] } },
   });
   let step = 0;
-  const client = async (): Promise<LlmResponse> => {
+  const sent: LlmRequest[] = [];
+  const client = async (request: LlmRequest): Promise<LlmResponse> => {
+    sent.push(request);
     step += 1;
     // apr-0023 (0.3.0): the provider fails the new message's request.
     if (step === 2 && row.supersede === 'new_message_failed') throw new Error('The provider is unavailable (scripted).');
@@ -127,6 +138,18 @@ async function record(row: PairingCase): Promise<unknown> {
     await recordDecisions(session, pending.map((approval) => ({ approvalId: approval.id, approved: true })));
     await runtime.send(session, '');
     await session.thread().record([toolResultRow([], pending.map((approval) => ({ approval_id: approval.id, approved: false, reason: 'Too late.' })))]);
+  }
+  // 0.6.0 (round 17): every pending approval approved, one resume during
+  // which the first echo call's run sees a host row recorded, then one more
+  // turn with the prompt `later`.
+  if (row.supersede === 'concurrent_user' || row.supersede === 'concurrent_text') {
+    const message: JsonObject = row.supersede === 'concurrent_user'
+      ? { type: 'user', content: 'A host row while the call runs.' }
+      : { type: 'assistant', content: 'A host note while the call runs.', tool_calls: [], tool_approval_requests: [] };
+    await recordDecisions(session, pending.map((approval) => ({ approvalId: approval.id, approved: true })));
+    during = () => session.thread().record([message]);
+    await runtime.send(session, '');
+    await runtime.send(session, 'later');
   }
   const later = row.later;
   const laterIds: string[] = [];
@@ -183,8 +206,24 @@ async function record(row: PairingCase): Promise<unknown> {
     if (later !== undefined) outcome.later_outcomes = segmentOutcomes(later.calls, steps[1] ?? []);
     outcome.refusals = refusals;
   }
+  // 0.6.0: every request the fake model received answers every call of
+  // every step it carries, exactly once, in that step's own result run.
+  if (row.supersede === 'concurrent_user' || row.supersede === 'concurrent_text') outcome.sent = sent.every((request) => answersInOwnRun(request.messages));
 
   return outcome;
+}
+
+/** Whether every call of every step in `messages` is answered exactly once by the tool_result rows directly after it (a multiset of ids). */
+function answersInOwnRun(messages: readonly JsonObject[]): boolean {
+  return messages.every((row, index) => {
+    if (row.type !== 'assistant' || !Array.isArray(row.tool_calls) || row.tool_calls.length === 0) return true;
+    const answered: string[] = [];
+    for (let at = index + 1; at < messages.length && messages[at]!.type === 'tool_result'; at += 1) {
+      for (const entry of (messages[at]!.tool_results ?? []) as JsonObject[]) answered.push(String(entry.tool_call_id));
+    }
+    const ids = (row.tool_calls as JsonObject[]).map((call) => String(call.id));
+    return ids.length === answered.length && [...new Set(ids)].every((id) => ids.filter((x) => x === id).length === answered.filter((x) => x === id).length);
+  });
 }
 
 /**
