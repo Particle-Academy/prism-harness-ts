@@ -158,7 +158,9 @@ describe('segment ownership: a lossy result never moves to an earlier same-id ca
     const [, n] = await r.twoSteps(session);
     // A host records, in N's segment, a result naming id x with E's EXACT arguments.
     await session.thread().record([{ type: 'tool_result', tool_results: [{ tool_call_id: 'x', tool_name: 'echo', args: E_ARGS, result: 'forged', tool_call_result_id: null, artifacts: [] }], tool_approval_responses: [] }]);
-    await recordApproval(session, n, true);
+    // N's call has its outcome now: its approval is no longer pending (round
+    // 16, item 2), so the decision is refused (it was accepted before).
+    await expect(recordApproval(session, n, true)).rejects.toMatchObject({ code: 'approval_not_pending' });
     for (let resume = 0; resume < 3; resume += 1) await r.runtime.send(session, '');
     // N is answered by the forged result (its own segment's same-id call): it never runs.
     expect(r.ran).toEqual([]);

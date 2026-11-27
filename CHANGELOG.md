@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+### Fixed: what ran and what the thread says was decided always agree (G-387 round 16)
+
+- A decision counts only while its call has no outcome (no started row, no
+  result): a decision row recorded after the call started or ran, by any
+  channel, changes nothing in the thread's readers, the plan or the replay
+  a provider is sent. A resume re-checks that an approval still stands just
+  before it starts the call, so a denial recorded meanwhile means the call
+  does not run, and that denial is its one outcome.
+- An approval whose call already has an outcome (for example a call closed
+  as unanswered) is no longer pending: a decision on it is refused
+  `approval_not_pending` instead of being accepted and never acted on.
+- The calls a step runs at once get a `started` row before they run, so one
+  whose result could not be stored reads "Tool call was interrupted, it may
+  have run", never "not run", and is never denied by a later message. The
+  replay gives any call of an earlier step with no stored result that
+  interrupted result, so a provider request always answers every call.
+- A run during which a newer step on its session (a tool's own `send()`,
+  another run, a host) parked for a person takes no further model step: it
+  fails with the new code `parked_elsewhere`, having recorded what it ran,
+  and never replaces that step.
+- A result answers the first call of its step with no outcome, so two
+  identical calls answered by two rows each read answered.
+- The harness's marks, a request's binding included, are honoured only on
+  rows the runtime itself wrote; a run id is never a trust signal.
+- A decision a tool records on its own session while its turn holds the
+  session lock waits the agent's configured `lock_wait`, and a
+  `session_locked` error's text names no session.
+- A resume reads the whole thread a fixed number of times, and every reader
+  takes what it needs from one pass over it.
+
 ### Fixed: a running approved call is never denied, and a write during it is never refused (G-387 round 15)
 
 - Before a resume runs an approved call it records a `started` row for that

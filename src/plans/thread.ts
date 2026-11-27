@@ -1,5 +1,5 @@
 import type { JsonObject, JsonValue } from '../json.js';
-import { endedByStart, pairStepApprovals, pausedStepIndex, pendingApprovalIds, repeatedIdDenials, ownRequests, prevails, replacedStepApprovals, stepCalls, stepResultsByPosition, supersededApprovals, isReplacedStepRow } from '../thread-rows.js';
+import { endedByStart, pairStepApprovals, pausedStepIndex, pendingApprovalIds, repeatedIdDenials, ownRequests, replacedStepApprovals, standingDecisions, stepCalls, stepResultsByPosition, supersededApprovals, turnDecisions, isReplacedStepRow } from '../thread-rows.js';
 import { argsDigest } from '../tool-policy.js';
 import type { PendingCall } from './machine.js';
 
@@ -46,8 +46,9 @@ export function pendingApprovalCalls(rows: readonly JsonObject[]): PendingCall[]
 }
 
 /**
- * Every recorded decision, by approval id: true when approved. The first
- * decision for an id stands. A decision on a call a runner start's task row
+ * Every recorded decision, by approval id: true when approved. The decision
+ * that STANDS for an id (standingDecisions(), round 16): one recorded after
+ * its call started or ran never counts. A decision on a call a runner start's task row
  * ended as not run is left out (G-387 round 10): it was never acted on, so
  * the plan reads that approval as ended, never as approved work.
  */
@@ -58,14 +59,7 @@ export function approvalDecisions(rows: readonly JsonObject[]): Map<string, bool
   // Superseded by a later step with the call open (DECISION B): never acted on.
   // So were a 0.11.x replaced-step answer's calls (an older thread, round 15).
   const ended = new Set([...endedByStart(rows), ...repeatedIdDenials(rows), ...supersededApprovals(rows), ...replacedStepApprovals(rows)]);
-  for (const row of rows) {
-    if (row.type !== 'tool_result') continue;
-    for (const response of list(row.tool_approval_responses)) {
-      if (typeof response.approval_id === 'string' && prevails(decided.get(response.approval_id), response.approved === true) && !ended.has(response.approval_id)) {
-        decided.set(response.approval_id, response.approved === true);
-      }
-    }
-  }
+  for (const [id, entry] of standingDecisions(rows)) if (!ended.has(id)) decided.set(id, entry.approved);
 
   return decided;
 }
@@ -82,17 +76,14 @@ export function approvedCallsAwaitingResult(rows: readonly JsonObject[], name: s
   const row = rows[step]!;
   // A step that repeats a call id runs none of its gated calls (G-392).
   if (pairStepApprovals(stepCalls(row), ownRequests(rows, step)).repeated) return 0;
-  // The FIRST decision recorded for an id is the one answer that counts, as
-  // for the resume and the plan.
-  const decided = new Map<string, boolean>();
+  // The decision that STANDS for an id is the one answer that counts, as
+  // for the resume and the plan (turnDecisions(), round 16).
+  const decided = new Map([...turnDecisions(rows)].map(([id, entry]) => [id, entry.approved]));
   const finished = new Set<string>();
   for (const later of rows.slice(step + 1)) {
     if (later.type !== 'tool_result' || isReplacedStepRow(later)) continue;
     for (const result of list(later.tool_results)) {
       if (typeof result.tool_call_id === 'string') finished.add(result.tool_call_id);
-    }
-    for (const response of list(later.tool_approval_responses)) {
-      if (typeof response.approval_id === 'string' && prevails(decided.get(response.approval_id), response.approved === true)) decided.set(response.approval_id, response.approved === true);
     }
   }
 

@@ -7,7 +7,7 @@ import type { SessionStore } from './stores/session-store.js';
 import { StoreTaskSource } from './store-task-source.js';
 import type { StoreTaskSourceOptions } from './store-task-source.js';
 import { HarnessError } from './errors.js';
-import { Thread } from './thread.js';
+import { Thread, forgetThreadSnapshot } from './thread.js';
 import { pausedApprovalIds, stepRequests, storedBinding } from './thread-rows.js';
 import type { ModelBinding } from './subagents.js';
 import type { AgentRuntime } from './runtime.js';
@@ -945,8 +945,10 @@ export class Session {
       async () => {
         // Re-read inside the lock. State written by whoever held it before us
         // is otherwise invisible to this instance, and acting on a stale read
-        // is the thing the lock exists to prevent.
+        // is the thing the lock exists to prevent. The thread too: the turn's
+        // snapshot of it (BRIEF-R16 item 7) ends here.
         this.#cachedState = null;
+        forgetThreadSnapshot(`${this.key()}:thread`);
 
         return callback(this);
       },

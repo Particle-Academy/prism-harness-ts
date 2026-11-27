@@ -189,7 +189,10 @@ describe('item 1: a superseding write while an approved call runs', () => {
       const [id] = await r.parked();
       await recordApproval(r.session(), id!, true);
       r.duringEcho = async () => { r.during.push(await r.session().thread().record([row]).then(() => 'recorded', code)); };
-      await r.runtime.send(r.session(), '');
+      // A host step that asks for an approval parks the session on it: the
+      // resume then takes no further model step (round 16, parked_elsewhere).
+      const asks = Array.isArray(row.tool_approval_requests) && row.tool_approval_requests.length > 0;
+      expect(await r.runtime.send(r.session(), '').then(() => 'ran', code)).toBe(asks ? 'parked_elsewhere' : 'ran');
       expect(r.during).toEqual(['recorded']);
 
       const rows = await r.rows();
@@ -211,17 +214,24 @@ describe('item 1: a superseding write while an approved call runs', () => {
     });
   }
 
-  it('a tool-call step reusing the call\'s id, recorded mid-call, the run then continuing: the run\'s next row replaces the host\'s step (ONE denial for its call), and the earlier result never answers it', async () => {
+  // Round 16 (BRIEF-R16 item 3, a NESTED PARK): a newer step parked for a
+  // person while the call ran stops the resume with no model step, so the
+  // run no longer replaces it (it was REPLACED before). Its own approval
+  // decides it: two empty resumes with no decision close it as unanswered.
+  it('a tool-call step reusing the call\'s id, recorded mid-call: the resume stops with no model step (parked_elsewhere), the host\'s step stays pending on ITS OWN approval, and the earlier result never answers it', async () => {
     const r = new Rig();
     const [id] = await r.parked();
     await recordApproval(r.session(), id!, true);
     r.duringEcho = async () => { await r.session().thread().record([hostStep('c1', 3, 'apr_later')]); };
-    await r.runtime.send(r.session(), '');
+    const requests = r.requests.length;
+    expect(await r.runtime.send(r.session(), '').then(() => 'ran', code)).toBe('parked_elsewhere');
+    expect(r.requests.length).toBe(requests);
+    expect(pendingApprovalIds(await r.rows())).toEqual(['apr_later']);
     for (let i = 0; i < 2; i += 1) await r.runtime.send(r.session(), '');
     const rows = await r.rows();
     expect(r.echoed).toEqual([1]);
     expect(echoOutcomes(rows, 1)).toEqual(['ran:1']);
-    expect(echoOutcomes(rows, 3)).toEqual([REPLACED]);
+    expect(echoOutcomes(rows, 3)).toEqual(['No approval response provided']);
     expect(await recordApproval(r.session(), 'apr_later', true).then(() => 'accepted', code)).toBe('approval_not_pending');
   });
 
@@ -738,14 +748,20 @@ describe('added: an approval binds to the exact call the person was shown', () =
       ...copy([call('c1', 1)], 'apr_h'),
       tool_approval_requests: [{ approval_id: 'apr_h', tool_call_id: 'c1', arguments_format: ARGUMENTS_AS_SENT, harness_call: { tool_name: 'free', args_digest: 'sha256:00' } }],
     }]);
-    const step = (await r.rows()).find((row) => row.type === 'assistant')!;
+    // As STORED (round 16: the readers read a host row's binding as absent,
+    // so its request binds to its own call by position, the same call).
+    const step = (await r.session().thread().messages()).map((entry) => entry.message).find((row) => row.type === 'assistant')!;
     expect((step.tool_approval_requests as JsonObject[])[0]!.harness_call).toEqual({ tool_name: 'echo', args_digest: `sha256:${createHash('sha256').update('{"n":1}').digest('hex')}` });
+    expect((await r.rows()).find((row) => row.type === 'assistant')!.tool_approval_requests).toEqual([{ approval_id: 'apr_h', tool_call_id: 'c1', arguments_format: ARGUMENTS_AS_SENT }]);
   });
 
+  // Stored as the RUNTIME writes its own step (round 16: `harness: true` on
+  // the entry, the one trust signal); a binding on any other row is read as
+  // absent (review-r16).
   async function stored(r: Rig, request: JsonObject): Promise<void> {
     const thread = r.session().thread() as unknown as { store: MemorySessionStore; key: string };
     const rows: [JsonObject, string | null][] = [[{ type: 'user', content: 'Go' }, null], [{ ...copy([call('c1', 1)], 'apr_s'), tool_approval_requests: [request] }, 'run-x']];
-    await thread.store.put(thread.key, { messages: rows.map(([message, runId], index) => ({ position: index + 1, message, run_id: runId, recorded_at: '2026-11-01T00:00:00.000Z' })) as never });
+    await thread.store.put(thread.key, { messages: rows.map(([message, runId], index) => ({ position: index + 1, message, run_id: runId, recorded_at: '2026-11-01T00:00:00.000Z', ...(runId === null ? {} : { harness: true }) })) as never });
   }
 
   for (const [label, binding] of [

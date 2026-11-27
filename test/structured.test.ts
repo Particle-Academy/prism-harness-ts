@@ -235,7 +235,8 @@ describe('a structured turn', () => {
     const response = await runtime(client).sendStructured(session, 'Plan the release', planSchema);
 
     expect(response.toolCalls).toEqual(['echo']);
-    expect((await rows(session)).map((row) => row.type)).toEqual([
+    // Round 16: the ungated call's write-ahead started row is left out.
+    expect((await rows(session)).filter((row) => row.harness_started === undefined).map((row) => row.type)).toEqual([
       'user',
       'assistant',
       'tool_result',

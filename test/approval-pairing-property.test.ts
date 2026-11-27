@@ -15,7 +15,7 @@ import {
   type RunStep,
   type Session,
 } from '../src/index.js';
-import { ARGUMENTS_AS_SENT, assistantRow, threadView, toolResultEntry, toolResultRow } from '../src/thread-rows.js';
+import { ARGUMENTS_AS_SENT, assistantRow, pendingApprovalIds, replayView, threadView, toolResultEntry, toolResultRow } from '../src/thread-rows.js';
 import { argsDigest, canonicalJson } from '../src/tool-policy.js';
 
 // G-392 QC: property tests for the approval pairing invariants.
@@ -204,7 +204,15 @@ interface Case {
    * step that first asked for it): the new call is never run on them. From
    * a generator of its own (seed ^ 0x408408).
    */
-  junk: { kind: JunkKind; requests: boolean } | null;
+  junk: { kind: JunkKind; requests: boolean; raw?: boolean } | null;
+  /**
+   * Round 16 (BRIEF-R16 item 8): the inserted host row carries the parked
+   * step's OWN run id (a caller-passed run id is always outside), from a
+   * generator of its own (seed ^ 0x16016). The junk row's `raw` writes it
+   * straight into storage, as an import or a sync would (no binding, no
+   * reader), from the same generator.
+   */
+  forgedRunId?: boolean;
 }
 
 type JunkKind = 'string' | 'number' | 'null' | 'strings' | 'scalar' | 'mixed' | 'copy' | 'both';
@@ -322,7 +330,20 @@ function laterInsertion(seed: number, calls: Call[], later: LaterStep, failOnce:
 /** Record the inserted row as a host would, or send a new message through the harness. */
 async function insertRow(r: Rig, c: Case): Promise<void> {
   if (c.insert!.kind === 'new_message') await r.agent.send(r.session, 'Something else.');
-  else await r.session.thread().record([insertedRow(c)]);
+  else await r.session.thread().record([insertedRow(c)], c.forgedRunId === true ? await parkedRunId(r) : null);
+}
+
+/** The run id the parked step was recorded under (the first tool-call step). */
+async function parkedRunId(r: Rig): Promise<string | null> {
+  return (await r.session.thread().messages()).find((entry) => isStepRow(entry.message))?.runId ?? null;
+}
+
+/** Append `message` straight into the thread's storage, as an import or a sync would. */
+async function rawRecord(r: Rig, message: JsonObject): Promise<void> {
+  const thread = r.session.thread() as unknown as { store: MemorySessionStore; key: string };
+  const stored = (await thread.store.get(thread.key)) ?? {};
+  const existing = Array.isArray(stored.messages) ? stored.messages as JsonObject[] : [];
+  await thread.store.put(thread.key, { ...stored, messages: [...existing, { position: existing.length + 1, message, run_id: null, recorded_at: '' }] });
 }
 
 /** The step whose calls an inserted row names: the later step's, for one recorded after it. */
@@ -481,8 +502,11 @@ function withDuplicate(c: Case): Case {
 /** G-408 / #92: the junk row (see Case.junk), from a generator of its own. */
 function withJunk(c: Case): Case {
   const rng = new Rng((c.seed ^ 0x408408) >>> 0);
-  if (!rng.chance(0.3) || c.later !== null || c.recorder === 'streamDecision') return c;
-  return { ...c, junk: { kind: rng.pick(JUNK_KINDS), requests: rng.chance(0.6) } };
+  const r16 = new Rng((c.seed ^ 0x16016) >>> 0);
+  const forged = c.insert !== null && c.insert.kind !== 'new_message' && r16.chance(0.4) ? { forgedRunId: true } : {};
+  if (!rng.chance(0.3) || c.later !== null || c.recorder === 'streamDecision') return { ...c, ...forged };
+  const raw = r16.chance(0.4);
+  return { ...c, ...forged, junk: { kind: rng.pick(JUNK_KINDS), requests: rng.chance(0.6), ...(raw ? { raw } : {}) } };
 }
 
 // ---------------------------------------------------------------------------
@@ -691,14 +715,31 @@ async function outcomes(session: Session): Promise<[number, string][]> {
   // earlier results with it: a copy of one an earlier row held is that
   // result, not another; two in one row are two outcomes.
   const seen = new Map<string, number>();
-  for (const row of await rows(session)) {
+  // A replaced-step answer (the 0.11.x shape, written for an older thread's
+  // step left superseded and unanswered, e.g. under a copy written straight
+  // into storage) names the step it answers by position (round 16).
+  const steps = new Map<number, { calls: JsonObject[]; has: boolean[] }>();
+  for (const entry of await session.thread().messages()) {
+    const row = entry.message;
     if (isStepRow(row)) {
       calls = (row.tool_calls as unknown[]).filter(isCall);
       has = calls.map(() => false);
+      steps.set(entry.position, { calls, has });
       seen.clear();
       continue;
     }
     if (row.type !== 'tool_result') continue;
+    const named = (row.harness_replaced_step as JsonObject | undefined)?.position;
+    if (typeof named === 'number' && steps.has(named)) {
+      const step = steps.get(named)!;
+      for (const result of (row.tool_results ?? []) as JsonObject[]) {
+        const at = step.calls.findIndex((call, index) => !step.has[index] && call.id === result.tool_call_id && call.name === result.tool_name);
+        if (at === -1) continue;
+        step.has[at] = true;
+        out.push([Number((step.calls[at]!.arguments as JsonObject).n), String(result.result)]);
+      }
+      continue;
+    }
     const here = new Map<string, number>();
     for (const entry of (row.tool_results ?? []) as JsonObject[]) {
       const copy = JSON.stringify([entry.tool_call_id, entry.tool_name, entry.args, entry.result]);
@@ -794,20 +835,42 @@ async function runCase(c: Case): Promise<void> {
     ]);
   }
 
-  // The decisions, in a shuffled order.
-  const decisions = c.order.filter((index) => c.requests[index]!.verdict !== 'none').map((index) => ({
+  // The decisions, in a shuffled order. One for a call that already has its
+  // outcome (a stored prior result) is refused on its own (round 16, TS
+  // run19 F2: its approval is not pending), so it is checked alone and kept
+  // out of every batch (a refused batch records none of its decisions).
+  // (A step whose call ids repeat cannot say whose result is whose: every
+  // request stays open until the step is settled, G-392.)
+  const distinctStep = !decideStep(c.calls, c.requests, c.prior).repeated;
+  // So is one whose call a forged result (its own segment's) answered before
+  // the decisions are recorded.
+  const target = c.insert?.when === 'before_decision' || c.insert?.segment === 'earlier' ? forgedTarget(c) : null;
+  // (A repeated-id step whose every call already has a result is settled.)
+  const settled = !distinctStep && c.calls.every((call, index) => call.tool === 'free' || c.prior.includes(index) || (target?.step === 'earlier' && target.index === index));
+  const closedCall = (index: number): boolean => settled || (distinctStep && ((c.source === 'stored' && c.prior.includes(c.requests[index]!.call))
+    || (target?.step === 'earlier' && target.index === c.requests[index]!.call)));
+  const closed = c.order.filter((index) => c.requests[index]!.verdict !== 'none' && closedCall(index)).map((index) => approvalIds[index]!);
+  const decisions = c.order.filter((index) => c.requests[index]!.verdict !== 'none' && !closedCall(index)).map((index) => ({
     approvalId: approvalIds[index]!,
     approved: c.requests[index]!.verdict === 'approve',
     reason: c.requests[index]!.reason,
   }));
+  const laterRepeated = c.later !== null && decideStep(c.later.calls, c.later.requests, []).repeated;
+  const laterSettled = laterRepeated && c.later!.calls.every((call, index) => call.tool === 'free' || (target?.step === 'later' && target.index === index));
+  const laterClosed = (index: number): boolean => laterSettled || (!laterRepeated && target?.step === 'later' && target.index === c.later!.requests[index]!.call);
   // A later step's decisions follow; the replaced step's decisions are still recorded.
   c.later?.requests.forEach((request, index) => {
     const id = `apr_later_${c.seed}_${index}`;
     approvalIds.push(id);
-    if (request.verdict !== 'none') decisions.push({ approvalId: id, approved: request.verdict === 'approve', reason: request.reason });
+    if (request.verdict !== 'none' && laterClosed(index)) closed.push(id);
+    else if (request.verdict !== 'none') decisions.push({ approvalId: id, approved: request.verdict === 'approve', reason: request.reason });
   });
   // G-397: a row the host records between the park and the decision.
   if (c.insert?.when === 'before_decision' && c.insert.segment !== 'earlier') await insertRow(r, c);
+  for (const id of closed) {
+    const accepted = await recordApproval(r.session, id, true).then(() => true, () => false);
+    check(!accepted, 'A: a decision on a call that already has its outcome is refused', { id });
+  }
   // A decision for the parked step after a row that superseded it is refused
   // (approval_not_pending), on every path; a later step's decisions are not.
   const oldIds = new Set(approvalIds.slice(0, c.requests.length));
@@ -875,7 +938,9 @@ async function runCase(c: Case): Promise<void> {
     const requests = c.junk.requests
       ? c.requests.map((q, index) => ({ approval_id: approvalIds[index]!, tool_call_id: c.calls[q.call]!.id, arguments_format: ARGUMENTS_AS_SENT }))
       : [];
-    await r.session.thread().record([{ type: 'assistant', content: '', tool_calls: junkCalls(c.junk.kind, c.calls[0]!.id, firstGated(c)), additional_content: {}, tool_approval_requests: requests, harness_tool_names: ['echo', 'free'] }]);
+    const junk: JsonObject = { type: 'assistant', content: '', tool_calls: junkCalls(c.junk.kind, c.calls[0]!.id, firstGated(c)), additional_content: {}, tool_approval_requests: requests, harness_tool_names: ['echo', 'free'] };
+    if (c.junk.raw === true) await rawRecord(r, junk);
+    else await r.session.thread().record([junk]);
   }
   if (!resumedYet) first = await resumed(async () => await turn(r, c.resume, ''));
 
@@ -925,6 +990,10 @@ async function runCase(c: Case): Promise<void> {
 
   await settledOutcomes(r, c, oracle, '5');
   await replayShowsEachResultOnce(r.session, '7');
+  // Round 16 (TS run19 F2): every call has its outcome now, so no approval
+  // is pending, by the reader every decision is checked against.
+  check(pendingApprovalIds(await r.session.thread().readerRows()).length === 0, 'A: a pending approval names a call with no outcome', pendingApprovalIds(await r.session.thread().readerRows()));
+  await replaySentAnswersEveryCall(r.session, c, '7b');
 
   // Repeat resumes, with later decisions in between: nothing runs twice and
   // no outcome changes, and no result entry is written again (round 15).
@@ -937,7 +1006,12 @@ async function runCase(c: Case): Promise<void> {
     // host's step); from then on, nothing.
     if (index === 1 && c.failOnce) entriesBefore = await entries();
     if (again.approveAll) {
-      for (const id of approvalIds) await recordApproval(r.session, id, true).catch(() => undefined);
+      // Every call has its outcome: an ACCEPTED decision would be an
+      // approval accepted and never run (round 16, TS run19 F2).
+      for (const id of approvalIds) {
+        const accepted = await recordApproval(r.session, id, true).then(() => true, () => false);
+        check(!accepted, 'A: a decision is accepted only for a call with no outcome', { id });
+      }
     }
     const next = await turn(r, again.path, '');
     check(next.response.toolCalls.filter((name) => name === 'echo').length === 0, '3/6: a repeat resume reports no run', next.response.toolCalls);
@@ -991,6 +1065,45 @@ async function replayShowsEachResultOnce(session: Session, label: string): Promi
     }
     for (const key of (got[at] ?? new Map<string, number>()).keys()) check(segment.has(key), `${label}: the replay view shows no result outside its own segment`, { step: at, key });
   });
+}
+
+/**
+ * Invariant 7b (round 16, TS run19 I-9 and BRIEF-R16 item 3) on the replay
+ * the runtime SENDS (replayView of the reader rows): every call of every
+ * step but a paused one is answered EXACTLY once before the next assistant
+ * or user row, so a provider request is always valid; a call with no stored
+ * result reads interrupted.
+ */
+async function replaySentAnswersEveryCall(session: Session, c: Case, label: string): Promise<void> {
+  // A result a host forged that answers NO call is still shown where it
+  // sits (TS run19 I-9, Info): with one, a call may read answered twice.
+  const forged = c.insert?.kind === 'tool_result';
+  const readers = await session.thread().readerRows();
+  const sent = replayView(readers);
+  // The paused step (the last assistant row, no user row after it) is the
+  // resume's to answer: the replay gives its open calls nothing (the
+  // reference's rule, parity-r16 item 3a).
+  const last = sent.map((row) => row.type).lastIndexOf('assistant');
+  const paused = last !== -1 && !sent.slice(last + 1).some((row) => row.type === 'user');
+  for (const [index, row] of sent.entries()) {
+    if (row.type !== 'assistant' || (index === last && paused)) continue;
+    const calls = ((row.tool_calls ?? []) as JsonObject[]);
+    if (calls.length === 0) continue;
+    const answers: string[] = [];
+    for (let at = index + 1; at < sent.length && sent[at]!.type !== 'assistant' && sent[at]!.type !== 'user'; at += 1) {
+      for (const entry of (sent[at]!.tool_results ?? []) as JsonObject[]) answers.push(String(entry.tool_call_id));
+    }
+    const counts = new Map<string, number>();
+    for (const call of calls) counts.set(String(call.id), (counts.get(String(call.id)) ?? 0) + 1);
+    for (const [id, want] of counts) {
+      const got = answers.filter((answer) => answer === id).length;
+      // Calls that share an id: the fold keys a result by id, tool and
+      // arguments and a later row's replaces an earlier one's (thr-0009), so
+      // IDENTICAL calls may show one answer between them; never none.
+      const ok = forged ? got >= want : want > 1 ? got >= 1 && got <= want : got === want;
+      check(ok, `${label}: the sent replay answers every call of a step exactly once`, { step: index, id, got, want });
+    }
+  }
 }
 
 /** Invariants 5 and 6 on the thread rows: every call has exactly one outcome, the oracle's. */
@@ -1210,5 +1323,9 @@ describe('G-392 property: approval pairing invariants over generated steps', () 
       for (const requests of [true, false]) expect(has((c) => c.junk?.kind === kind && c.junk.requests === requests && c.requests.some((q) => q.verdict === 'approve')), `junk ${kind} requests ${String(requests)} after an approve`).toBe(true);
     }
     expect(has((c) => c.junk !== null && c.junk.requests && c.spent && c.requests.some((q) => q.verdict === 'approve')), 'junk with the old requests on a spent run after an approve').toBe(true);
+    // Round 16 (item 8): RAW non-object and MIXED copies (written straight
+    // into storage), and inserted rows carrying the parked step's own run id.
+    for (const kind of ['string', 'mixed', 'copy', 'both'] as const) expect(has((c) => c.junk?.kind === kind && c.junk.raw === true && c.junk.requests), `raw junk ${kind} with the old requests`).toBe(true);
+    for (const kind of ['user', 'assistant_text', 'assistant_call', 'tool_result', 'system'] as const) expect(has((c) => c.forgedRunId === true && c.insert?.kind === kind), `forged run id on a ${kind} row`).toBe(true);
   });
 });
