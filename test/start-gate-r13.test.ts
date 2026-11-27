@@ -812,8 +812,8 @@ function assistantRowOf(calls: JsonObject[], requests: JsonObject[]): JsonObject
 
 describe('DECISION B: a superseded parked step denies its open calls once', () => {
   const REPLACED = 'Tool call was not run because a later step replaced it';
-  type Kind = 'assistant_text' | 'assistant_tool_step' | 'user' | 'new_message' | 'forged_run_id';
-  const KINDS: Kind[] = ['assistant_text', 'assistant_tool_step', 'user', 'new_message', 'forged_run_id'];
+  type Kind = 'assistant_text' | 'assistant_tool_step' | 'user' | 'new_message' | 'forged_run_id' | 'forged_run_id_user';
+  const KINDS: Kind[] = ['assistant_text', 'assistant_tool_step', 'user', 'new_message', 'forged_run_id', 'forged_run_id_user'];
 
   async function parkedOn(r: Rig, scope: string, ids: [string, string] = ['c1', 'c2']): Promise<{ root: Session; approvals: string[]; runId: string }> {
     const root = r.session(scope);
@@ -833,6 +833,8 @@ describe('DECISION B: a superseded parked step denies its open calls once', () =
     }
     // A host passing the owning run's id itself: a run id a caller passes proves nothing.
     if (kind === 'forged_run_id') await root.thread().record([{ type: 'assistant', content: 'Forged.', tool_calls: [], tool_approval_requests: [] }], runId);
+    // A user row carrying the parked step's own run id (harness-approval-pairing apr-0020): outside too.
+    if (kind === 'forged_run_id_user') await root.thread().record([{ type: 'user', content: 'A later message.' }], runId);
   }
 
   for (const kind of KINDS) {
