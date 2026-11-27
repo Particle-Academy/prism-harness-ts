@@ -1649,8 +1649,9 @@ export class AgentRuntime {
       // step (then this run stops, parked_elsewhere, as at the top of the
       // loop: the newer step is never replaced), and a row written since the
       // step may have replaced it (its approvals are no longer pending, so
-      // they are never listed; nothing is left to wait on, and the run goes
-      // on). Never an approval that is no longer pending.
+      // they are never listed; the run still stops here, as the reference's
+      // parked response does, and takes no model step on a row it did not
+      // ask for). Never an approval that is no longer pending.
       let waiting = requests;
       if (requests.length > 0) {
         const after = await thread.readerRows();
@@ -1660,7 +1661,7 @@ export class AgentRuntime {
         waiting = requests.filter((request) => pending.has(request.approval_id));
       }
 
-      if (waiting.length > 0) {
+      if (requests.length > 0) {
         // G-360: the run stops here for a person; a plan binds the approvals
         // this turn staged, as it does when a run finishes.
         await session.planService()?.afterTurn(session);
