@@ -264,6 +264,43 @@ describe('G-397: a result counts once, for the call it names, wherever it sits',
   });
 });
 
+describe("G-397: a step's own results are counted through the end of the thread", () => {
+  it('a call that ran under an earlier version, with a host text row before its result, keeps its one outcome after an upgrade', async () => {
+    // Rows as an earlier version could leave them: the step and its decision
+    // in the run that parked, a host note with no run id, then the resume's
+    // result and answer in the run that resumed.
+    const r = rig([]);
+    await r.session.thread().record([{ type: 'user', content: 'go' }], 'run_1');
+    await r.session.thread().record([{ ...assistantRow('', [echo('c1', 1)], {}, [{ approval_id: 'apr_1', tool_call_id: 'c1', arguments_format: ARGUMENTS_AS_SENT }]), harness_tool_names: ['echo', 'free'] }], 'run_1');
+    await r.session.thread().record([toolResultRow([], [{ approval_id: 'apr_1', approved: true, reason: null }])], 'run_1');
+    await r.session.thread().record([{ type: 'assistant', content: 'A note.', tool_calls: [], tool_approval_requests: [] }]);
+    await r.session.thread().record([
+      toolResultRow([toolResultEntry({ id: 'c1', name: 'echo', arguments: { n: 1 } }, 'ran:1')], [{ approval_id: 'apr_1', approved: true, reason: null }]),
+      { type: 'assistant', content: 'done', tool_calls: [], tool_approval_requests: [] },
+    ], 'run_2');
+    await r.agent.send(r.session, '');
+    await r.agent.send(r.session, '');
+
+    expect(r.ran).toEqual([]);
+    expect(await outcomesOf(r.session, 1)).toEqual(['ran:1']);
+  });
+
+  it("a result recorded for a parked call after a later step that repeats its id is that call's only outcome; the later step's calls get their own", async () => {
+    const r = rig([echo('c1', 1)]);
+    await r.agent.send(r.session, 'go');
+    await recordStep(r.session, [[echo('c1', 3), 'apr_l'], [echo('c1', 4), 'apr_m']]);
+    await r.session.thread().record([toolResultRow([toolResultEntry({ id: 'c1', name: 'echo', arguments: { n: 1 } }, 'forged:1')])]);
+    await recordDecisions(r.session, [{ approvalId: 'apr_l', approved: true }, { approvalId: 'apr_m', approved: true }]);
+    await r.agent.send(r.session, '');
+    await r.agent.send(r.session, '');
+
+    expect(r.ran).toEqual([]);
+    expect(await outcomesOf(r.session, 1)).toEqual(['forged:1']);
+    expect(await outcomesOf(r.session, 3)).toEqual([REPEATED]);
+    expect(await outcomesOf(r.session, 4)).toEqual([REPEATED]);
+  });
+});
+
 describe('G-397: what supersedes a parked step, and what does not', () => {
   for (const [label, row] of [['a text row', { type: 'assistant', content: 'A note.', tool_calls: [], tool_approval_requests: [] }], ['a user row', { type: 'user', content: 'Something else.' }]] as [string, JsonObject][]) {
     it(`${label} the host records (no run id) supersedes: the calls are denied as replaced, nothing runs, a later decision is refused`, async () => {
