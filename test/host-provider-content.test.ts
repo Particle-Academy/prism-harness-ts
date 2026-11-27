@@ -169,6 +169,23 @@ describe('G-415: a host row\'s provider content is sent only when it is that row
     }
   });
 
+  it('a host row\'s tool calls are sent without a copied reasoning id or summary (a client would rebuild a reasoning item from them); stored unchanged', async () => {
+    const copied = { ...call('fc_1'), reasoning_id: 'rs_copied', reasoning_summary: [{ type: 'summary_text', text: 'copied thought' }] };
+    const { sent, stored } = await sendWith(hostRow('', {}, [copied]));
+    expect((sent.tool_calls as JsonObject[]).map((entry) => [entry.id, entry.reasoning_id, entry.reasoning_summary])).toEqual([['fc_1', null, null]]);
+    expect((stored.tool_calls as JsonObject[])[0]!.reasoning_id).toBe('rs_copied');
+  });
+
+  it('the harness\'s own tool calls keep their reasoning id and summary', async () => {
+    const r = rig([
+      { text: '', finishReason: 'tool_calls', toolCalls: [{ id: 'fc_9', name: 'lookup', arguments: { q: 'x' }, reasoningId: 'rs_9', reasoningSummary: [{ type: 'summary_text', text: 'own thought' }] }] },
+      { text: 'done', finishReason: 'stop' },
+    ]);
+    await r.agent.send(r.session, 'go');
+    const step = (r.requests.at(-1)!.messages as JsonObject[]).find((row) => row.type === 'assistant' && Array.isArray(row.tool_calls) && row.tool_calls.length > 0)!;
+    expect((step.tool_calls as JsonObject[]).map((entry) => [entry.reasoning_id, entry.reasoning_summary])).toEqual([['rs_9', [{ type: 'summary_text', text: 'own thought' }]]]);
+  });
+
   it('a host row whose tool_calls hold no objects counts as one with none', async () => {
     const { sent } = await sendWith(hostRow(NOTE, { output_items: [openaiCall('fc_1'), message(NOTE)], content_blocks: [{ type: 'text', text: NOTE }, toolUse('t1')] }, ['{"id":"fc_1"}']));
     expect(additional(sent)).toEqual({});
