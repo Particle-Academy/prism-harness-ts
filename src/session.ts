@@ -8,7 +8,7 @@ import { StoreTaskSource } from './store-task-source.js';
 import type { StoreTaskSourceOptions } from './store-task-source.js';
 import { HarnessError } from './errors.js';
 import { Thread } from './thread.js';
-import { pausedApprovalIds, storedBinding } from './thread-rows.js';
+import { pausedApprovalIds, stepRequests, storedBinding } from './thread-rows.js';
 import type { ModelBinding } from './subagents.js';
 import type { AgentRuntime } from './runtime.js';
 import { PlansDisabled } from './plans/refusal.js';
@@ -781,8 +781,8 @@ export class Session {
     const entries = await this.#threadOf().messages();
     const runs: string[] = [];
     for (const approvalId of pausedApprovalIds(entries.map((entry) => entry.message))) {
-      const issued = entries.find((entry) => Array.isArray(entry.message.tool_approval_requests)
-        && (entry.message.tool_approval_requests as JsonObject[]).some((request) => isJsonObject(request) && request.approval_id === approvalId));
+      // Asked by a tool-call step only, by the one rule (G-408).
+      const issued = entries.find((entry) => stepRequests(entry.message).some((request) => request.approval_id === approvalId));
       if (issued?.runId != null && !runs.includes(issued.runId)) runs.push(issued.runId);
     }
 

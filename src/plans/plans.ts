@@ -181,7 +181,7 @@ export class Plans {
   async reconciled(session: Session, superseding = false, runId: string | null = null): Promise<Plan | null> {
     const plan = await this.load(session);
     if (!PlanMachine.isLive(plan)) return plan;
-    const rows = (await session.thread().messages()).map((entry) => entry.message);
+    const rows = (await session.thread().readerRows());
     const pending = superseding ? [] : pendingApprovalCalls(rows);
     const decided = approvalDecisions(rows);
 
@@ -515,7 +515,7 @@ export class Plans {
     const step = activeAgentStep(plan);
     const advancing = step !== null && this.#advancing.has(session.key());
     const stepApproval = step !== null && step.approvalIds.length > 0
-      && pausedApprovalIds((await session.thread().messages()).map((entry) => entry.message)).some((id) => step.approvalIds.includes(id));
+      && pausedApprovalIds((await session.thread().readerRows())).some((id) => step.approvalIds.includes(id));
 
     return this.#routedLedger(session, plan, prompt, advancing, stepApproval, context);
   }
@@ -540,7 +540,7 @@ export class Plans {
   async #savedRefs(session: Session): Promise<ChildRefs> {
     const kept = await session.childRefs();
     if (kept !== null) return kept;
-    const paused = pausedRunState((await session.thread().messages()).map((entry) => entry.message));
+    const paused = pausedRunState((await session.thread().readerRows()));
 
     return { tree: paused?.tree ?? null, planLedger: paused?.planLedger ?? null };
   }

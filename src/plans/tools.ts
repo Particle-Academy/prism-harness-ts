@@ -61,7 +61,7 @@ export function planTools(plans: Plans, session: Session): HarnessTool[] {
 
   /** A person approved exactly this call, and it has not run yet. Read from the thread. */
   const approved = async (tool: string, hash: string): Promise<boolean> =>
-    approvedCallsAwaitingResult((await session.thread().messages()).map((entry) => entry.message), tool, hash) > 0;
+    approvedCallsAwaitingResult((await session.thread().readerRows()), tool, hash) > 0;
 
   const proposal = async (args: JsonObject, hash: string, authorized = true): Promise<Plan> => {
     const limits = plans.limits();

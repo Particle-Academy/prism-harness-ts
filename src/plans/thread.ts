@@ -1,5 +1,5 @@
 import type { JsonObject, JsonValue } from '../json.js';
-import { endedByStart, pairStepApprovals, pausedStepIndex, pendingApprovalIds, repeatedIdDenials, stepResultsByPosition, supersededApprovals, isReplacedStepRow } from '../thread-rows.js';
+import { endedByStart, pairStepApprovals, pausedStepIndex, pendingApprovalIds, repeatedIdDenials, ownRequests, stepCalls, stepResultsByPosition, supersededApprovals, isReplacedStepRow } from '../thread-rows.js';
 import { argsDigest } from '../tool-policy.js';
 import type { PendingCall } from './machine.js';
 
@@ -33,12 +33,12 @@ export function pendingApprovalCalls(rows: readonly JsonObject[]): PendingCall[]
   // Each approval's call, paired by position (G-392), with a call that has
   // no result of its own first (round 13): a call that already has one ran
   // ungated, so it is not the one asked about.
-  const stepCalls = list(row.tool_calls);
+  const ofStep = stepCalls(row);
   const answered = stepResultsByPosition(rows, index);
-  const paired = pairStepApprovals(stepCalls, list(row.tool_approval_requests), (_call, position) => !answered[position]).approvalIds;
+  const paired = pairStepApprovals(ofStep, ownRequests(rows, index), (_call, position) => !answered[position]).approvalIds;
   const calls: PendingCall[] = [];
   for (const id of ids) {
-    const call = stepCalls[paired.indexOf(id)];
+    const call = ofStep[paired.indexOf(id)];
     if (call !== undefined && typeof call.name === 'string') calls.push({ id, name: call.name, digest: digestOf(call.arguments) });
   }
 
@@ -80,7 +80,7 @@ export function approvedCallsAwaitingResult(rows: readonly JsonObject[], name: s
   if (step === null) return 0;
   const row = rows[step]!;
   // A step that repeats a call id runs none of its gated calls (G-392).
-  if (pairStepApprovals(list(row.tool_calls), list(row.tool_approval_requests)).repeated) return 0;
+  if (pairStepApprovals(stepCalls(row), ownRequests(rows, step)).repeated) return 0;
   // The FIRST decision recorded for an id is the one answer that counts, as
   // for the resume and the plan.
   const decided = new Map<string, boolean>();
@@ -95,10 +95,10 @@ export function approvedCallsAwaitingResult(rows: readonly JsonObject[], name: s
     }
   }
 
-  const approvedCalls = new Set(list(row.tool_approval_requests)
+  const approvedCalls = new Set(ownRequests(rows, step)
     .filter((request) => typeof request.approval_id === 'string' && decided.get(request.approval_id) === true && typeof request.tool_call_id === 'string')
     .map((request) => request.tool_call_id as string));
 
-  return list(row.tool_calls).filter((call) => typeof call.id === 'string' && approvedCalls.has(call.id)
+  return stepCalls(row).filter((call) => typeof call.id === 'string' && approvedCalls.has(call.id)
     && !finished.has(call.id) && call.name === name && digestOf(call.arguments) === digest).length;
 }
