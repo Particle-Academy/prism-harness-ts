@@ -5,11 +5,13 @@ name: Property tests (long set)
 # the property files, with many more examples and a seed taken from the run,
 # so each run explores new cases and logs the seed to replay them.
 #
-# `schedule` fires only from the default branch, so this copy tests the
-# default branch only. It never checks out another ref: code from another ref
-# run in the default branch's context could poison what that context trusts
-# (CodeQL actions/cache-poisoning). Each release line keeps its own
-# dispatch-only copy of this workflow.
+# `schedule` fires only from the default branch, and tests it. A dispatch may
+# name, in `ref`, the default branch or a RELEASE LINE (`release/<line>`) to
+# test (G-387 round 16, item 11): nothing else (no tags, no SHAs, no other
+# branches, no fork's refs), checked by tools/property/ref.mjs from the
+# DEFAULT branch's copy before the named branch is checked out. A release
+# line's run uses no npm cache, so nothing it installs can be restored into a
+# default-branch run (actions/cache-poisoning).
 
 on:
   schedule:
@@ -20,6 +22,10 @@ on:
         description: Examples per property
         required: false
         default: '5000'
+      ref:
+        description: The branch to test, the default branch or release/<line>
+        required: false
+        default: main
 
 permissions:
   contents: read
@@ -37,32 +43,48 @@ jobs:
       # Pinned to full commit SHAs, resolved read-only from the lightweight
       # release tags (gh api repos/actions/<action>/git/ref/tags/v4.4.0, a
       # commit object, so nothing to dereference).
+      #
+      # The DEFAULT branch first: its own copy of the checks decides what runs.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        with:
-          node-version: 22
-          cache: npm
-      - run: npm ci
-      # The count must be a whole number from 1 to 1000000: anything else a
-      # dispatch gives fails the job here (no default for a bad value). A
-      # scheduled run has no input and takes the default.
-      - name: Examples count
-        id: examples
+      # The count must be a whole number from 1 to 1000000, and the ref the
+      # default branch or release/<line>: anything else a dispatch gives fails
+      # the job here (no default for a bad value). A scheduled run has no
+      # input and takes the defaults.
+      - name: Examples count and branch
+        id: inputs
         shell: bash
         env:
           EVENT: ${{ github.event_name }}
-          INPUT: ${{ inputs.examples }}
+          EXAMPLES: ${{ inputs.examples }}
+          REF: ${{ inputs.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
-          node --test tools/property/examples-check.mjs
-          count="$(node tools/property/examples.mjs "$EVENT" "$INPUT")"
+          node --test tools/property/examples-check.mjs tools/property/ref-check.mjs
+          count="$(node tools/property/examples.mjs "$EVENT" "$EXAMPLES")"
+          branch="$(node tools/property/ref.mjs "$EVENT" "$REF" "$DEFAULT_BRANCH")"
           echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          if [ "$branch" = "$DEFAULT_BRANCH" ]; then echo "cache=npm" >> "$GITHUB_OUTPUT"; else echo "cache=" >> "$GITHUB_OUTPUT"; fi
+      # Then the branch it named, as a branch of THIS repository only.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: refs/heads/${{ steps.inputs.outputs.branch }}
+          persist-credentials: false
+          clean: true
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: ${{ steps.inputs.outputs.cache }}
+      - run: npm ci
       - name: Property tests
         shell: bash
         env:
-          PRISM_PROPERTY_EXAMPLES: ${{ steps.examples.outputs.count }}
+          PRISM_PROPERTY_EXAMPLES: ${{ steps.inputs.outputs.count }}
           PRISM_PROPERTY_BASE_SEED: ${{ github.run_id }}
+          BRANCH: ${{ steps.inputs.outputs.branch }}
         run: |
-          echo "PRISM_PROPERTY_BASE_SEED=$PRISM_PROPERTY_BASE_SEED PRISM_PROPERTY_EXAMPLES=$PRISM_PROPERTY_EXAMPLES"
+          echo "BRANCH=$BRANCH PRISM_PROPERTY_BASE_SEED=$PRISM_PROPERTY_BASE_SEED PRISM_PROPERTY_EXAMPLES=$PRISM_PROPERTY_EXAMPLES"
           npx vitest run test/approval-pairing-property.test.ts --reporter=verbose

@@ -959,7 +959,9 @@ export const EXPECTED_R15: Record<string, Record<string, string>> = {
   user: { write: 'recorded', outcomes: 'ok', echoed: '1', superseded: 'no', ended: 'no', decided: 'approved', pending: '' },
   assistant_text: { write: 'recorded', outcomes: 'ok', echoed: '1', superseded: 'no', ended: 'no', decided: 'approved', pending: '' },
   assistant_tool_step: { write: 'recorded', outcomes: 'ok', echoed: '1', superseded: 'no', ended: 'no', decided: 'approved', pending: '' },
-  host_step_request: { write: 'recorded', outcomes: 'ok', echoed: '1', superseded: 'no', ended: 'no', decided: 'approved', pending: '' },
+  // Round 16 (item 3, a nested park): the host's step waits on ITS OWN
+  // approval, so the resume takes no further model step: parked_elsewhere.
+  host_step_request: { write: 'recorded', resume: 'parked_elsewhere', outcomes: 'ok', echoed: '1', superseded: 'no', ended: 'no', decided: 'approved', pending: '' },
   forged_ended: { write: 'recorded', outcomes: 'ok', echoed: '1', superseded: 'no', ended: 'no', decided: 'approved', pending: '' },
   junk_copy: { write: 'recorded', outcomes: 'ok', echoed: '1', superseded: 'no', ended: 'no', decided: 'approved', pending: '' },
   no_session: { write: 'recorded', outcomes: 'ok', echoed: '1', superseded: 'no', ended: 'no', decided: 'approved', pending: '' },
@@ -998,7 +1000,10 @@ describe('G-387 round 15: the matrix, every superseding write while an approved 
         }
       };
       r.text('Resumed.');
-      await r.runtime.send(r.child(), '');
+      await r.runtime.send(r.child(), '').catch((error: { code?: string }) => {
+        if (error.code !== 'parked_elsewhere') throw error;
+        got.resume = error.code;
+      });
       for (let resume = 0; resume < 2; resume += 1) { r.text('Again.'); await r.runtime.send(r.child(), ''); }
 
       const rows = await r.child().thread().readerRows();

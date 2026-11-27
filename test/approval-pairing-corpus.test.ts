@@ -33,7 +33,7 @@ interface PairingCase {
   calls: { id: string; name: string; args: JsonObject }[];
   rounds: [number, boolean][][];
   /** DECISION B (0.2.0): what supersedes the parked step, after the park and before the rounds. */
-  supersede?: 'assistant_tool_step' | 'assistant_text' | 'user' | 'user_owning_run_id' | 'new_message' | 'new_message_failed' | 'altered_copy' | 'altered_copy_after_approval';
+  supersede?: 'assistant_tool_step' | 'assistant_text' | 'user' | 'user_owning_run_id' | 'new_message' | 'new_message_failed' | 'altered_copy' | 'altered_copy_after_approval' | 'host_result' | 'denial_after_run';
   /**
    * SEGMENT OWNERSHIP (0.2.0, round 13b): a later step a host records after
    * the park, each echo call asking its own approval (`apr_later_<k>`, k
@@ -114,6 +114,19 @@ async function record(row: PairingCase): Promise<unknown> {
       harness_tool_names: ['echo', 'free'],
     }]);
     if (row.supersede === 'altered_copy_after_approval') await runtime.send(session, '');
+  }
+  // 0.5.0 (round 16): a host's result for the first echo call, after the
+  // park and before the rounds (its approval is then not pending); or every
+  // pending approval recorded approved, one resume, then a host's denial of
+  // each (it never stands).
+  if (row.supersede === 'host_result') {
+    const call = row.calls.find((candidate) => candidate.name === 'echo')!;
+    await session.thread().record([toolResultRow([toolResultEntry({ id: call.id, name: call.name, arguments: call.args }, 'host')])]);
+  }
+  if (row.supersede === 'denial_after_run') {
+    await recordDecisions(session, pending.map((approval) => ({ approvalId: approval.id, approved: true })));
+    await runtime.send(session, '');
+    await session.thread().record([toolResultRow([], pending.map((approval) => ({ approval_id: approval.id, approved: false, reason: 'Too late.' })))]);
   }
   const later = row.later;
   const laterIds: string[] = [];

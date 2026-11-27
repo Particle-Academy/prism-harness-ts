@@ -52,7 +52,10 @@ export interface ThreadMessage {
 const ROW_MARKS: readonly string[] = [ANSWERS_STEP_KEY, STARTED_KEY, ENDED_BY_START_KEY, SUPERSEDED_KEY, REPLACED_STEP_KEY,
   // The step counts a parked run writes on the row it parks on (round 16: the
   // reference's list): on a row the runtime did not write they read as absent.
-  'harness_steps_used', 'harness_steps_left'];
+  'harness_steps_used', 'harness_steps_left',
+  // The reference's own marks (0.26.x replaced, its write-ahead journal):
+  // never written here, read as absent on any row the runtime did not write.
+  'harness_replaced', 'harness_journal'];
 
 /**
  * The rows as every harness reader takes them (G-387 round 15): a row the

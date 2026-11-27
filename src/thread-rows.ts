@@ -642,8 +642,6 @@ class StepAnswers {
   readonly calls: JsonObject[];
   readonly has: Answer[];
   readonly #args: string[];
-  /** A result an EARLIER row of the step already holds (a copy: the same id, tool, arguments and result) answers nothing new (TS I-1). */
-  readonly #prints = new Set<string>();
 
   constructor(row: JsonObject) {
     this.calls = stepCalls(row);
@@ -662,12 +660,13 @@ class StepAnswers {
     }
     const entries = Array.isArray(row.tool_results) ? list(row.tool_results)
       : Object.hasOwn(row, 'tool_call_id') ? [{ tool_call_id: row.tool_call_id ?? null, tool_name: row.name ?? null }] : [];
-    const added: string[] = [];
+    // Every result answers the FIRST call with no outcome it matches (round
+    // 16, the reference's rule, thr-0026): a second row of the same result
+    // answers an identical second call. (An answer row writes only results
+    // its step does not hold yet, newResults(), so nothing the runtime writes
+    // is read twice.)
     for (const entry of entries) {
       const id = text(entry.tool_call_id);
-      const print = sortedJson([id, text(entry.tool_name), isObject(entry.args) ? entry.args : {}, text(entry.result)]);
-      if (this.#prints.has(print)) continue;
-      added.push(print);
       // A started call is still open to ITS result (the real one, wherever it lands).
       const open = (position: number): boolean => has[position] !== 'result' && text(calls[position]!.id) === id;
       const first = (test: (call: JsonObject, position: number) => boolean): number => {
@@ -679,7 +678,6 @@ class StepAnswers {
       if (found === -1) found = first(() => true);
       if (found !== -1) has[found] = 'result';
     }
-    for (const print of added) this.#prints.add(print);
   }
 }
 
