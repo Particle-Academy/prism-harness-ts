@@ -368,9 +368,22 @@ every call. If a newer step on the session (a tool's own `send()`, another
 run, a host) parks for a person while a run is going, that run takes no
 further model step: it fails with `parked_elsewhere` (a `HarnessError` code)
 after recording what it ran, and never replaces a step that was just
-reported as awaiting approval. The harness's marks (started, answers-step,
-ended, superseded, replaced, the repeated-id mark and a request's binding)
-are read only on rows the runtime itself wrote; on any other row, whatever
+reported as awaiting approval; a step's own run also re-reads what is
+pending once its calls ran, so it never reports an approval that is no
+longer pending. A call that needs nobody runs only while its step is still
+open: one a row written in the meantime replaced keeps its one "replaced"
+outcome and never runs; if its `started` row cannot be stored, nothing of the
+batch runs and each call reads "not run". The replay answers every call of
+every step directly after that step: its results (wherever they were stored,
+for example after a message sent while the call ran) come first, and any
+user, assistant or system row written in between follows them, so every
+request a provider is sent answers every call in that step's own result
+run. A resume answers a paused step's calls that need nobody and still have
+no outcome (a host's own step) as interrupted. The harness's marks (started,
+answers-step, ended, superseded, replaced, the repeated-id mark and a
+request's binding) and the run state a paused run carries (its model
+binding, tool list, run tree, plan ledger and agent spend) are read only on
+rows the runtime itself wrote; on any other row, whatever
 run id it carries, they are read as absent. A run id is never a trust
 signal. A decision counts only while its call has no outcome: a denial
 recorded after an approval, before the call starts, revokes it (and the

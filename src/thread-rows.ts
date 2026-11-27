@@ -272,7 +272,7 @@ export function threadView(rows: readonly JsonObject[]): JsonObject[] {
  *
  * @internal
  */
-export function replayView(rows: readonly JsonObject[], synthesise = true): JsonObject[] {
+function replayView$(rows: readonly JsonObject[], synthesise = true): JsonObject[] {
   return threadView(placedRows(rows, synthesise));
 }
 
@@ -288,7 +288,7 @@ export function replayView(rows: readonly JsonObject[], synthesise = true): Json
  *
  * @internal
  */
-export function placedRows(rows: readonly JsonObject[], synthesise = true): JsonObject[] {
+function placedRows$(rows: readonly JsonObject[], synthesise = true): JsonObject[] {
   const standing = standingDecisions(rows);
   const asked = new Set<string>();
   return replayOrder(rows, synthesise).map((row) => {
@@ -312,19 +312,25 @@ export function placedRows(rows: readonly JsonObject[], synthesise = true): Json
 }
 
 /**
- * The rows in the order the replay shows them (G-387 round 15): a harness
- * STARTED row is never replayed; a harness row whose honoured mark
- * (markedOwner) names an earlier step is replayed in THAT step's result run
- * (directly after the step and the result and system rows that follow it),
- * not where it sits; and a started call with no result its step owns gets
- * ONE result there, INTERRUPTED_RESULT, so a provider sees an answer for
- * every call. Unmarked threads are returned as they are.
+ * The rows in the order the replay shows them (G-387 rounds 15 to 17, the
+ * reference's Thread::placedRows):
+ *
+ * - EACH STEP IS ANSWERED DIRECTLY AFTER ITSELF (round 17): every
+ *   tool_result row that belongs to it (its honoured mark names it,
+ *   markedOwner(), or its segment holds it) is replayed right after the
+ *   step, oldest first, PAST any user, assistant text, system or other row
+ *   written in between (a person, a host or the tool itself writing while
+ *   its call ran); those rows follow its results, in their stored order. So
+ *   every request answers every call of every step it carries in that
+ *   step's own result run, as every provider requires;
+ * - a harness STARTED row is never replayed;
+ * - a started call with no result its step owns gets ONE result,
+ *   INTERRUPTED_RESULT, and a step that is no longer paused answers each
+ *   call with no outcome (replaced or interrupted), after the step's own
+ *   results.
  */
 function replayOrder(rows: readonly JsonObject[], synthesise = true): readonly JsonObject[] {
-  const marked = (row: JsonObject): boolean => row.harness === true && row.type === 'tool_result'
-    && (Object.hasOwn(row, ANSWERS_STEP_KEY) || Object.hasOwn(row, STARTED_KEY));
   const paused = pausedStepIndex(rows);
-  const anyMarked = rows.some(marked);
   // What each step's replay is given (round 15): its started calls with no
   // result read INTERRUPTED; a step that is NOT the paused one, a requested
   // call of which has no outcome (a thread an older version wrote, item 9),
@@ -359,28 +365,25 @@ function replayOrder(rows: readonly JsonObject[], synthesise = true): readonly J
     });
     if (entries.length > 0) synthesised.set(index, toolResultRow(entries) as unknown as JsonObject);
   }
-  if (synthesised.size === 0 && !anyMarked) return rows;
-  const moved = new Map<number, JsonObject[]>();
-  const kept: { row: JsonObject; index: number }[] = [];
-  let segment = -1;
+  // Each step's result rows, in stored order (round 17): every row that
+  // answers it, wherever it was stored.
+  const answersOf = rowIndex(rows).answers;
+  const owned = new Map<number, JsonObject[]>();
   for (const [index, row] of rows.entries()) {
-    if (isToolStep(row)) segment = index;
-    if (row.harness === true && isStartedRow(row)) continue;
-    const owner = markedOwner(rows, index);
-    if (owner !== undefined && owner !== segment) {
-      moved.set(owner, [...(moved.get(owner) ?? []), row]);
-      continue;
-    }
-    kept.push({ row, index });
+    const owner = answersOf[index];
+    if (owner === null || owner === undefined || (row.harness === true && isStartedRow(row))) continue;
+    owned.set(owner, [...(owned.get(owner) ?? []), row]);
   }
   const out: JsonObject[] = [];
-  for (let at = 0; at < kept.length; at += 1) {
-    const { row, index } = kept[at]!;
+  for (const [index, row] of rows.entries()) {
+    if (row.harness === true && isStartedRow(row)) continue;
+    // A result row is replayed with the step it answers, never where it sits.
+    if (answersOf[index] !== null && answersOf[index] !== undefined) continue;
     out.push(row);
     if (!isToolStep(row)) continue;
-    // The step's own result run: the result and system rows right after it.
-    while (at + 1 < kept.length && (kept[at + 1]!.row.type === 'tool_result' || kept[at + 1]!.row.type === 'system')) out.push(kept[++at]!.row);
-    out.push(...(moved.get(index) ?? []));
+    // Directly after the step: its results, then what is synthesised for
+    // its calls with none; every other row follows, in stored order.
+    out.push(...(owned.get(index) ?? []));
     const extra = synthesised.get(index);
     if (extra !== undefined) out.push(extra);
   }
@@ -504,7 +507,7 @@ export function stepRequests(row: JsonObject | undefined): JsonObject[] {
  *
  * @internal
  */
-export function askedBefore(rows: readonly JsonObject[], index: number): Set<string> {
+function askedBefore$(rows: readonly JsonObject[], index: number): Set<string> {
   const asked = new Set<string>();
   for (const [id, step] of rowIndex(rows).firstAsker) if (step < index) asked.add(id);
   return asked;
@@ -517,7 +520,7 @@ export function askedBefore(rows: readonly JsonObject[], index: number): Set<str
  *
  * @internal
  */
-export function ownRequests(rows: readonly JsonObject[], index: number): JsonObject[] {
+function ownRequests$(rows: readonly JsonObject[], index: number): JsonObject[] {
   const requests = stepRequests(rows[index]);
   if (requests.length === 0) return requests;
   const first = rowIndex(rows).firstAsker;
@@ -554,6 +557,43 @@ export const ANSWERS_STEP_KEY = 'harness_answers_step';
  * @internal
  */
 export const STARTED_KEY = 'harness_started';
+
+/**
+ * The outcome of an UNGATED call whose started row could not be written
+ * (round 17, TS run20 F3b): the batch never ran, so the call did not run.
+ * @internal
+ */
+export const UNSTARTED_RESULT = 'Not run: the harness could not record that this call was starting.';
+
+/**
+ * The calls of the paused step (pausedStepIndex) that need nobody's
+ * approval and have NO outcome: no result, no started row, no request of
+ * their own (round 17). A step a host recorded can hold such a call; one
+ * whose started row could not be written too. By position.
+ *
+ * @internal
+ */
+function unansweredUngatedCalls$(rows: readonly JsonObject[], needsApproval: (name: string) => boolean): number[] {
+  const step = pausedStepIndex(rows);
+  if (step === null || !isToolStep(rows[step])) return [];
+  const answers = stepAnswers(rows, step);
+  if (!answers.includes(null)) return [];
+  const calls = stepCalls(rows[step]);
+  const requested = pairStepApprovals(calls, ownRequests(rows, step), (_call, position) => answers[position] === null).approvalIds;
+  return calls.flatMap((call, position) => (answers[position] === null && requested[position] === undefined && !needsApproval(text(call.name)) ? [position] : []));
+}
+
+/** The interrupted answer for a stored call (the replay's, as stored). @internal */
+export function interruptedEntry(call: JsonObject): ToolResultEntry {
+  return {
+    tool_call_id: text(call.id),
+    tool_name: text(call.name),
+    args: usableArguments(call.arguments) ?? {},
+    result: INTERRUPTED_RESULT,
+    tool_call_result_id: nullableText(call.result_id),
+    artifacts: [],
+  };
+}
 
 /** The outcome of a started call that never got a result (no final period; the reference's text). @internal */
 export const INTERRUPTED_RESULT = 'Tool call was interrupted, it may have run';
@@ -597,7 +637,12 @@ export function isStartedRow(row: JsonObject): boolean {
  *
  * @internal
  */
-export function markedOwner(rows: readonly JsonObject[], index: number): number | undefined {
+/** markedOwner() of every row, in one pass (for a caller that reads it row by row). @internal */
+function markedOwners$(rows: readonly JsonObject[]): readonly (number | undefined)[] {
+  return rowIndex(rows).owners;
+}
+
+function markedOwner$(rows: readonly JsonObject[], index: number): number | undefined {
   return rowIndex(rows).owners[index];
 }
 
@@ -630,7 +675,7 @@ function ownerOf(rows: readonly JsonObject[], row: JsonObject, index: number): n
  *
  * @internal
  */
-export function stepAnswers(rows: readonly JsonObject[], index: number): Answer[] {
+function stepAnswers$(rows: readonly JsonObject[], index: number): Answer[] {
   const known = rowIndex(rows).steps.get(index);
   return known === undefined ? stepCalls(rows[index]).map(() => null) : [...known.has];
 }
@@ -690,6 +735,13 @@ class StepAnswers {
 interface RowIndex {
   /** markedOwner() of each row. */
   owners: (number | undefined)[];
+  /**
+   * The step each tool_result row ANSWERS (round 17): the one its honoured
+   * mark names, else the step whose segment holds it (stepAnswers' rule);
+   * null for any other row, a row before every step, and a 0.11.x
+   * replaced-step answer (it names an earlier step and is never replayed).
+   */
+  answers: (number | null)[];
   /** The tool-call step that FIRST asked for each approval id (G-408): askedBefore()'s rule. */
   firstAsker: Map<string, number>;
   /** Each tool-call step's answers (stepAnswers()). */
@@ -707,19 +759,40 @@ interface RowIndex {
   standing: Map<string, { entry: ApprovalDecisionEntry; at: number }>;
 }
 
-const INDEXES = new WeakMap<readonly JsonObject[], { length: number; index: RowIndex }>();
+/**
+ * The indexes built during ONE top-level reader call (round 17, Py run21
+ * I1): every exported reader runs inside reading(), and the cache is dropped
+ * when the outermost one returns. Inside one call every reader of a rows
+ * array shares one pass; across calls nothing is kept, so a caller that
+ * edits its array between two calls (even in place, at the same length)
+ * is never answered from a stale index.
+ */
+let INDEXES = new WeakMap<readonly JsonObject[], RowIndex>();
+let DEPTH = 0;
 
-/** The one-pass index of `rows` (RowIndex), built once per rows array. */
+/** Run `body` as (part of) one reader call: the index cache lives until the outermost call returns. */
+function reading<R>(body: () => R): R {
+  DEPTH += 1;
+  try {
+    return body();
+  } finally {
+    DEPTH -= 1;
+    if (DEPTH === 0) INDEXES = new WeakMap();
+  }
+}
+
+/** The one-pass index of `rows` (RowIndex), built once per rows array per reader call. */
 function rowIndex(rows: readonly JsonObject[]): RowIndex {
   const known = INDEXES.get(rows);
-  if (known !== undefined && known.length === rows.length) return known.index;
+  if (known !== undefined) return known;
   const index = buildIndex(rows);
-  INDEXES.set(rows, { length: rows.length, index });
+  if (DEPTH > 0) INDEXES.set(rows, index);
   return index;
 }
 
 function buildIndex(rows: readonly JsonObject[]): RowIndex {
   const owners: (number | undefined)[] = [];
+  const answers: (number | null)[] = [];
   const firstAsker = new Map<string, number>();
   // The requests markedApprovals() reads: the first assistant row asking with a call id.
   const markAsker = new Map<string, number>();
@@ -764,6 +837,7 @@ function buildIndex(rows: readonly JsonObject[]): RowIndex {
   for (const [at, row] of rows.entries()) {
     const owner = ownerOf(rows, row, at);
     owners.push(owner);
+    answers.push(row.type === 'tool_result' && !isReplacedStepRow(row) ? owner ?? segment : null);
     if (row.type === 'assistant') {
       lastAssistant = at;
       if (!isToolStep(row)) { segment = null; continue; }
@@ -796,7 +870,7 @@ function buildIndex(rows: readonly JsonObject[]): RowIndex {
     if (target !== null) steps.get(target)?.feed(row, owner !== undefined);
   }
 
-  return { owners, firstAsker, steps, marked, standing };
+  return { owners, answers, firstAsker, steps, marked, standing };
 }
 
 /**
@@ -811,7 +885,7 @@ function buildIndex(rows: readonly JsonObject[]): RowIndex {
  *
  * @internal
  */
-export function pausedStepIndex(rows: readonly JsonObject[]): number | null {
+function pausedStepIndex$(rows: readonly JsonObject[]): number | null {
   for (let index = rows.length - 1; index >= 0; index -= 1) {
     const type = rows[index]!.type;
     if (type === 'user') return null;
@@ -834,7 +908,7 @@ export function pausedStepIndex(rows: readonly JsonObject[]): number | null {
  * counts, here, in the plan's reading of the thread or in the replay, so
  * what ran and what the thread says was decided cannot disagree.
  */
-export function turnDecisions(rows: readonly JsonObject[]): Map<string, ApprovalDecisionEntry> {
+function turnDecisions$(rows: readonly JsonObject[]): Map<string, ApprovalDecisionEntry> {
   const decisions = new Map<string, ApprovalDecisionEntry>();
   // The paused step (G-397): no decision applies to any other.
   const step = pausedStepIndex(rows);
@@ -850,13 +924,13 @@ export function turnDecisions(rows: readonly JsonObject[]): Map<string, Approval
  *
  * @internal
  */
-export function standingDecisions(rows: readonly JsonObject[]): Map<string, ApprovalDecisionEntry> {
+function standingDecisions$(rows: readonly JsonObject[]): Map<string, ApprovalDecisionEntry> {
   return new Map([...rowIndex(rows).standing].map(([id, { entry }]) => [id, entry]));
 }
 
 /**
- * Whether a decision recorded after `earlier` is the answer (G-401, the
- * recommended option until the owner decides): the FIRST answer stands,
+ * Whether a decision recorded after `earlier` is the answer (G-401, DECIDED:
+ * denial wins): the FIRST answer stands,
  * except that a later DENIAL revokes an earlier approval of a call that has
  * not started (the decision path accepts it only then, revocableApprovalIds).
  * An approval never overrides anything.
@@ -871,18 +945,18 @@ export function prevails(earlier: { approved: boolean } | boolean | undefined, a
 
 /**
  * The approval ids a person APPROVED whose call has not started (no started
- * row, no result): a denial may still revoke each (G-401's recommended
- * option). Nothing else may be decided again.
+ * row, no result): a denial may still revoke each (G-401, decided: denial
+ * wins). Nothing else may be decided again.
  *
  * @internal
  */
-export function revocableApprovalIds(rows: readonly JsonObject[]): string[] {
+function revocableApprovalIds$(rows: readonly JsonObject[]): string[] {
   const decisions = turnDecisions(rows);
   return unresolvedApprovalIds(rows).filter((id) => decisions.get(id)?.approved === true);
 }
 
 /** Stored approval authority, kept separate from the provider replay view. */
-export function approvalToolScope(rows: readonly JsonObject[]): { names: string[]; legacy: boolean } | null {
+function approvalToolScope$(rows: readonly JsonObject[]): { names: string[]; legacy: boolean } | null {
   // The paused step (G-397), as stored, and the same row in the view (which
   // folds a 0.3.0 request row into the assistant row before it).
   const step = pausedStepIndex(rows);
@@ -917,7 +991,7 @@ export function approvalToolScope(rows: readonly JsonObject[]): { names: string[
  * answered once is no longer pending, and neither is one a harness mark
  * answered (a replaced step's denial, a start's ended row).
  */
-export function pendingApprovalIds(rows: readonly JsonObject[]): string[] {
+function pendingApprovalIds$(rows: readonly JsonObject[]): string[] {
   // The paused step (G-397); its answers are read from the rows after it.
   const step = pausedStepIndex(rows);
   if (step === null) return [];
@@ -948,7 +1022,7 @@ export function pendingApprovalIds(rows: readonly JsonObject[]): string[] {
  * act on each of them. Read newest first, as pendingApprovalIds() is; a user
  * turn ends the scope.
  */
-export function unresolvedApprovalIds(rows: readonly JsonObject[]): string[] {
+function unresolvedApprovalIds$(rows: readonly JsonObject[]): string[] {
   // The paused step (G-397); its results are read from the rows after it.
   const step = pausedStepIndex(rows);
   if (step === null) return [];
@@ -1058,7 +1132,7 @@ export function supersedes(message: JsonObject, outside: boolean): boolean {
  *
  * @internal Written by Thread.record(); the harness-approval-pairing corpus pins it.
  */
-export function supersededRow(rows: readonly JsonObject[], alsoResults: readonly JsonObject[] = []): (ToolResultRow & { harness_superseded: { approval_ids: string[] } }) | null {
+function supersededRow$(rows: readonly JsonObject[], alsoResults: readonly JsonObject[] = []): (ToolResultRow & { harness_superseded: { approval_ids: string[] } }) | null {
   const step = pausedStepIndex(rows);
   if (step === null) return null;
   const calls = stepCalls(rows[step]);
@@ -1110,7 +1184,7 @@ export const REPLACED_STEP_KEY = 'harness_replaced_step';
  *
  * @internal
  */
-export function replacedStepApprovals(rows: readonly JsonObject[]): Set<string> {
+function replacedStepApprovals$(rows: readonly JsonObject[]): Set<string> {
   const out = new Set<string>();
   for (const row of rows) {
     if (!isReplacedStepRow(row)) continue;
@@ -1144,7 +1218,7 @@ export type PositionedRow = { position: number; message: JsonObject; runId: stri
  *
  * @internal
  */
-export function unansweredReplacedSteps(rows: readonly PositionedRow[], gated: (name: string) => boolean): { position: number; calls: JsonObject[] }[] {
+function unansweredReplacedSteps$(rows: readonly PositionedRow[], gated: (name: string) => boolean): { position: number; calls: JsonObject[] }[] {
   const messages = rows.map((row) => row.message);
   const paused = pausedStepIndex(messages);
   const answeredAt = new Set(messages.filter((row) => isReplacedStepRow(row)).map((row) => (row[REPLACED_STEP_KEY] as JsonObject).position as number));
@@ -1196,7 +1270,7 @@ export function replacedStepRow(position: number, calls: readonly JsonObject[]):
  *
  * @internal
  */
-export function supersededApprovals(rows: readonly JsonObject[]): Set<string> {
+function supersededApprovals$(rows: readonly JsonObject[]): Set<string> {
   return markedApprovals(rows, SUPERSEDED_KEY);
 }
 
@@ -1219,7 +1293,7 @@ export function supersededApprovals(rows: readonly JsonObject[]): Set<string> {
  *
  * @internal
  */
-export function endedByStart(rows: readonly JsonObject[]): Set<string> {
+function endedByStart$(rows: readonly JsonObject[]): Set<string> {
   return markedApprovals(rows, ENDED_BY_START_KEY);
 }
 
@@ -1235,7 +1309,7 @@ function markedApprovals(rows: readonly JsonObject[], key: string): Set<string> 
  * or not; empty when the tail is a user turn or an assistant step that asked
  * nothing. A turn with no new message continues exactly these calls (G-366).
  */
-export function pausedApprovalIds(rows: readonly JsonObject[]): string[] {
+function pausedApprovalIds$(rows: readonly JsonObject[]): string[] {
   const step = pausedStepIndex(rows);
   if (step === null) return [];
 
@@ -1254,7 +1328,7 @@ export function pausedApprovalIds(rows: readonly JsonObject[]): string[] {
  * run parked on. This is the floor a resume never counts below, and what a
  * row written before that field existed is counted by.
  */
-export function approvalRunSteps(rows: readonly JsonObject[]): number | null {
+function approvalRunSteps$(rows: readonly JsonObject[]): number | null {
   if (approvalToolScope(rows) === null) return null;
   let steps = 0;
   for (let index = rows.length - 1; index >= 0; index -= 1) {
@@ -1287,7 +1361,7 @@ export type PausedBinding = {
  * again from nothing. A malformed binding is read as none. A row written
  * before these fields existed carries neither.
  */
-export function pausedRunState(rows: readonly JsonObject[]): {
+function pausedRunState$(rows: readonly JsonObject[]): {
   agentSpend: PausedAgentSpend | null;
   binding: PausedBinding | null;
   tree: { session: string; run: string } | null;
@@ -1356,7 +1430,7 @@ export function storedBinding(value: JsonValue | undefined): PausedBinding | nul
  * never the whole thread: providers that number calls per response reuse
  * ids, and an older turn's call must not decide a newer one.
  */
-export function unusableStoredCalls(rows: readonly JsonObject[]): Set<string> {
+function unusableStoredCalls$(rows: readonly JsonObject[]): Set<string> {
   const unusable = new Set<string>();
   // The paused step (G-397), never another turn's.
   const step = pausedStepIndex(rows);
@@ -1476,7 +1550,7 @@ function foldKey(entry: JsonObject): string {
   return sortedJson([text(entry.tool_call_id), text(entry.tool_name), isObject(entry.args) ? entry.args : {}]);
 }
 
-export function newResults<T extends JsonObject | ToolResultEntry>(rows: readonly JsonObject[], index: number, entries: readonly T[]): T[] {
+function newResults$<T extends JsonObject | ToolResultEntry>(rows: readonly JsonObject[], index: number, entries: readonly T[]): T[] {
   const most = new Map<string, number>();
   let inSegment = true;
   for (let at = index + 1; at < rows.length; at += 1) {
@@ -1507,7 +1581,7 @@ export function newResults<T extends JsonObject | ToolResultEntry>(rows: readonl
  *
  * @internal
  */
-export function stepResultsByPosition(rows: readonly JsonObject[], index: number): boolean[] {
+function stepResultsByPosition$(rows: readonly JsonObject[], index: number): boolean[] {
   return stepAnswers(rows, index).map((answer) => answer !== null);
 }
 
@@ -1519,7 +1593,7 @@ export function stepResultsByPosition(rows: readonly JsonObject[], index: number
  *
  * @internal
  */
-export function pausedStepRepeatsCallIds(rows: readonly JsonObject[]): boolean {
+function pausedStepRepeatsCallIds$(rows: readonly JsonObject[]): boolean {
   const step = pausedStepIndex(rows);
 
   return step !== null && pairStepApprovals(stepCalls(rows[step]), ownRequests(rows, step)).repeated;
@@ -1533,7 +1607,7 @@ export function pausedStepRepeatsCallIds(rows: readonly JsonObject[]): boolean {
  *
  * @internal
  */
-export function repeatedStepSettled(rows: readonly JsonObject[], index: number): boolean {
+function repeatedStepSettled$(rows: readonly JsonObject[], index: number): boolean {
   const calls = stepCalls(rows[index]).map((call) => text(call.id));
   const counts = new Map<string, number>();
   for (const row of rows.slice(index + 1)) {
@@ -1560,7 +1634,7 @@ export function repeatedStepSettled(rows: readonly JsonObject[], index: number):
  *
  * @internal
  */
-export function repeatedIdDenials(rows: readonly JsonObject[]): Set<string> {
+function repeatedIdDenials$(rows: readonly JsonObject[]): Set<string> {
   const asked = new Map<string, string>();
   const denied = new Set<string>();
   for (const row of rows) {
@@ -1677,3 +1751,34 @@ function text(value: JsonValue | undefined): string {
 function nullableText(value: JsonValue | undefined): string | null {
   return typeof value === 'string' ? value : null;
 }
+
+// Every exported reader runs as one reader call (reading(), round 17).
+export const replayView = ((...args: Parameters<typeof replayView$>) => reading(() => (replayView$ as (...a: unknown[]) => unknown)(...args))) as typeof replayView$;
+export const placedRows = ((...args: Parameters<typeof placedRows$>) => reading(() => (placedRows$ as (...a: unknown[]) => unknown)(...args))) as typeof placedRows$;
+export const askedBefore = ((...args: Parameters<typeof askedBefore$>) => reading(() => (askedBefore$ as (...a: unknown[]) => unknown)(...args))) as typeof askedBefore$;
+export const ownRequests = ((...args: Parameters<typeof ownRequests$>) => reading(() => (ownRequests$ as (...a: unknown[]) => unknown)(...args))) as typeof ownRequests$;
+export const unansweredUngatedCalls = ((...args: Parameters<typeof unansweredUngatedCalls$>) => reading(() => (unansweredUngatedCalls$ as (...a: unknown[]) => unknown)(...args))) as typeof unansweredUngatedCalls$;
+export const markedOwner = ((...args: Parameters<typeof markedOwner$>) => reading(() => (markedOwner$ as (...a: unknown[]) => unknown)(...args))) as typeof markedOwner$;
+export const stepAnswers = ((...args: Parameters<typeof stepAnswers$>) => reading(() => (stepAnswers$ as (...a: unknown[]) => unknown)(...args))) as typeof stepAnswers$;
+export const pausedStepIndex = ((...args: Parameters<typeof pausedStepIndex$>) => reading(() => (pausedStepIndex$ as (...a: unknown[]) => unknown)(...args))) as typeof pausedStepIndex$;
+export const turnDecisions = ((...args: Parameters<typeof turnDecisions$>) => reading(() => (turnDecisions$ as (...a: unknown[]) => unknown)(...args))) as typeof turnDecisions$;
+export const standingDecisions = ((...args: Parameters<typeof standingDecisions$>) => reading(() => (standingDecisions$ as (...a: unknown[]) => unknown)(...args))) as typeof standingDecisions$;
+export const revocableApprovalIds = ((...args: Parameters<typeof revocableApprovalIds$>) => reading(() => (revocableApprovalIds$ as (...a: unknown[]) => unknown)(...args))) as typeof revocableApprovalIds$;
+export const approvalToolScope = ((...args: Parameters<typeof approvalToolScope$>) => reading(() => (approvalToolScope$ as (...a: unknown[]) => unknown)(...args))) as typeof approvalToolScope$;
+export const pendingApprovalIds = ((...args: Parameters<typeof pendingApprovalIds$>) => reading(() => (pendingApprovalIds$ as (...a: unknown[]) => unknown)(...args))) as typeof pendingApprovalIds$;
+export const unresolvedApprovalIds = ((...args: Parameters<typeof unresolvedApprovalIds$>) => reading(() => (unresolvedApprovalIds$ as (...a: unknown[]) => unknown)(...args))) as typeof unresolvedApprovalIds$;
+export const supersededRow = ((...args: Parameters<typeof supersededRow$>) => reading(() => (supersededRow$ as (...a: unknown[]) => unknown)(...args))) as typeof supersededRow$;
+export const replacedStepApprovals = ((...args: Parameters<typeof replacedStepApprovals$>) => reading(() => (replacedStepApprovals$ as (...a: unknown[]) => unknown)(...args))) as typeof replacedStepApprovals$;
+export const unansweredReplacedSteps = ((...args: Parameters<typeof unansweredReplacedSteps$>) => reading(() => (unansweredReplacedSteps$ as (...a: unknown[]) => unknown)(...args))) as typeof unansweredReplacedSteps$;
+export const supersededApprovals = ((...args: Parameters<typeof supersededApprovals$>) => reading(() => (supersededApprovals$ as (...a: unknown[]) => unknown)(...args))) as typeof supersededApprovals$;
+export const endedByStart = ((...args: Parameters<typeof endedByStart$>) => reading(() => (endedByStart$ as (...a: unknown[]) => unknown)(...args))) as typeof endedByStart$;
+export const pausedApprovalIds = ((...args: Parameters<typeof pausedApprovalIds$>) => reading(() => (pausedApprovalIds$ as (...a: unknown[]) => unknown)(...args))) as typeof pausedApprovalIds$;
+export const approvalRunSteps = ((...args: Parameters<typeof approvalRunSteps$>) => reading(() => (approvalRunSteps$ as (...a: unknown[]) => unknown)(...args))) as typeof approvalRunSteps$;
+export const pausedRunState = ((...args: Parameters<typeof pausedRunState$>) => reading(() => (pausedRunState$ as (...a: unknown[]) => unknown)(...args))) as typeof pausedRunState$;
+export const unusableStoredCalls = ((...args: Parameters<typeof unusableStoredCalls$>) => reading(() => (unusableStoredCalls$ as (...a: unknown[]) => unknown)(...args))) as typeof unusableStoredCalls$;
+export const newResults = ((...args: Parameters<typeof newResults$>) => reading(() => (newResults$ as (...a: unknown[]) => unknown)(...args))) as typeof newResults$;
+export const stepResultsByPosition = ((...args: Parameters<typeof stepResultsByPosition$>) => reading(() => (stepResultsByPosition$ as (...a: unknown[]) => unknown)(...args))) as typeof stepResultsByPosition$;
+export const pausedStepRepeatsCallIds = ((...args: Parameters<typeof pausedStepRepeatsCallIds$>) => reading(() => (pausedStepRepeatsCallIds$ as (...a: unknown[]) => unknown)(...args))) as typeof pausedStepRepeatsCallIds$;
+export const repeatedStepSettled = ((...args: Parameters<typeof repeatedStepSettled$>) => reading(() => (repeatedStepSettled$ as (...a: unknown[]) => unknown)(...args))) as typeof repeatedStepSettled$;
+export const repeatedIdDenials = ((...args: Parameters<typeof repeatedIdDenials$>) => reading(() => (repeatedIdDenials$ as (...a: unknown[]) => unknown)(...args))) as typeof repeatedIdDenials$;
+export const markedOwners = ((...args: Parameters<typeof markedOwners$>) => reading(() => markedOwners$(...args))) as typeof markedOwners$;

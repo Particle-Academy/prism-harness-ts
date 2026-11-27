@@ -637,7 +637,7 @@ describe('added: directed decision orders', () => {
     expect(echoOutcomes(await r.rows(), 1)).toEqual(['no']);
   });
 
-  it('(d) an APPROVAL is stored, the turn never runs, then a DENY arrives: DENIED (the recommended G-401 option), the call never runs, one outcome', async () => {
+  it('(d) an APPROVAL is stored, the turn never runs, then a DENY arrives: DENIED (G-401, decided: denial wins), the call never runs, one outcome', async () => {
     const r = new Rig();
     const [id] = await r.parked();
     await recordApproval(r.session(), id!, true);

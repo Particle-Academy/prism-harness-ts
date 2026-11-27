@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { JsonObject, JsonValue } from './json.js';
 import { isJsonObject } from './json.js';
-import { ANSWERS_STEP_KEY, CALL_BINDING_KEY, ENDED_BY_START_KEY, NOT_RUN_KEY, REPLACED_STEP_KEY, STARTED_KEY, SUPERSEDED_KEY, markedOwner, pausedStepIndex, supersededRow, supersedes, withBoundRequests } from './thread-rows.js';
+import { ANSWERS_STEP_KEY, CALL_BINDING_KEY, ENDED_BY_START_KEY, NOT_RUN_KEY, REPLACED_STEP_KEY, STARTED_KEY, SUPERSEDED_KEY, markedOwners, pausedStepIndex, supersededRow, supersedes, withBoundRequests } from './thread-rows.js';
 import { HarnessError } from './errors.js';
 
 /**
@@ -53,6 +53,11 @@ const ROW_MARKS: readonly string[] = [ANSWERS_STEP_KEY, STARTED_KEY, ENDED_BY_ST
   // The step counts a parked run writes on the row it parks on (round 16: the
   // reference's list): on a row the runtime did not write they read as absent.
   'harness_steps_used', 'harness_steps_left',
+  // The run state a parked run writes on the row it parks on (round 17, TS
+  // run20 F2): read ONLY from a row the runtime wrote. A host step resumes on
+  // the session's own binding and tree, with the legacy tool scope, and none
+  // of these is carried onto the runtime's next parked row.
+  'harness_binding', 'harness_tool_names', 'harness_tree', 'harness_plan_ledger', 'harness_agent_spend',
   // The reference's own marks (0.26.x replaced, its write-ahead journal):
   // never written here, read as absent on any row the runtime did not write.
   'harness_replaced', 'harness_journal'];
@@ -438,12 +443,13 @@ function supersedingAt(rows: readonly JsonObject[], runIds: readonly (string | n
     // owner; a run id a host row carries is never evidence of anything.
     const own = rows[step]?.harness === true ? runIds[step] ?? null : null;
     if (own !== null) owners.add(own);
+    const markedBy = markedOwners(rows);
     for (const [index, row] of rows.entries()) {
       if (index <= step || row.harness !== true) continue;
       const runId = runIds[index] ?? null;
       // A result row a harness mark gives to an EARLIER step (round 15) is
       // that step's: its run does not own this one.
-      const owner = markedOwner(rows, index);
+      const owner = markedBy[index];
       if (owner !== undefined && owner !== step) continue;
       if (row.type === 'tool_result' && runId !== null && Array.isArray(row.tool_results) && row.tool_results.length > 0) owners.add(runId);
     }

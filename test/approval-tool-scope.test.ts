@@ -5,6 +5,7 @@ import {afterEach, describe, expect, it, vi} from 'vitest';
 import {AgentRuntime, FileSessionStore, HarnessError, MemorySessionStore, ModeRegistry, PrismHarness, ToolRegistry, recordApproval,
   type JsonObject, type JsonValue, type LlmRequest, type LlmResponse, type Session} from '../src/index.js';
 import {approvalToolScope, assistantRow} from '../src/thread-rows.js';
+import {recordingInRun} from '../src/thread.js';
 
 afterEach(() => vi.restoreAllMocks());
 
@@ -50,8 +51,14 @@ async function exercise(options: {
   try {
     if (options.seed) {
       const row: JsonObject = assistantRow('', [{id: 'safe-call', name: 'scope_safe', arguments: {}}], {}, [{approval_id: 'approval-1', tool_call_id: 'safe-call', arguments_format: 1}]);
-      if ('scope' in options.seed) row.harness_tool_names = options.seed.scope!;
-      await session.thread().record([row]);
+      // A stored list is honoured only on a row the runtime wrote (round 17,
+      // TS run20 F2): a scoped seed is written as the runtime's own row.
+      if ('scope' in options.seed) {
+        row.harness_tool_names = options.seed.scope!;
+        await recordingInRun('seed-run', () => session.thread().record([row], 'seed-run'));
+      } else {
+        await session.thread().record([row]);
+      }
       pendingId = 'approval-1';
     } else {
       const first = await runtime().send(session, 'A test turn.', options.requested);
@@ -76,11 +83,13 @@ async function exercise(options: {
             // Schedule a concurrent durable writer before the real lock. Its
             // native pending row belongs to a narrower turn, even if a person
             // affirms the model's request for an unoffered gated tool.
-            await fresh.thread().record([
+            // Another runtime turn's own rows (a stored list is honoured
+            // only on a row the runtime wrote, round 17).
+            await recordingInRun('concurrent-run', () => fresh.thread().record([
               {type: 'user', content: 'A concurrent narrowed turn.'},
               {...assistantRow('', [{id: 'new-call', name: 'scope_ceiling', arguments: {}}], {}, [{approval_id: 'new-approval', tool_call_id: 'new-call', arguments_format: 1}]), harness_tool_names: ['scope_safe']},
               {type: 'tool_result', tool_results: [], tool_approval_responses: [{approval_id: 'new-approval', approved: true, reason: null}]},
-            ]);
+            ], 'concurrent-run'));
           }
           return nativeLock(callback, ttl, wait);
         });

@@ -1033,6 +1033,16 @@ async function runCase(c: Case): Promise<void> {
     const open = c.junk !== null ? (c.junk.kind === 'copy' ? [902] : c.junk.kind === 'mixed' ? [901] : c.junk.kind === 'both' ? [firstGated(c).token, 903] : [])
       : c.later !== null ? (laterSuperseded(c) ? [] : c.later.calls.filter((call) => call.tool === 'echo' && call.token !== forgedToken).map((call) => call.token))
       : superseded(c) ? []
+        // Round 17: the row written while the first approved call ran
+        // replaced the step: the resume reports every call it answered as
+        // decided, but no later APPROVED call (it is never started: the
+        // replaced denial is its outcome).
+        : c.during !== undefined && oracle.runs.size > 0
+          ? (() => {
+            const first = c.calls.findIndex((call) => oracle.runs.has(call.token));
+            return c.calls.flatMap((call, index) => (call.tool === 'echo' && !c.prior.includes(index)
+              && (index <= first || c.requests.find((q) => q.call === index)?.verdict !== 'approve') ? [call.token] : []));
+          })()
         // By call, never by token: an identical duplicate shares its token (round 15).
         : c.calls.flatMap((call, index) => (call.tool === 'echo' && call.token !== forgedToken && !c.prior.includes(index) ? [call.token] : []));
     check(results.length === open.length, '6: one tool_result step per open gated call', { steps: results.length, open: open.length });
