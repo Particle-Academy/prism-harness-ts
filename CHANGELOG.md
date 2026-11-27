@@ -99,11 +99,44 @@
   limit", in `RunBudget.fromConfig`, the runtime config, modes and plan
   budgets (now pinned by tests).
 
+### Fixed: one ended-mark shape, and run events that cannot break a run (G-387 round 12)
+
+- The row a runner start writes when it ends the calls its child was parked
+  on now has the PHP reference's shape, so a thread reads the same in every
+  language: one result row holding only the ended calls, each with the fixed
+  result `Not run: the delegation this call was proposed under ended.`, and
+  marked beside (never inside) the results with
+  `harness_ended_by_start: {approval_ids: [...]}`, the calls' own approvals in
+  call order. Only that mark makes a call read ended: the approval named by
+  it, on the first result of its call after its request row. Pinned by the
+  harness-thread-rows corpus (thr-0014). The per-entry mark of round 11 was
+  never released and is no longer written or read.
+- A throwing event listener can no longer break a run: a listener's failure
+  is reported by its class name only (the warning no longer carries the
+  listener's own text), by a conversion that cannot throw, whatever the
+  listener threw.
+- Every run event is emitted inside the run's failure handling: a throw from
+  emitting `run.started` (a host's own events object may throw anything)
+  fails the run with the class name only, undoes a runner start that had not
+  recorded its task, releases its holds, emits `run.failed` and reaches the
+  caller. No run is left `running`, and no child stays busy until `lock_ttl`.
+- On a failed run, the run tree hold and the delegation hold are released
+  before `run.failed` is emitted, so a listener never sees a hold that is
+  about to be released.
+- A tool that throws a value that cannot be converted to text fails as a
+  tool result naming its class, instead of failing the run.
+- The child-state invariant matrix covers more phases (inside `run.started`
+  and `tool_denied` listeners, a failed start measured inside `run.failed`),
+  more readers (provisional, plans, the plan's run, the paused row, busy, the
+  resumed tree, the tool policy) and actions (a resume, a second start, a
+  decision or turn on the start's own Session, and that Session used from
+  outside its run).
+
 ### Fixed: a runner start's own reads, and how an ended call is recognised (G-387 round 11)
 
 - A call a runner start's task row ended is recognised only by a mark the
-  harness writes on that entry (`not_run: 'delegation_ended'`, with the
-  `approval_id` it ended), never by the "Not run" text: a tool whose result
+  harness writes on the row (round 12: `harness_ended_by_start`, below),
+  never by the "Not run" text: a tool whose result
   is exactly that text is an ordinary result, and its approval stays
   approved. The mark applies only to the approval it names, asked for before
   it, so a provider that reuses tool call ids across turns can no longer make

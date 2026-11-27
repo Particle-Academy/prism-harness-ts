@@ -1,3 +1,4 @@
+import { failureName } from './failures.js';
 import type { JsonObject } from './json.js';
 import type { RunStep } from './steps.js';
 
@@ -243,11 +244,17 @@ export class HarnessEvents {
       }
     }
 
+    // Reported by the named-class rule (G-387 round 12): never String() of
+    // what was thrown, which itself throws for a value with no prototype or
+    // a throwing toString, and would carry the listener's own text. Nothing
+    // here may throw, so emit() never breaks the run it reports on.
     if (failures.length > 0 && typeof process !== 'undefined') {
       for (const failure of failures) {
-        process.emitWarning(
-          `A prism-harness event listener threw while handling [${event.type}]: ${String(failure)}`,
-        );
+        try {
+          process.emitWarning(`A prism-harness event listener threw while handling [${event.type}]: ${failureName(failure)}.`);
+        } catch {
+          // A host's warning handler that throws is the host's; the run goes on.
+        }
       }
     }
   }
