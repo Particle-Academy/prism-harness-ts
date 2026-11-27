@@ -21,6 +21,7 @@ import {
   resultOwners,
   approvalSuperseded,
   startedDecisions,
+  requestView,
   REPLACED_STEP_KEY,
   answeringStep,
   isToolCallStep,
@@ -681,7 +682,8 @@ export class AgentRuntime {
       steps?.stepStart();
       const response = await this.#client({
         systemPrompt: mode.systemPrompt,
-        messages: threadView((await thread.messages()).map((entry) => entry.message)),
+        // Every result directly after its own step, a replaced step's too (G-412).
+        messages: requestView(await thread.messages()),
         tools: offered,
         provider,
         model,
@@ -867,7 +869,13 @@ export class AgentRuntime {
         const decision = approvalId === undefined ? undefined : work.decisions.get(approvalId);
         const at = work.indices[offset]!;
 
-        if (work.started.has(at)) {
+        if (work.ended.has(at)) {
+          // No request names it and it needs nobody, with no result (G-412):
+          // it may have run; it is never run here.
+          const entry = toolResultEntry(input, INTERRUPTED_RESULT);
+          steps?.toolResult(call.id, entry.result, { ok: false, code: 'tool_failed', refused: false });
+          resolved.push(entry);
+        } else if (work.started.has(at)) {
           // Started before, with no result (G-410): it may have run; never again.
           const entry = toolResultEntry(input, INTERRUPTED_RESULT);
           steps?.toolResult(call.id, entry.result, { ok: false, code: 'approval_denied', refused: true });
@@ -943,8 +951,9 @@ export class AgentRuntime {
         ...replaced,
         ...(work.calls.length === 0 ? [] : [answeringStep(toolResultRow([...work.results, ...resolved], [...work.decisions.values()]), work.position)]),
       ], runId, HARNESS_RECORDING);
-      // Only replaced steps were answered: this turn's tools are not narrowed.
-      return work.calls.length === 0 ? offered : bounded;
+      // Only replaced steps, or only calls that needed nobody, were answered:
+      // this turn's tools are not narrowed.
+      return work.calls.every((_call, offset) => work.ended.has(work.indices[offset]!)) ? offered : bounded;
     };
 
     if (alreadyLocked) return await resolve(session);
@@ -975,6 +984,8 @@ export class AgentRuntime {
     indices: number[];
     /** Step positions of the calls a started row names with no result (G-410). */
     started: Set<number>;
+    /** Step positions of the open calls no request names and that need nobody (G-412). */
+    ended: Set<number>;
     /** The thread position of the step resolved here (its result row names it). */
     position: number | undefined;
     scope: ReturnType<typeof approvalToolScope>;
@@ -1049,15 +1060,22 @@ export class AgentRuntime {
     // A call a started row names with no result is answered as interrupted
     // (G-410): it may have run, and it is never run again.
     const started = startedCalls(messages, stored);
+    // A call no approval request names and that needs nobody, with no result
+    // (its result was never stored, or a host recorded the call): no
+    // decision will ever answer it, so it is answered now, as interrupted,
+    // and never run (G-412). Otherwise it would stay unanswered in every
+    // later request, which a provider refuses.
+    const unrequested = (call: AssistantRow['tool_calls'][number]): boolean => !mode.needsApproval(call.name) && (repeated || !approvalIds.has(call.id));
     const open = stored >= 0 && supersededAt(messages, stored) !== -1
       ? []
-      : assistant.tool_calls.map((call, at) => ({ call, at })).filter(({ call, at }) => !done.has(at) && (started.has(at) || (repeated
+      : assistant.tool_calls.map((call, at) => ({ call, at })).filter(({ call, at }) => !done.has(at) && (started.has(at) || unrequested(call) || (repeated
         ? mode.needsApproval(call.name)
         : approvalIds.has(call.id) || mode.needsApproval(call.name))));
     const calls = open.map(({ call }) => call);
     const indices = open.map(({ at }) => at);
+    const ended = new Set(open.filter(({ call, at }) => !started.has(at) && unrequested(call)).map(({ at }) => at));
 
-    return calls.length === 0 && replaced.length === 0 ? null : { calls, results, decisions, approvalIds, repeated, replaced, stepIndex: stored, indices, started, position: messages[stored]?.position, scope: approvalToolScope(rows), unusable: unusableStoredCalls(rows), ambiguous: ambiguousCalls(assistant) };
+    return calls.length === 0 && replaced.length === 0 ? null : { calls, results, decisions, approvalIds, repeated, replaced, stepIndex: stored, indices, started, ended, position: messages[stored]?.position, scope: approvalToolScope(rows), unusable: unusableStoredCalls(rows), ambiguous: ambiguousCalls(assistant) };
   }
 
   /**

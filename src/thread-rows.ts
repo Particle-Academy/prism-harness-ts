@@ -134,6 +134,12 @@ export function toolResultRow(
  */
 export function threadView(rows: readonly JsonObject[]): JsonObject[] {
   const view: JsonObject[] = [];
+  // Where the newest tool-call step sits in the view: its results are shown
+  // DIRECTLY after it (G-412), also when a row of another kind (a user row, an
+  // assistant text row a host wrote while a call ran) was stored between the
+  // step and a result. A provider refuses a tool call with no result straight
+  // after it, on every later request; the other row is shown after the results.
+  let step = -1;
 
   for (const row of rows) {
     const normalised = normalise(row, view);
@@ -142,10 +148,15 @@ export function threadView(rows: readonly JsonObject[]): JsonObject[] {
 
     const previous = view.at(-1);
 
-    if (normalised.type === 'tool_result' && previous?.type === 'tool_result') {
+    if (normalised.type === 'tool_result' && step !== -1) {
+      const at = step + 1;
+      if (view[at]?.type === 'tool_result') view[at] = fold(view[at] as ToolResultRow, normalised as ToolResultRow);
+      else view.splice(at, 0, normalised);
+    } else if (normalised.type === 'tool_result' && previous?.type === 'tool_result') {
       view[view.length - 1] = fold(previous as ToolResultRow, normalised as ToolResultRow);
     } else {
       view.push(normalised);
+      if (isToolCallStep(normalised)) step = view.length - 1;
     }
   }
 
@@ -581,6 +592,74 @@ export function startedDecisions(messages: readonly StoredRow[], index: number):
     if (found !== undefined && !standing.has(approvalId)) standing.set(approvalId, found);
   }
   return standing;
+}
+
+/**
+ * The stored rows in the order the model is shown them (G-412): the answer the
+ * harness recorded for a replaced step (G-397) is moved to directly after the
+ * step it names, without its mark, so that step's calls are answered where
+ * they were made. Only a mark the harness recorded, naming an EARLIER
+ * tool-call step by position, is moved; any other stays where it is stored
+ * and is not shown. `threadView()` then puts every result directly after its
+ * own step.
+ *
+ * @internal
+ */
+export function replayRows(messages: readonly StoredRow[]): JsonObject[] {
+  const steps = new Map<number, number>();
+  const after = new Map<number, JsonObject[]>();
+  const moved = new Set<number>();
+  messages.forEach(({ position, message, harness }, index) => {
+    if (isToolCallStep(message)) { steps.set(position, index); return; }
+    if (harness !== true || !isReplacedStepRow(message)) return;
+    const step = steps.get((message[REPLACED_STEP_KEY] as JsonObject).position as number);
+    if (step === undefined) return;
+    const plain: JsonObject = { ...message };
+    delete plain[REPLACED_STEP_KEY];
+    after.set(step, [...(after.get(step) ?? []), plain]);
+    moved.add(index);
+  });
+  return messages.flatMap(({ message }, index) => (moved.has(index) ? [] : [message, ...(after.get(index) ?? [])]));
+}
+
+/**
+ * What the model is sent (G-412): the replay view of `replayRows()`, with
+ * every call that no result directly after its step answers given ONE result
+ * reading `REPLACED_STEP_RESULT`. By the time a request is made every call the
+ * run can answer has its stored outcome; one still without a result is a call
+ * no resolution answers (an earlier step's, or one in a step a later row
+ * superseded), and a provider refuses a request with a tool call that is not
+ * answered in the very next message. Nothing is stored. Results pair with
+ * calls by id and tool name, in order.
+ *
+ * @internal
+ */
+export function requestView(messages: readonly StoredRow[]): JsonObject[] {
+  const view = threadView(replayRows(messages));
+  const out: JsonObject[] = [];
+  view.forEach((row, at) => {
+    // A step's result row is written out with the step, below.
+    if (at > 0 && isToolCallStep(view[at - 1]) && row.type === 'tool_result') return;
+    out.push(row);
+    if (!isToolCallStep(row)) return;
+    const next = view[at + 1]?.type === 'tool_result' ? view[at + 1] as ToolResultRow : undefined;
+    const held = new Map<string, number>();
+    for (const entry of next?.tool_results ?? []) held.set(ownerKey(entry.tool_call_id, entry.tool_name), (held.get(ownerKey(entry.tool_call_id, entry.tool_name)) ?? 0) + 1);
+    const missing: ToolResultEntry[] = [];
+    for (const call of (row as AssistantRow).tool_calls) {
+      const key = ownerKey(call.id, call.name);
+      const count = held.get(key) ?? 0;
+      if (count > 0) { held.set(key, count - 1); continue; }
+      missing.push(toolResultEntry({ id: call.id, name: call.name, arguments: call.arguments, resultId: call.result_id }, REPLACED_STEP_RESULT));
+    }
+    if (next !== undefined) out.push(missing.length === 0 ? next : toolResultRow([...next.tool_results, ...missing], next.tool_approval_responses));
+    else if (missing.length > 0) out.push(toolResultRow(missing));
+  });
+  return out;
+}
+
+function ownerKey(id: string, name: string): string {
+  return `${id.length}:${id}${name.length}:${name}`;
 }
 
 /** Whether a stored row is the answer to a replaced step (G-397). @internal */
